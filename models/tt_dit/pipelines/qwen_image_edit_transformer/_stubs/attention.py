@@ -40,7 +40,7 @@ from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _pr
 
 
 # Optional kernel for the head split of one projection: HEAD_SPLIT(x, heads, None, parts=1) -> x [B, S, H * D] as
-# [B, H, S, D] (the reshape + permute below), or None for a tensor it does not take.
+# [B, H, S, D] (the reshape + permute below), and with merge=True the inverse; None for a tensor it does not take.
 HEAD_SPLIT = None
 
 
@@ -205,6 +205,9 @@ class TtQwenJointAttention:
             o = self._attend_entries(q, kh, v, mask_add, g)
         else:
             o = self._attend_core(q, kh, kl, v, mask_add)
+        y = None if HEAD_SPLIT is None else HEAD_SPLIT(o, self.local_heads, None, parts=1, merge=True)
+        if y is not None:
+            return y
         B, Sq = o.shape[0], o.shape[2]
         o = ttnn.permute(o, (0, 2, 1, 3))
         return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
