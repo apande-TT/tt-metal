@@ -152,8 +152,9 @@ ALWI void exp_tile(
 // to the QK subblock width). The stock kernel computes the whole chunk and then stamps -inf over everything past the
 // diagonal: those tiles add nothing to the row max (-inf), exp to exact 0.0 (adding 0 to the row sum and to P @ V
 // changes no bit), so skipping their QK products, mask stamps, max / exp work and P @ V products leaves every output
-// value as it was. Every CB count stays the full chunk's (the skipped tiles are popped / pushed untouched), so the
-// stock reader and writer are unchanged. The Q chunk past the prompt's last diagonal does the whole chunk as before.
+// value as it was. Q tile rows past the prompt (the last chunk's padding, never stored) are skipped the same way.
+// Every CB count stays the full chunk's (the skipped tiles are popped / pushed untouched), so the stock reader and
+// writer are unchanged.
 namespace sdpa_causal_skip {
 
 // apply_causal_mask_lightweight (k_start_tile 0, no straddle) on the first `cols` columns of rows `stride` tiles apart
@@ -193,7 +194,7 @@ void causal_mask_cols(
 
 // reduce_c (no eltwise max with a previous chunk) over the first `cols` tiles of rows `stride` tiles apart
 template <PoolType pool_type, ReduceDim reduce_dim, uint32_t in0_cb, uint32_t scale_cb, uint32_t rows>
-void reduce_c_cols(uint32_t out_cb, uint32_t cols, uint32_t stride) {
+void reduce_c_cols(uint32_t out_cb, uint32_t cols, uint32_t stride, uint32_t real_rows) {
     CircularBuffer cb_in0(in0_cb);
     CircularBuffer cb_scale(scale_cb);
     CircularBuffer cb_out(out_cb);
@@ -203,7 +204,7 @@ void reduce_c_cols(uint32_t out_cb, uint32_t cols, uint32_t stride) {
     pack_reconfig_data_format(out_cb);
     binary_max_tile_init();
     constexpr uint32_t reduce_dst_idx = 0;
-    for (uint32_t i = 0; i < rows; i++) {
+    for (uint32_t i = 0; i < real_rows; i++) {
         reconfig_data_format_srca(in0_cb);
         tile_regs_acquire();
         reduce_init<pool_type, reduce_dim>(in0_cb, scale_cb, out_cb);
@@ -222,7 +223,7 @@ void reduce_c_cols(uint32_t out_cb, uint32_t cols, uint32_t stride) {
 // sub_exp_block_bcast_cols_inplace (accurate exp, RC, in place, with the row-sum reduce) on the first `w` columns of
 // each `cols`-wide row; the remaining column groups are popped and pushed back untouched (the FIFO walks every tile)
 template <uint32_t in0_cb, uint32_t rows, uint32_t scale_fp32>
-void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, uint32_t w) {
+void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, uint32_t w, uint32_t real_rows) {
     CircularBuffer cb_in0(in0_cb);
     CircularBuffer cb_in1(in1_cb);
     CircularBuffer cb_reduce(reduce_cb);
@@ -241,7 +242,7 @@ void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, uint32_t w
 #endif
     for (uint32_t i = 0; i < rows; ++i) {
         for (uint32_t u = 0; u < granularity; u++) {
-            if (u * dst_tiles >= w) {
+            if (i >= real_rows || u * dst_tiles >= w) {
                 cb_in0.pop_front(dst_tiles);
                 cb_in0.reserve_back(dst_tiles);
                 cb_in0.push_back(dst_tiles);
@@ -351,7 +352,8 @@ template <
     uint32_t DHt,
     uint32_t vDHt,
     uint32_t scale_fp32,
-    uint32_t valid_Skt>
+    uint32_t valid_Skt,
+    uint32_t valid_Sqt>
 void causal_one_chunk(
     const uint32_t Skt,
     const uint32_t qk_in0_block_w,
@@ -404,6 +406,11 @@ void causal_one_chunk(
         if (w > Sk_chunk_t || w % exp_group != 0) {
             w = Sk_chunk_t;
         }
+        // the Q tile rows this chunk holds of the prompt (past them: padding rows the writer never stores)
+        uint32_t rr = q_start_tile < valid_Sqt ? valid_Sqt - q_start_tile : 0;
+        if (rr > Sq_chunk_t || rr == 0 || rr % qk_subblock_h != 0 || rr % out_subblock_h != 0) {
+            rr = Sq_chunk_t;
+        }
 
         uint32_t alias_prev_sum = cb_sum_A;
         uint32_t alias_cur_sum = cb_sum_B;
@@ -422,12 +429,15 @@ void causal_one_chunk(
             Sq_chunk_t,
             Sk_chunk_t,
             DHt,
-            qk_in0_num_subblocks,
+            rr / qk_subblock_h,
             w / qk_subblock_w,
             qk_in0_block_w,
             qk_subblock_h,
             qk_subblock_w,
             true /*transpose*/);
+        if (rr < Sq_chunk_t) {
+            cb_qk_im_obj.push_back((Sq_chunk_t - rr) * Sk_chunk_t);  // the padding rows' tiles, untouched
+        }
 
         /* QK += MASK (k chunk 0 always overlaps the causal diagonal) */
         reconfig_data_format(cb_qk_im, cb_mask_in);
@@ -440,16 +450,16 @@ void causal_one_chunk(
             lw_mask.causal_diag_tile_idx,
             cb_qk_im,
             q_start_tile,
-            Sq_chunk_t,
+            rr,
             w,
             Sk_chunk_t);
         cb_qk_im_obj.push_back(Sk_chunk_t * Sq_chunk_t);
 
         reconfig_data_format(cb_qk_im, cb_identity_scale_in);
         reduce_c_cols<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t>(
-            alias_cur_max, w, Sk_chunk_t);
+            alias_cur_max, w, Sk_chunk_t, rr);
 
-        sub_exp_cols<cb_qk_im, Sq_chunk_t, scale_fp32>(alias_cur_max, alias_cur_sum, Sk_chunk_t, w);
+        sub_exp_cols<cb_qk_im, Sq_chunk_t, scale_fp32>(alias_cur_max, alias_cur_sum, Sk_chunk_t, w, rr);
 
         reconfig_data_format(cb_v_in, cb_qk_im);
         pack_reconfig_data_format(alias_mm2_cur_out);
@@ -461,12 +471,15 @@ void causal_one_chunk(
             Sq_chunk_t,
             vDHt,
             Sk_chunk_t,
-            out_in0_num_subblocks,
+            rr / out_subblock_h,
             out_in1_num_subblocks,
             out_in0_block_w,
             out_subblock_h,
             out_subblock_w,
             w);
+        if (rr < Sq_chunk_t) {
+            CircularBuffer(alias_mm2_cur_out).push_back((Sq_chunk_t - rr) * vDHt);  // padding rows, untouched
+        }
 
         cb_qk_im_obj.pop_front(qk_chunk_tiles);
         reconfig_data_format(alias_prev_max, alias_cur_max);
@@ -544,7 +557,16 @@ void sdpa_standard(
         is_causal && lightweight_mask_enabled && !use_attention_sink && !use_provided_mask && !use_padded_mask &&
         !is_chunked && sliding_window_size == 0 && !use_windowed_narrowing) {
         if (k_num_chunks == 1 && Skt == Sk_chunk_t) {
-            causal_one_chunk<cb_qk_im, cb_identity_scale_in, Sq_chunk_t, Sk_chunk_t, DHt, vDHt, scale_fp32, valid_Skt>(
+            causal_one_chunk<
+                cb_qk_im,
+                cb_identity_scale_in,
+                Sq_chunk_t,
+                Sk_chunk_t,
+                DHt,
+                vDHt,
+                scale_fp32,
+                valid_Skt,
+                SDPA_VALID_SQT>(
                 Skt,
                 qk_in0_block_w,
                 qk_subblock_w,

@@ -137,7 +137,9 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
         ("REDUCE_GRANULARITY", str(_granularity(Sq_chunk_t, dst_size // 2))),
         ("EXP_APPROX_MODE", "1" if program_config.exp_approx_mode else "0"),
     ]
-    compute_defines = defines + ([("SDPA_CAUSAL_SKIP", "1")] if is_causal and CAUSAL_SKIP else [])
+    compute_defines = defines + (
+        [("SDPA_CAUSAL_SKIP", "1"), ("SDPA_VALID_SQT", str(valid_Sqt))] if is_causal and CAUSAL_SKIP else []
+    )
     packed_identity = 0x3F803F80  # two bf16 1.0
     scale_packed = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
     zigzag = int(bool(is_causal))
