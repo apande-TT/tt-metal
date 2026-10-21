@@ -311,10 +311,10 @@ EXACT_CORE_GRID = None
 # split_matmul's plain (exact=False) limb products on this core grid (None: ttnn picks its own)
 BMM_CORE_GRID = None
 # the vision attention's logit scale applied as the mask add's input activation (False: multiply + add)
+VISION_FUSED_SCALE_MASK = False
 # fn(qkv, off, heads, head_dim, mem) -> [N, heads, S, head_dim] head-major (the column block off + h * head_dim per
 # head) or None; the vision attention's q / k / v heads in one call instead of slice + reshape + permute
 VISION_HEADS_FN = None
-VISION_FUSED_SCALE_MASK = False
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
