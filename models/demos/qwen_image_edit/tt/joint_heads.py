@@ -41,6 +41,22 @@ def fused_joint_heads(txt, img, off, heads, head_dim, mem):
     return _copy_program([txt, img], out, "reader_joint_heads.cpp", reader_ct, shape_rt)
 
 
+def fused_face_heads(x, off, heads, head_dim, mem):
+    """x [N, 1, S, W] TILE -> [N, heads, S, head_dim]: head h is the column block off + h * head_dim (multiples of 16:
+    whole tile faces, so each output tile is a copy of source faces, the head width's tile padding zero). The stock
+    slice + reshape [N, S, heads, D] + permute pads `heads` to a tile dim. None when the shapes do not fit."""
+    xb, xs = [int(d) for d in x.padded_shape], [int(d) for d in x.shape]
+    if x.dtype not in (ttnn.float32, ttnn.bfloat16) or x.layout != ttnn.TILE_LAYOUT or x.is_sharded():
+        return None
+    if len(xb) != 4 or xb[1] != 1 or xs != xb or off % 16 or head_dim % 16 or off + heads * head_dim > xb[3]:
+        return None
+    N, S, W = xb[0], xb[2], xb[3]
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape([N, heads, S, head_dim]), x.dtype, ttnn.TILE_LAYOUT, x.device(), mem)
+    reader_ct = [_BATCH] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+    shape_rt = [S // 32, W // 32, heads, head_dim // 16, -(-head_dim // 32), off // 16]
+    return _copy_program([x], out, "reader_face_heads.cpp", reader_ct, shape_rt)
+
+
 def _copy_program(srcs, out, reader, reader_ct, shape_rt):
     """`reader` streams out's tiles in order (one source tile each) into cb 16; the stock interleaved writer stores
     them. Reader runtime args: the source addresses, (tile count, first tile), then shape_rt (shapes and offsets are
