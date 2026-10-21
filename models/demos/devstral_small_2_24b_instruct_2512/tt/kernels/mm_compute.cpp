@@ -120,6 +120,61 @@ inline void calculate_silu_mul(const uint32_t gate, const uint32_t up, const uin
         sfpi::dst_reg++;
     }
 }
+
+#ifdef SWIGLU_HOIST
+// calculate_silu_mul with the fp32 exp's 32-bit polynomial constants held in registers across the rows instead of
+// re-loaded (two SFPLOADIs each) every row: _sfpu_sigmoid_ = sfpu_reciprocal_iter<2>(1 + _sfpu_exp_fp32_accurate_(-x))
+// written out op for op, the same products and sums on the same values. Two constants ride in the programmable
+// constant registers (silu_mul_hoist_init, after silu_init's 2.0 in Prgm0), three in LREGs, which x leaves free by
+// being re-read from DEST for the final product (the row is unchanged there until the store). 42 SFPU instructions a
+// row instead of 52; the SFPU is issue-bound (~1 instruction a cycle), so the pass shrinks by the same fraction.
+inline void silu_mul_hoist_init() {
+    sfpi::vConstFloatPrgm1 = -6.93145752e-1f;
+    sfpi::vConstFloatPrgm2 = -1.42860677e-6f;
+}
+
+template <int ITERATIONS>
+inline void calculate_silu_mul_hoisted(const uint32_t gate, const uint32_t up, const uint32_t out) {
+    constexpr uint32_t T = 32;  // DEST rows a tile in sfpi addressing
+    const sfpi::vFloat c_log2e = 1.442695f;
+    const sfpi::vFloat c_p1 = 8.37312452e-3f;
+    const sfpi::vFloat c_p2 = 4.16695364e-2f;
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vFloat a = -sfpi::vFloat(sfpi::dst_reg[gate * T]);
+        // y = _sfpu_exp_fp32_accurate_<false>(a)
+        sfpi::vInt i, e;
+        sfpi::vFloat f, r, j, y;
+        sfpi::vSMag16 sm;
+        j = c_log2e * a;
+        r = 1.37805939e-3f;
+        sm = sfpi::convert<sfpi::vSMag16>(j, sfpi::RoundMode::Nearest);
+        j = sfpi::convert<sfpi::vFloat>(sm, sfpi::RoundMode::Nearest);
+        f = j * sfpi::vConstFloatPrgm1 + a;
+        f = j * sfpi::vConstFloatPrgm2 + f;
+        r = r * f + c_p1;
+        r = r * f + c_p2;
+        r = r * f + 1.66664720e-1f;
+        r = r * f + 4.99999851e-1f;
+        i = sfpi::abs(sfpi::as<sfpi::vInt>(sm));
+        y = r * f + 1.0f;
+        i = sfpi::as<sfpi::vInt>(sfpi::copysgn(sfpi::as<sfpi::vFloat>(i), j));
+        r = y * f + 1.0f;
+        y *= std::numeric_limits<float>::infinity();
+        e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
+        v_if(sfpi::nearby(e < 255)) {
+            y = sfpi::setexp(r, e);
+            v_if(sfpi::nearby(e < 1)) { y = 0.0f; }
+            v_endif;
+        }
+        v_endif;
+        sfpi::vFloat s = sfpi::vFloat(sfpi::dst_reg[gate * T]) * sfpu_reciprocal_iter<2>(1.0f + y);
+        sfpi::vFloat u = sfpi::dst_reg[up * T];
+        sfpi::dst_reg[out * T] = s * u;
+        sfpi::dst_reg++;
+    }
+}
+#endif  // SWIGLU_HOIST
 }  // namespace ckernel::sfpu
 #endif
 
@@ -131,7 +186,11 @@ inline void pack_silu_mul(const uint32_t gate, const uint32_t up, const uint32_t
     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
 #pragma GCC unroll 0
     for (int face = 0; face < 4; face++) {
+#ifdef SWIGLU_HOIST
+        ckernel::sfpu::calculate_silu_mul_hoisted<8>(gate, up, out);
+#else
         ckernel::sfpu::calculate_silu_mul<DST_ACCUM_MODE, 8>(gate, up, out);
+#endif
         TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
         TTI_SETRWC(p_setrwc::CLR_NONE, p_setrwc::CR_D, 8, 0, 0, p_setrwc::SET_D);
     }
@@ -151,6 +210,9 @@ void swiglu_block(uint32_t in_cb, uint32_t out_cb, uint32_t M_block_tiles, uint3
     copy_init(in_cb);
 #ifdef SWIGLU_PACK_SFPU
     silu_tile_init_pack();  // the SFPU pass runs on the PACK thread (pack_silu_mul), the datacopy stays on MATH
+#ifdef SWIGLU_HOIST
+    PACK((ckernel::sfpu::silu_mul_hoist_init()));
+#endif
 #else
     silu_tile_init();
     mul_binary_tile_init();

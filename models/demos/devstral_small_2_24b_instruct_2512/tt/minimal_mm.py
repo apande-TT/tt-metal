@@ -34,6 +34,9 @@ SWIGLU_PAIRS = 2
 # The SwiGLU epilogue's SFPU pass (silu * up) runs on the PACK thread (kernels/mm_compute.cpp pack_silu_mul) while MATH
 # copies the next pair group's partials into the other DEST half.
 SWIGLU_PACK_SFPU = True
+# ... with the exp polynomial's constants held in registers across the rows (mm_compute.cpp
+# calculate_silu_mul_hoisted: 42 instead of 52 SFPU instructions a row, the same arithmetic)
+SWIGLU_HOIST = True
 
 
 def _round_up(a, b):
@@ -282,6 +285,8 @@ def matmul(
     cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
     if fuse_swiglu and SWIGLU_PACK_SFPU:
         cdefines += [("SWIGLU_PACK_SFPU", "1")]
+        if SWIGLU_HOIST:
+            cdefines += [("SWIGLU_HOIST", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
 
