@@ -59,6 +59,13 @@ class TtMinistral3DecoderLayer:
     # Decode's residual adds write their fp32 sum straight into the decode norms' width-sharded layout (a sharded
     # residual stream between layers), so neither norm has to re-shard its input first.
     SHARDED_DECODE_RESIDUAL = True
+    # Decode's o_proj / MLP-down all_reduces as ONE collective each (tt/decode_all_reduce.py: all_reduce_async, fp32
+    # sum) instead of a reduce-scatter + all_gather pair; the streamed projections write their partials into the
+    # residual's width shards, where the sum lands too, so the residual add reads it natively.
+    DECODE_ONE_SHOT_ALL_REDUCE = True
+    # ... and the o_proj one folded into the MLP's gate / up program together with the residual add (its link workers
+    # exchange the partials while the gate / up weights already stream; TtMinistral3MLP.decode_ar).
+    DECODE_FOLD_OPROJ_REDUCE = True
 
     def __init__(self, device, torch_module, meta_rope=False, layer_idx=None) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order).
@@ -86,6 +93,18 @@ class TtMinistral3DecoderLayer:
             self.self_attn.decode_gather_mem = self.mlp.decode_gather_mem = self.post_attention_layernorm.decode_mem(
                 self.hidden
             )
+            if (
+                self.DECODE_ONE_SHOT_ALL_REDUCE
+                and self.tp % 2 == 0
+                and self.self_attn.stream_o is not None
+                and self.mlp.stream_down is not None
+            ):
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.decode_all_reduce import DecodeAllReduce
+
+                ccl = tp_ccl_args()
+                mem = self.self_attn.decode_gather_mem
+                ar = DecodeAllReduce.shared(device, mem, self.tp, ccl["topology"], ccl.get("num_links", 1))
+                self.self_attn.decode_all_reduce = self.mlp.decode_all_reduce = ar
         self._stats_mask = None
         if self.tp > 1 and self.SHARDED_PREFILL_NORM:
             # Picks column 0 of each device's sum-of-squares tile out of the gathered (.., S, 32 * TP) stats.
@@ -151,18 +170,37 @@ class TtMinistral3DecoderLayer:
             n = self.input_layernorm.decode(x, keep_sharded=self.self_attn.DECODE_SHARDED_INPUT)
         else:
             n = self._bf16(self.input_layernorm(self._bf16(x)))  # rms_norm reads bf16 (fp32 input overflows L1 at 5120)
-        a = self.self_attn(
-            n,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            kv_cache=kv_cache,
-            cur_pos=cur_pos,
-            mode=mode,
+        fold = (
+            mode == "decode"
+            and self.DECODE_FOLD_OPROJ_REDUCE
+            and self.self_attn.decode_all_reduce is not None
+            and self.self_attn.decode_all_reduce is self.mlp.decode_all_reduce
+            and getattr(self.mlp.fused_gate_up, "ar_accepts", None) is not None
         )
+        self.self_attn.defer_decode_reduce = fold  # o_proj's partials come back un-reduced
+        try:
+            a = self.self_attn(
+                n,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+                cur_pos=cur_pos,
+                mode=mode,
+            )
+        finally:
+            self.self_attn.defer_decode_reduce = False
         res_mem = None
         if mode == "decode" and self.SHARDED_DECODE_RESIDUAL:
             res_mem = self.post_attention_layernorm.decode_mem(int(x.shape[-1]))
+        if fold and self.mlp.ar_folds(x, a):
+            # all_reduce + residual add + norm + gate / up in one program, then down + its all_reduce
+            h, m = self.mlp.decode_ar(x, a)
+            ttnn.deallocate(a)
+            out = m if h is None else self._residual_add(h, m, res_mem)  # (None, new residual): the down folds it
+            return ttnn.reshape(out, in_shape) if len(in_shape) == 3 else out
+        if fold:
+            a = self.self_attn.decode_all_reduce(a)
         h = self._residual_add(x, a, res_mem)
         if mode == "decode" and self.mlp.decode_norms(h):
             # the gate / up program norms the residual's own width shards itself (its weight streams start meanwhile)
@@ -231,12 +269,31 @@ class TtMinistral3DecoderLayer:
         if total:  # bf16 parts of each row's whole-hidden sum, added back in fp32 (exact); no gather needed
             sq = ttnn.sum(ttnn.typecast(sq, ttnn.float32), dim=-1, keepdim=True, compute_kernel_config=cfg)
         else:
+            # tt/add_stats's stats carry exact zeros in columns 1..31 (add_stats.CLEAN_STATS): masking them is the
+            # identity, so only rms_norm_pre_all_gather's stats are masked
+            clean = sq is not None and self.FUSED_ADD_STATS and self._clean_stats()
             if sq is None:  # sum(x^2) in column 0
                 sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
-            sq = ttnn.multiply(ttnn.all_gather(sq, dim=3, **ccl), self._stats_mask)
+            sq = ttnn.all_gather(sq, dim=3, **ccl)
+            if not clean:
+                sq = ttnn.multiply(sq, self._stats_mask)
             sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
-        r = ttnn.rsqrt(ttnn.add(ttnn.multiply(sq, 1.0 / self.hidden), norm._impl.eps))
+        # rsqrt(sq / N + eps) as ONE SFPU chain: the same fp32 multiply, add and rsqrt the three separate ops ran
+        r = ttnn.unary_chain(
+            sq,
+            [
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, 1.0 / self.hidden),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.ADD_UNARY_SFPU, norm._impl.eps),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
+            ],
+        )
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
+
+    @staticmethod
+    def _clean_stats():
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
+
+        return getattr(add_stats, "CLEAN_STATS", False)
 
     def _residual_add_stats(self, x, delta):
         """(x + delta, the sum-of-squares stats of the sum or None) for the prefill residual (see FUSED_ADD_STATS)."""

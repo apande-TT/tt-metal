@@ -31,6 +31,11 @@ def _mesh_size(device):
 # device its own slice of the image batch (and gathers the projector output). False: tensor-parallel over the mesh.
 DATA_PARALLEL = False
 
+# The head split and the q/k RoPE as ONE C++ program (tt/heads_rope.py). True while the vision model builds its
+# transformer, whose rotary tables then hold the SIGNED sin (first half negated: TtPixtralRotaryEmbedding(
+# signed_sin=True)) that carries rotate_half's negation. Host-supplied tables are converted here.
+CPP_HEADS_ROPE = False
+
 
 def vision_tp(device):
     """(tensor-parallel degree of a vision module built now, mapper for its replicated tensors)."""
@@ -42,10 +47,19 @@ class TtPixtralAttention:
     # The fused q/k/v output (read once, by the head split, which frees it) lands in L1 while it takes at most this many
     # bytes per core (the data-parallel 8 x 256-row batch: 114 KB).
     QKV_OUT_L1_BYTES = 128 * 1024
+    # o_proj's fp32 output (added into the vision layer's residual stream, which stays in L1, see attention.py) lands in
+    # L1 while it takes at most this many bytes per core (8 x 256 x 1024 fp32: 76 KB); 0: DRAM.
+    OUT_L1_BYTES = 96 * 1024
+    # q / k / v (head split + RoPE output), SDPA's output and the head concat stay in L1 -- each freed by its one reader
+    # -- while q, k and v together take at most this many bytes per core (3 x 8 x 256 x 1024 bf16: 114 KB); 0: DRAM.
+    ATTN_L1_BYTES = 128 * 1024
+    # o_proj reads SDPA's head outputs as their concat itself when it also folds the residual add (see __call__).
+    FOLD_CONCAT = True
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
         self.device = device
+        self.cpp_rope = CPP_HEADS_ROPE
         self.tp, repl = vision_tp(device)
         tp = self.tp
         self.num_heads = torch_module.num_heads
@@ -80,10 +94,11 @@ class TtPixtralAttention:
         self.wqkv = _put(torch.hstack(chunks), shard(-1))  # 2-D slices: hstack == concat on dim -1
         self.wo = _put(torch_module.o_proj.weight.T, shard(-2))
 
-        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1)).
+        # rotate_half(x) == x @ R  (HF convention: cat(-x2, x1)). cpp_rope: the tables hold the signed sin, so R only
+        # swaps the halves (its fallback rotate-half chain then multiplies the same magnitudes with the same signs).
         half = hd // 2
         rot = torch.zeros(hd, hd)
-        rot[torch.arange(half) + half, torch.arange(half)] = -1.0
+        rot[torch.arange(half) + half, torch.arange(half)] = 1.0 if self.cpp_rope else -1.0
         rot[torch.arange(half), torch.arange(half) + half] = 1.0
         self.rot = _put(rot.reshape(1, 1, hd, hd), repl)
 
@@ -108,13 +123,13 @@ class TtPixtralAttention:
             mesh_mapper=self._repl,
         )
 
-    def _narrow_n_cfg(self, x, w):
+    def _narrow_n_cfg(self, x, w, shape=None):
         """minimal_matmul config whose blocks are the per-core M / N ranges where those are under 8 tiles (M splits
         along the grid's x axis and N along y when M > N, else the other way round): the default 8-tile blocks would
         compute mostly padding (TP o_proj: 4 of 8 N tiles valid, TP QKV: 3 of 8; the data-parallel QKV's 7 x 9-tile
         range ran 8 x 16). None (the default 8 x 8 blocks) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
-        shape = tuple(int(d) for d in x.shape)
+        shape = tuple(int(d) for d in (x.shape if shape is None else shape))
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
             mt *= d
@@ -177,6 +192,8 @@ class TtPixtralAttention:
         hd = self.head_dim
 
         cos, sin = position_embeddings
+        if self.cpp_rope and isinstance(sin, torch.Tensor):  # host tables come plain; device tables already signed
+            sin = torch.cat((-sin[..., : hd // 2], sin[..., hd // 2 :]), dim=-1)
         cos = self._to_tt(cos.reshape(1, 1, s, hd)) if isinstance(cos, torch.Tensor) else cos
         sin = self._to_tt(sin.reshape(1, 1, s, hd)) if isinstance(sin, torch.Tensor) else sin
         mask = attention_mask
@@ -187,62 +204,137 @@ class TtPixtralAttention:
         # rows as a batched matmul on 64 cores: 816 us).
         grid = self.device.compute_with_storage_grid_size()
         qkv_l1 = 2 * int(b) * int(s) * int(self.wqkv.shape[-1]) // (grid.x * grid.y) <= self.QKV_OUT_L1_BYTES
-        qkv = ttnn.experimental.minimal_matmul(
-            x,
-            self.wqkv,
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        qkv_kw = dict(
             config=self._narrow_n_cfg(x, self.wqkv),
             compute_kernel_config=self.compute_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,  # q / k / v in bf16 also when x is the fp32 norm output
         )
+        if qkv_kw["config"] is not None and minimal_mm.supported(x, self.wqkv, self.compute_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            qkv = minimal_mm.matmul(x, self.wqkv, **qkv_kw)
+        else:
+            qkv = ttnn.experimental.minimal_matmul(x, self.wqkv, **qkv_kw)
         if len(in_shape) == 4 and x.memory_config().buffer_type == ttnn.BufferType.L1:
             ttnn.deallocate(x)  # the caller's L1 norm output, read only here (see TtAttention)
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.local_heads,
-            num_kv_heads=self.local_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        if self.cpp_rope:
+            # (imported here: a module held on the instance would be walked by the perf harness's weight census)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import heads_rope
+        attn_l1 = (
+            self.tp == 1
+            and 0
+            < 3 * int(qkv.shape[0]) * int(s) * int(self.wo.shape[-2]) * 2 // (grid.x * grid.y)
+            <= self.ATTN_L1_BYTES
         )
-        if qkv_l1:
-            ttnn.deallocate(qkv)
-        q = self._rope(q, cos, sin)
-        k = self._rope(k, cos, sin)
+        head_mem = ttnn.L1_MEMORY_CONFIG if attn_l1 else ttnn.DRAM_MEMORY_CONFIG
+        if self.cpp_rope and heads_rope.supports(qkv, cos, sin, self.local_heads):
+            q, k, v = heads_rope.apply(qkv, cos, sin, self.local_heads, memory_config=head_mem)
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+        else:
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv,
+                num_heads=self.local_heads,
+                num_kv_heads=self.local_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+            q = self._rope(q, cos, sin)
+            k = self._rope(k, cos, sin)
+            attn_l1, head_mem = False, ttnn.DRAM_MEMORY_CONFIG
         if q.dtype != ttnn.bfloat16:  # fp32 activations upstream; SDPA reads bf16
             q, k, v = (ttnn.typecast(t, ttnn.bfloat16) for t in (q, k, v))
         # Widest key chunk the sequence allows: SDPA's per-key-chunk rescale rounding biases its output level
         # upward (+0.23% at k_chunk 32, +0.02% at 512 on the text model's attention).
         k_chunk = next(c for c in (512, 256, 128, 64, 32) if s % c == 0)
-        q_chunk = 64 if s % 64 == 0 else 32
-        attn = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=False,
-            attn_mask=mask,
-            scale=self.scale,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-                q_chunk_size=q_chunk,
-                k_chunk_size=k_chunk,
-                exp_approx_mode=False,
-            ),
-            compute_kernel_config=self.compute_cfg,
+        # Query chunk: 128 rows where the sequence allows (8 x 16 heads x 256 patches: 256 chunks over the grid's 110
+        # cores, 185 us vs 215 at 64 rows and 207 at 256 -- each chunk streams its key/value range once).
+        q_chunk = next(c for c in (128, 64, 32) if s % c == 0)
+        sdpa_cfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
+            q_chunk_size=q_chunk,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=False,
         )
-        attn = ttnn.experimental.nlp_concat_heads(attn)
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import sdpa_prefill
+
+        if sdpa_prefill.supported(q, k, v, False, mask, self.compute_cfg):
+            # the same program with the softmax's scale + exp as one SFPU pass (tt/sdpa_prefill.py), bit-identical
+            attn = sdpa_prefill.sdpa(q, k, v, False, self.scale, sdpa_cfg, self.compute_cfg, head_mem)
+        else:
+            attn = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False,
+                attn_mask=mask,
+                scale=self.scale,
+                program_config=sdpa_cfg,
+                compute_kernel_config=self.compute_cfg,
+                memory_config=head_mem,
+            )
+        if attn_l1:
+            for t in (q, k, v):
+                ttnn.deallocate(t)
+        heads = attn
+        # residual (the layer's fp32 residual stream x): return x + o_proj(attn). With TP = 1 the add rides in o_proj's
+        # output stage (tt/minimal_mm.py residual=: the same SFPU add ttnn.add runs, bit-identical), and FOLD_CONCAT:
+        # o_proj reads the SDPA heads as their concat itself (minimal_mm in0_heads=), no nlp_concat_heads program.
+        residual = kwargs.get("residual")
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        fused = residual is not None and self.tp == 1
+        cat_shape = (int(b), 1, int(s), int(self.wo.shape[-2]))
+        o_cfg = self._narrow_n_cfg(heads, self.wo, shape=cat_shape)
+        fold = (
+            fused
+            and self.FOLD_CONCAT
+            and o_cfg is not None
+            and minimal_mm.supports_heads(heads, self.wo)
+            and minimal_mm.supports_residual(heads, self.wo, residual, ttnn.float32, in0_heads=True)
+        )
+        if fold:
+            attn = heads
+        else:
+            attn = ttnn.experimental.nlp_concat_heads(heads, memory_config=head_mem)
+            if attn_l1:
+                ttnn.deallocate(heads)
         # fp32 output: it is added straight into the vision layer's fp32 residual stream. minimal_matmul folds the
         # images into its rows over the full grid (ttnn.linear ran the 32 x 256-row batch on 88 cores: 360 us), with
         # N blocks no wider than each core's N range (the default 8-tile block would be half padding at 4 tiles).
-        out = ttnn.experimental.minimal_matmul(
-            attn,
-            self.wo,
-            config=self._narrow_n_cfg(attn, self.wo),
+        out_l1 = (
+            self.tp == 1 and 0 < 4 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.OUT_L1_BYTES
+        )
+        o_kw = dict(
+            config=o_cfg,
             compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.float32,
         )
+        if fold:
+            out = minimal_mm.matmul(attn, self.wo, residual=residual, in0_heads=True, **o_kw)
+            residual = None
+        elif (
+            fused
+            and o_kw["config"] is not None
+            and minimal_mm.supported(attn, self.wo, self.compute_cfg)
+            and minimal_mm.supports_residual(attn, self.wo, residual, ttnn.float32)
+        ):
+            out = minimal_mm.matmul(attn, self.wo, residual=residual, **o_kw)
+            residual = None
+        else:
+            out = ttnn.experimental.minimal_matmul(attn, self.wo, **o_kw)
+        if attn_l1:
+            ttnn.deallocate(attn)
         if self.tp > 1:
             out = ttnn.all_reduce(out, topology=ttnn.Topology.Linear)
+        if residual is not None:
+            a, out = out, ttnn.add(residual, out, memory_config=o_kw["memory_config"])
+            ttnn.deallocate(a)
         if len(in_shape) == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out

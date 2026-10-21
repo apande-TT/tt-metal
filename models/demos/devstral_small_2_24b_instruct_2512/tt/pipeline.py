@@ -129,7 +129,7 @@ PLANNED_TP = 4
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
 #                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
-#                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
+#                     Fused gate/up computes at HiFi2 (LoFi on layers 14-25) (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
 #                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
 #   ministral3_model decode embedding: ONE program (tt/embed_decode.py) gathers each core's column slice of the token
 #                     rows, tilizes them to fp32 and writes the first layer's width-sharded residual directly (no
@@ -174,7 +174,7 @@ PLANNED_TP = 4
 #                     position below the KV capacity, built once by the same device ops on one dense position column
 #                     (32 positions a tile; ~0.1 ms at load instead of 2.65 ms) (no per-step cos / sin math,
 #                     concat or reshard; the fp32 position column is then no longer advanced). Decode QKV
-#                     is a DRAM-sharded matmul (2 readers per bank) over its own bank-sharded copy of [q | k | v]; decode
+#                     is a DRAM-sharded matmul (3 readers per bank, HiFi2) over its own bank-sharded copy of [q | k | v]; decode
 #                     QKV and o_proj read block-float8 copies (prefill keeps bf16). Decode o_proj is the MLP down's
 #                     C++ streaming program (tt/down_decode.py: bank-major bf8 copy, 8 x 10 cores, ~9 KB pushes,
 #                     bit-identical to the 1D-multicast matmul), its bf16 partials in L1 for the reduce-scatter.
@@ -217,10 +217,28 @@ PLANNED_TP = 4
 #                  to bf16 in L1 (full 8-tile K blocks). The down projection runs at HiFi2.
 #   attention (vision layer): each RMSNorm gamma is folded into the q/k/v and gate/up weights that read it (no separate
 #                     fp32 gamma multiply); the QKV and the gate/up read their norm outputs from L1 after an L1 cast
-#                     to bf16 (the gate/up's product fits in L1 too).
+#                     to bf16 (the gate/up's product fits in L1 too). The fp32 residual stream stays in L1 between
+#                     the layers (o_proj / down outputs and both residual adds in L1, consumed tensors freed):
+#                     adds 58 -> ~20 us, norms 36 -> 24 us, o_proj 73 -> 61 us, down 125 -> 117 us a layer.
+#                     q / k / v, the SDPA output and the head concat sit in L1 too (each freed by its reader):
+#                     SDPA 185 -> 167 us, head concat 25 -> 11 us a layer.
+#                     Both fp32 residual adds ride in the output stage of the matmul feeding them (o_proj, the MLP
+#                     down; tt/minimal_mm.py residual=: the residual block read by the stock readers' FUSE_TERNARY
+#                     path, added by the same SFPU add ttnn.add runs, bit-identical): o_proj + add 79.8 -> 67.9 us,
+#                     down + add 135.3 -> ~123 us a layer; trace encode 24.62 -> 23.72 ms.
+#                     o_proj reads SDPA's head outputs as their concat itself (minimal_mm in0_heads=, kernels/
+#                     mm_in0_heads.cpp: the stock in0 reader with its tile index remapped): no nlp_concat_heads
+#                     program (11.4 us a layer), bit-identical.
+#                     The L1 casts of both norm outputs to bf16 run as tt/local_cast.py (LOCAL_CAST: every core casts
+#                     the pages of its own L1 bank with ttnn.typecast's compute, rounding loop unrolled; bit-identical):
+#                     10.3 -> 7.2 us a cast, 48 an encode.
+#   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
+#                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
 #                     run on the reduce-scatter shard (sum-of-squares all_gather) and the bf16 norm output is all_gathered.
-#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py);
+#   ministral3_decoder_layer prefill residual adds: C++ add + next-norm sum of squares in one pass (tt/add_stats.py),
+#                     whose stats tile has exact zeros beside the row sum, so the gathered stats need no mask multiply;
+#                     rsqrt(stats / N + eps) runs as one unary_chain;
 #                     the last layer's final add emits the bf16 residual for the gather directly (no fp32 copy + cast).
 #   text decoder all_reduces (o_proj, MLP down): reduce-scatter + bf16 all_gather of the reduced shard; prefill's
 #                     and decode's partials are produced and reduce-scattered in bf16 (half the bytes, no cast),
@@ -232,6 +250,54 @@ PLANNED_TP = 4
 #                     height-sharded heads (no rotate-half matmul / mul / add chain, no unshard + reshard of k); q
 #                     shares k's tables while the KV capacity is below the llama-4 scaling threshold (scale == 1).
 #                     Prefill's q / k RoPE are one fused rotary_embedding_llama each too (interleaved, all users at once).
+#   pixtral_attention CPP_HEADS_ROPE: each vision layer's head split and q / k RoPE run as ONE C++ program
+#                     (tt/heads_rope.py: per tile, x * cos + partner * signed sin, replaying ttnn.multiply's SFPU and
+#                     ttnn.add's FPU bf16 ops -- bit-identical to the rotate-half chain, no matmul) instead of
+#                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor. The vision
+#                     SDPA runs 128-row query chunks (one 256-row key chunk).
+#   ministral3_m_l_p prefill fused gate/up: M blocks that tile each core's M range with the least padding (416-row
+#                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
+#                     The long-prompt QKV / o_proj take N blocks of each core's narrow N range (QKV: 5 tiles, 4 x 1
+#                     subblocks) and the MLP down 1 x 4 subblocks.
+#   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
+#                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
+#                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
+#                     the lm_head multiplies at HiFi4 (free under its weight stream); decode down bf4 on layers 16-25.
+#   ministral3_decoder_layer decode all_reduces (o_proj, MLP down): ONE all_reduce_async each (tt/decode_all_reduce.py)
+#                     instead of reduce-scatter + all_gather: the streamed projections write their bf16 partials into
+#                     the residual's 40-core width shards, every device multicasts them into one shared 32 KB/core
+#                     scratch, summed in fp32 DEST and rounded once, and the residual add reads the sum natively
+#                     (trace decode 15.99 -> 15.75 -> 15.48 ms). The scratch fits L1 because the prefill final norm runs
+#                     with no all-ones weight row and minimal_mm keeps one output-block buffer (vision gate / up -86 KB).
+#   decode o_proj all_reduce + residual add folded into the MLP's gate / up program (NormGateUpDecode.ar_norm_call):
+#                     two fabric-link workers (kernels/ar_send.cpp, all_reduce_async's line-multicast exchange) push the
+#                     partial shards into every device's scratch at launch, the norm cores sum the slots and add the
+#                     residual exactly as all_reduce_async + ttnn.add do, then norm -- the exchange runs under the weight
+#                     streams (trace decode 15.48 -> 15.14 ms, PCC unchanged).
+#   ministral3_m_l_p: the block-float4 decode gate / up and down multiply at HiFi2 (the bf4 gate / up is compute-bound;
+#                     trace decode 15.09 -> 14.72 ms, PCC 0.995223); decode down bf4 on layers 16-26 (14.67 ms, PCC 0.995097).
+#   decode gate / up spread over 104 cores (NormGateUpDecode.SPREAD): the 40 norm cores take 2 columns each once their
+#                     norm is done and the stream cores 3 or 2 (was 4), every bank still serving 32 columns: the bf4
+#                     layers' post-prologue matmul shrinks by a quarter and the extra readers lift the bf8 stream (bf8
+#                     gate / up 214.6 -> 191.5 us; trace decode 14.67 -> 14.16 ms, bit-identical).
+#   decode down / o_proj streams spread over 104 cores (StreamDownDecode.SPREAD): per bank 7 cores with two columns
+#                     and 6 with one, whose pushes alternate between its two RISCs (bf8 down 110.5 -> 101.4 us, o_proj
+#                     15.3 -> 13.6 us; trace decode 14.16 -> 13.92 ms, bit-identical).
+#   lm_head stream spread over 104 cores (LMHeadDecode.SPREAD): one column a copy a pass, 5 or 4 passes a core
+#                     (419.7 -> 375.7 us, ~474 GB/s; trace decode 13.92 -> 13.88 ms, bit-identical).
+#   decode MLP down all_reduce + residual add folded into the down program (StreamDownDecode.ar_call): each core's
+#                     columns stream one at a time, the fabric-link workers (kernels/ar_send_waves.cpp) send the
+#                     first-column shards while the second columns stream, the residual cores sum the slots and add
+#                     the residual (all_reduce_async + ttnn.add bit for bit); the senders multicast half of x on each
+#                     NOC (one RISC's 512 KB multicast landed x ~40-60 us in). Trace decode 13.88 -> 13.61 ms.
+#   decode gate / up sender multicasts half of the gathered normed row on each NOC (NormGateUpDecode.DUAL_NOC_SENDER):
+#                     bf8 gate / up 191.5 -> ~184 us, the bf4 layers' matmul starts earlier; trace 13.61 -> 13.37 ms.
+#   decode down fold: a two-column core's second column split into a leading run of pushes for RISCV_0 (18, then 20
+#                     of 32) and a trailing one for RISCV_1, whose NOC 1 reads fall behind once only those cores stream
+#                     (StreamDownDecode.SPLIT_B_SHARE): down 119.7 -> 116.8 us; trace 13.37 -> 13.22 -> 13.18 ms.
+#   decode down fold: each partial tile goes straight into its link worker's send buffer and the worker sends every
+#                     shard once its tiles are in (StreamDownDecode.DIRECT_SEND, kernels/ar_send_shards.cpp), not a
+#                     wave's shards read back after the whole wave.
 
 
 def kv_capacity_for(tp):
@@ -888,8 +954,15 @@ class DevstralPipeline:
 
     # ------------------------------------------------------------------ host -> device (outside any forward)
 
+    # Tile-layout uploads up to this many elements are tilized on the host: the per-request positions / pos /
+    # unfinished columns otherwise each cost a device TilizeWithValPadding launch (one of them on a single core).
+    HOST_TILIZE_MAX = 1 << 16
+
     def _put(self, t, dtype, layout):
-        return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
+        t = t.contiguous()
+        if layout == ttnn.TILE_LAYOUT and t.numel() <= self.HOST_TILIZE_MAX:
+            return ttnn.to_device(ttnn.from_torch(t, dtype=dtype, layout=layout, mesh_mapper=self._repl), self.device)
+        return ttnn.from_torch(t, dtype=dtype, layout=layout, device=self.device, mesh_mapper=self._repl)
 
     def _put_pixels(self, pixel_values, sizes):
         """Upload an image batch: equal-size images go up already patchified on the host (the vision tower's own

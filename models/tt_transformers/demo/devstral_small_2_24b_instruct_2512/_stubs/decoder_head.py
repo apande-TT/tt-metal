@@ -152,15 +152,37 @@ class DecoderHead:
             mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1) if self.tp > 1 else None,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        # HiFi4: the one-row lm_head is bound by its weight stream, so the full-precision products cost nothing
         self.compute_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
         )
+        # The one-tile-row call (decode, and prefill's last prompt rows) as the streaming program of
+        # tt/lm_head_decode.py over bank-major copies of the weight (same products, same K order, fp32 DEST).
+        self.stream = None
+        if self.tp > 1 and self.STREAM_LM_HEAD:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.lm_head_decode import LMHeadDecode
+
+            k, n = int(w.shape[0]), int(w.shape[1]) // self.tp
+            if LMHeadDecode.supports(device, k, n, ttnn.bfloat8_b):
+                put = lambda t, dtype: ttnn.from_torch(
+                    t.contiguous(),
+                    dtype=dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=device,
+                    mesh_mapper=ttnn.ShardTensorToMesh(device, dim=-1),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                self.stream = LMHeadDecode(device, w, ttnn.bfloat8_b, ttnn.MathFidelity.HiFi4, put, tp=self.tp)
+
+    STREAM_LM_HEAD = True
 
     def _apply__root_(self, x):
+        if self.stream is not None and self.stream.accepts(x):
+            return self.stream(x)
         return ttnn.linear(x, self.w__root__weight, compute_kernel_config=self.compute_cfg)
 
     def __call__(self, x, *args, gather=True, **kwargs):

@@ -33,18 +33,33 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 # step streams); the other layers keep DECODE_WEIGHT_DTYPE.
 DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
 DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
+# Layers whose many-row (prefill) fused gate/up computes at LoFi instead of GATE_UP_FIDELITY (LoFi on every layer:
+# prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137; 16-24: 1134 ms, 0.995147;
+# 8-31: 1073 ms, PCC 0.99509 and 12-27: 1107 ms, PCC 0.995806 fail test_e2e_text_generation's token agreement).
+PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
-# Math fidelity of the bf4 decode gate / up (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
-DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi3
+# Math fidelity of the bf4 decode gate / up and down (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
+# HiFi2: the bf4 gate / up program is compute-bound (~100 us of matmul after its prologue vs ~95 us of weight stream),
+# so the pass fewer is decode time (trace 15.09 -> 14.72 ms); not bit-exact, text logits PCC 0.995037 -> 0.995223.
+DECODE_GATE_UP_BF4_FIDELITY = ttnn.MathFidelity.HiFi2
 # K tiles per activation multicast block of the decode down projection (divides K = 256 tiles).
 DOWN_DECODE_K_BLOCK = 8
 # Decode down projection as one C++ program streaming a bank-major weight copy (tt/down_decode.py).
 DOWN_DECODE_STREAM = True
-# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight). 16-24: layer
+# Decoder layers whose decode-only down copy is block-float4 (the others read the bf8 prefill weight). 16-26 (layer 26
+# added once the bf4 HiFi2 matmuls raised the gate PCC 0.995037 -> 0.995223: 0.995097 at 16-26, 0.994848 at 16-28).
+# Before: 16-25 (layer 25
+# added once the HiFi4 lm_head raised the gate PCC 0.995070 -> 0.995097: 0.995078 at 16-25). 16-24: layer
 # 15 went back to bf8 (gate PCC 0.995034 at 15-24, 0.995374 at 16-23), headroom the fixed-chunk decode SDPA
 # (ministral3_attention DECODE_SDPA_K_CHUNK, -0.22 ms for -0.00018 PCC) spends.
-DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 25))
+DECODE_DOWN_BF4_LAYERS = frozenset(range(16, 27))
+# The decode down program folds its all_reduce and the residual add in (tt/down_decode.py StreamDownDecode.ar_call):
+# its fabric-link workers send the partial shards of each core's first column while the second columns still stream.
+DECODE_DOWN_AR_FOLD = True
+# Many-row (prefill / vision) fused gate/up through tt/minimal_mm.py: minimal_matmul's own program with its
+# output stage regrouped -- silu * up as ONE SFPU pass (the SFPU is ~1.4 ms of the 416-row gate/up's 9.8), bit-identical.
+PREFILL_MM_PROGRAM = True
 # Decode gate / up / silu-multiply as one C++ program (tt/gate_up_decode.py).
 DECODE_GATE_UP_FUSED = True
 # ... with the post-attention RMSNorm folded into that program's prologue (tt/gate_up_decode.py NormGateUpDecode): it
@@ -64,6 +79,8 @@ class TtMinistral3MLP:
     GATHER_DTYPE = ttnn.bfloat16
     # Set by the decoder layer: the decode all_gather writes straight into its residual add's width shards.
     decode_gather_mem = None
+    # Set by the decoder layer: decode's down all_reduce as one collective (tt/decode_all_reduce.py).
+    decode_all_reduce = None
     # dtype of the many-row (prefill) down projection's partials and their reduce-scatter (None: OUT_DTYPE). The text
     # decoder reduce-scatters prefill's partials in bf16 (half the bytes, no cast before the gather).
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
@@ -82,6 +99,12 @@ class TtMinistral3MLP:
     # The many-row SwiGLU product goes to the down projection through L1 (interleaved, freed right after) while it
     # takes at most this many bytes per core (the vision MLP's 8192 x 1024 bf16: 152 KB; the text MLP's is far larger).
     PREFILL_INTER_L1_BYTES = 192 * 1024
+    # The many-row down projection's output lands in L1 while it takes at most this many bytes per core (0: DRAM). The
+    # vision MLPs set it: their fp32 output is added into the L1-resident vision residual stream (see attention.py).
+    DOWN_OUT_L1_BYTES = 0
+    # The many-row down projection folds a fp32 residual add into its output stage (tt/minimal_mm.py residual=,
+    # bit-identical to ttnn.add(residual, down)): __call__(x, residual=h) returns h + mlp(x). The vision MLPs set it.
+    FUSE_RESIDUAL_DOWN = False
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -204,7 +227,9 @@ class TtMinistral3MLP:
                 if StreamDownDecode.supports(device, self.inter, n_out, wdt):
                     fid = DECODE_GATE_UP_BF4_FIDELITY if lowp_down else ttnn.MathFidelity.HiFi4
                     put = lambda t, dtype: _put(t, shard(-2), dtype)
-                    self.stream_down = StreamDownDecode(device, torch_module.down_proj.weight.T, wdt, fid, put, tp)
+                    self.stream_down = StreamDownDecode(
+                        device, torch_module.down_proj.weight.T, wdt, fid, put, tp, ar_fold=DECODE_DOWN_AR_FOLD
+                    )
             if self.stream_down is not None:
                 self.w_down_decode = None
             elif lowp_down:
@@ -255,9 +280,10 @@ class TtMinistral3MLP:
                 packer_l1_acc=False,
             )
         # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
+        lofi = type(self) is TtMinistral3MLP and layer_idx is not None and layer_idx in PREFILL_GATE_UP_LOFI_LAYERS
         self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=self.GATE_UP_FIDELITY,
+            math_fidelity=ttnn.MathFidelity.LoFi if lofi else self.GATE_UP_FIDELITY,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
@@ -276,8 +302,9 @@ class TtMinistral3MLP:
         """Whether the decode gate / up can take the residual h itself and norm it (NormGateUpDecode)."""
         return getattr(self.fused_gate_up, "accepts", None) is not None and self.fused_gate_up.accepts(h)
 
-    def __call__(self, x, *args, mode="prefill", residual_norm=False, **kwargs):
-        """residual_norm (decode, decode_norms(x)): x is the residual, normed here by the gate / up program."""
+    def __call__(self, x, *args, mode="prefill", residual_norm=False, residual=None, **kwargs):
+        """residual_norm (decode, decode_norms(x)): x is the residual, normed here by the gate / up program.
+        residual (many-row, TP = 1): return residual + mlp(x) (FUSE_RESIDUAL_DOWN: the add folded into the down)."""
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
@@ -290,8 +317,10 @@ class TtMinistral3MLP:
             # peak DRAM stays small (rows are independent, so the result is identical).
             parts = [self._forward(ttnn.slice(x, [i, 0, 0, 0], [min(i + step, b), 1, s, d])) for i in range(0, b, step)]
             out = ttnn.concat(parts, dim=0)
+            if residual is not None:
+                out = ttnn.add(residual, out)
             return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
-        out = self._forward(x)
+        out = self._forward(x, residual)
         return ttnn.reshape(out, shape[:-1] + (out.shape[-1],))
 
     def _forward_decode(self, x, residual_norm=False):
@@ -308,7 +337,28 @@ class TtMinistral3MLP:
             g = ttnn.linear(x, self.w_gate, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             u = ttnn.linear(x, self.w_up, program_config=pc, memory_config=l1, compute_kernel_config=cfg)
             m = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU], memory_config=l1)
+        return self._decode_down(m)
+
+    def decode_ar(self, x, p):
+        """Decode with the attention's o_proj all_reduce and the residual add folded into the gate / up program
+        (tt/gate_up_decode.py NormGateUpDecode.ar_norm_call): x the residual, p this device's o_proj partials. Returns
+        (h, mlp(norm(h))) with h = x + all_reduce(p) -- or (None, h + mlp(norm(h))) when the down program folds its own
+        all_reduce and the residual add in too (DECODE_DOWN_AR_FOLD, tt/down_decode.py StreamDownDecode.ar_call)."""
+        h, m = self.fused_gate_up.ar_norm_call(x, p, self.decode_all_reduce)
+        sd = self.stream_down
+        if sd is not None and sd.ar_ok(m, h, self.decode_all_reduce):
+            return None, sd.ar_call(m, h, self.decode_all_reduce)
+        return h, self._decode_down(m)
+
+    def ar_folds(self, x, p) -> bool:
+        """Whether decode_ar can take (x, p)."""
+        fn = getattr(self.fused_gate_up, "ar_accepts", None)
+        return fn is not None and fn(x, p, self.decode_all_reduce)
+
+    def _decode_down(self, m):
         if self.stream_down is not None:  # one program streaming the bank-major down copy (tt/down_decode.py)
+            if self.decode_all_reduce is not None:  # partials in its width shards, one collective
+                return self.decode_all_reduce(self.stream_down(m, memory_config=self.decode_all_reduce.mem))
             return self._reduce(self.stream_down(m))
         out = ttnn.linear(
             m,
@@ -337,34 +387,45 @@ class TtMinistral3MLP:
         """Each core's M tile range in minimal_matmul (M splits along the grid's x axis when M > N, else along y)."""
         return -(-mt // (grid.x if mt > nt else grid.y))
 
-    def _forward(self, x):
+    def _forward(self, x, residual=None):
         grid = self.device.compute_with_storage_grid_size()
         rows = 1
         for d in tuple(int(v) for v in x.shape)[:-1]:
             rows *= d
         x_l1 = x.memory_config().buffer_type == ttnn.BufferType.L1
         inter_l1 = 0 < 2 * rows * self.inter // (grid.x * grid.y) <= self.PREFILL_INTER_L1_BYTES
-        # M blocks no taller than each core's M range (the data-parallel vision MLP's 2048 rows give 7 tiles a core;
-        # an 8-tile block would compute a padded row of tiles)
+        # M blocks that tile each core's M range with the least padding (no taller than 8 tiles): the SwiGLU epilogue
+        # runs whole blocks, so the 416-row prompt's 42 tiles a core take six 7-tile blocks (8-tile blocks padded the
+        # last to 8 for 2 real rows), the data-parallel vision MLP's 7 one, the 128-row prompt's 13 two. Paired with
+        # 1 x 4 subblocks: 9844 vs 10166 us at HiFi2 and 5947 vs 7310 us at LoFi on the 416-row prompt (8-tile M, 2 x 2).
+        # The fp32 intermediate accumulates every output tile's K blocks in the same order whatever the blocking.
         nt_gu = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
-        m_gu = min(8, self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid))
-        m = ttnn.experimental.minimal_matmul(
-            x,
-            self.w_gate_up,
-            config=ttnn.MinimalMatmulConfig(
-                M_block_size=m_gu,
-                # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
-                K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
-                N_block_size=self._gate_up_n_block(x, grid),
-                subblock_h=2 if m_gu % 2 == 0 else 1,
-                subblock_w=2 if m_gu % 2 == 0 else 4 if self._gate_up_n_block(x, grid) % 4 == 0 else 2,
-                compute_with_storage_grid_size=grid,
-            ),
+        m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid)
+        m_gu = min(range(min(8, m_rng), max(1, min(8, m_rng) // 2) - 1, -1), key=lambda b: -(-m_rng // b) * b - m_rng)
+        n_gu = self._gate_up_n_block(x, grid)
+        gu_cfg = ttnn.MinimalMatmulConfig(
+            M_block_size=m_gu,
+            # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
+            K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
+            N_block_size=n_gu,
+            subblock_h=1 if n_gu % 4 == 0 else 2 if m_gu % 2 == 0 else 1,
+            subblock_w=4 if n_gu % 4 == 0 else 2,
+            compute_with_storage_grid_size=grid,
+        )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        gu_kw = dict(
+            config=gu_cfg,
             compute_kernel_config=self.gate_up_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if inter_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
             fuse_swiglu=True,
         )
+        if PREFILL_MM_PROGRAM and minimal_mm.supported(x, self.w_gate_up, self.gate_up_cfg, fuse_swiglu=True):
+            # the same program with silu * up as one SFPU pass (tt/minimal_mm.py), bit-identical
+            m = minimal_mm.matmul(x, self.w_gate_up, **gu_kw)
+        else:
+            m = ttnn.experimental.minimal_matmul(x, self.w_gate_up, **gu_kw)
         if x_l1:  # the caller's norm output, read only here (see TtAttention)
             ttnn.deallocate(x)
         # Many-row down projection on the full grid as well (ttnn.linear's auto config left it at ~45 TFLOP/s). A short
@@ -397,17 +458,50 @@ class TtMinistral3MLP:
                 subblock_w=2,
                 compute_with_storage_grid_size=grid,
             )
-        out = ttnn.experimental.minimal_matmul(
-            m,
-            self.w_down,
+        elif -(-nt // (grid.y if mt > nt else grid.x)) % 8 == 0:
+            # A wide per-core N range (the 416-row prompt's 160 output tiles over 10 cores: 16) in 8-tile blocks of 1 x 4
+            # subblocks (4142 -> 4108 us; the default config runs 2 x 2).
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=8,
+                subblock_h=1,
+                subblock_w=4,
+                compute_with_storage_grid_size=grid,
+            )
+        down_dtype = self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE
+        out_bytes = (4 if down_dtype == ttnn.float32 else 2) * rows * nt * ttnn.TILE_SIZE // (grid.x * grid.y)
+        down_l1 = self.tp == 1 and 0 < out_bytes <= self.DOWN_OUT_L1_BYTES
+        # (stock op: its copy-out epilogue costs ~nothing, measured 4110 vs 4109 us through tt/minimal_mm.py)
+        down_kw = dict(
             config=down_cfg,
             compute_kernel_config=self.down_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            dtype=self.PREFILL_REDUCE_DTYPE if (self.PREFILL_REDUCE_DTYPE and self.tp > 1) else self.OUT_DTYPE,
+            memory_config=ttnn.L1_MEMORY_CONFIG if down_l1 else ttnn.DRAM_MEMORY_CONFIG,
+            dtype=down_dtype,
         )
+        if (
+            residual is not None
+            and self.FUSE_RESIDUAL_DOWN
+            and self.tp == 1
+            and down_cfg is not None
+            and minimal_mm.supported(m, self.w_down, self.down_cfg)
+            and minimal_mm.supports_residual(m, self.w_down, residual, down_dtype)
+        ):
+            # residual + down(m) in one program (tt/minimal_mm.py residual=), bit-identical to the add below
+            out = minimal_mm.matmul(m, self.w_down, residual=residual, **down_kw)
+            residual = None
+        elif down_cfg is not None and minimal_mm.supported(m, self.w_down, self.down_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            out = minimal_mm.matmul(m, self.w_down, **down_kw)
+        else:
+            out = ttnn.experimental.minimal_matmul(m, self.w_down, **down_kw)
         if inter_l1:
             ttnn.deallocate(m)
-        return self._reduce(out, gather=self.prefill_gather)
+        out = self._reduce(out, gather=self.prefill_gather)
+        if residual is not None:
+            f, out = out, ttnn.add(residual, out, memory_config=out.memory_config())
+            ttnn.deallocate(f)
+        return out
 
     def _reduce(self, out, gather=True):
         if self.tp == 1:

@@ -23,6 +23,10 @@ import torch
 import ttnn
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_attention import vision_tp
 
+# The side-by-side batch's 2 x 2 unfold as one tile-layout program (tt/patch_unfold.py) instead of untilize + reshape +
+# permute + reshape + tilize (286 -> 40 us for 8 images of 16 x 16 patches, byte-identical).
+PATCH_UNFOLD_PROGRAM = True
+
 
 class TtMistral3PatchMerger:
     def __init__(self, device, torch_module) -> None:
@@ -72,9 +76,22 @@ class TtMistral3PatchMerger:
     def _merge(self, x):
         # minimal_matmul folds the images into its rows and spreads them over the full grid; ttnn.linear's auto
         # config ran the side-by-side batch (32 x 64 rows, K 4096, N 256) as a batched matmul on 16 cores (2.8 ms).
-        out = ttnn.experimental.minimal_matmul(
-            x, self.w_merge, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if minimal_mm.supported(x, self.w_merge, self.compute_cfg):
+            # the stock op's default blocking as minimal_mm's program, its core ranges' padding skipped (SKIP_PADDING)
+            out = minimal_mm.matmul(
+                x,
+                self.w_merge,
+                minimal_mm.default_config(self.device, self.compute_cfg, x, self.w_merge),
+                self.compute_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=x.dtype,  # the stock op's output dtype when none is given
+            )
+        else:
+            out = ttnn.experimental.minimal_matmul(
+                x, self.w_merge, compute_kernel_config=self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
         if self.tp > 1:
             out = ttnn.all_gather(out, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         return out
@@ -87,7 +104,15 @@ class TtMistral3PatchMerger:
             assert len(set(grids)) == 1, "side-by-side images must share one size"
             h, w = grids[0]
             b = x.shape[0]
-            x = ttnn.to_layout(ttnn.reshape(x, (b, 1, h * w, self.d)), ttnn.ROW_MAJOR_LAYOUT)
+            x = ttnn.reshape(x, (b, 1, h * w, self.d))
+            # (imported here: a module held on the instance would be walked by the perf harness's weight census)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import patch_unfold
+
+            if PATCH_UNFOLD_PROGRAM and patch_unfold.supports(x, h, w, self.merge):
+                # the unfold as one tile-layout data-movement program (tt/patch_unfold.py), byte-identical
+                y = patch_unfold.apply(x, h, w)
+                return self._merge(y)
+            x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
             x = ttnn.to_layout(self._unfold(x, b, h, w), ttnn.TILE_LAYOUT)
             return self._merge(x)
 

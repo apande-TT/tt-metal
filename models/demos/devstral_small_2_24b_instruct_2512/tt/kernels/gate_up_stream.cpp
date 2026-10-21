@@ -15,61 +15,81 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-void kernel_main() {
-    constexpr uint32_t Kt = get_compile_time_arg_val(0);  // K tiles
-    constexpr uint32_t NB = get_compile_time_arg_val(1);  // DRAM banks the weight is interleaved over
-    constexpr uint32_t NC = get_compile_time_arg_val(2);  // columns a core
-    constexpr uint32_t RB = get_compile_time_arg_val(3);  // K rows a push
-    constexpr uint32_t w_tile = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_w = get_compile_time_arg_val(5);
-    constexpr uint32_t DEPTH = get_compile_time_arg_val(6);  // pushes cb_w holds
-    constexpr bool OWNER = get_compile_time_arg_val(7);
-    constexpr uint32_t sem_ready = get_compile_time_arg_val(8);
-    constexpr uint32_t sem_valid = get_compile_time_arg_val(9);
-    constexpr uint32_t out_tile = get_compile_time_arg_val(10);
-    constexpr uint32_t OUT_NC = get_compile_time_arg_val(11);  // output tiles the OWNER writes
-    constexpr auto w_args = TensorAccessorArgs<12>();
-    constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
-    static_assert(Kt % RB == 0, "gate_up blocking");
+// GU_NSEND: senders the activation comes from (gate_up_sender.cpp X_SLICE: one valid count each)
+#ifndef GU_NSEND
+#define GU_NSEND 1
+#endif
 
-    const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(0));
-    const uint32_t n0 = get_arg_val<uint32_t>(1);  // this core's first output column
-    uint32_t page = get_arg_val<uint32_t>(5);      // first page of this core's first push
+// GU_CTA / GU_RTA: where this stream's compile-time / runtime args start (norm_gate_stream_dm.cpp appends a stream
+// to the norm cores' dataflow, after the norm's own args)
+#ifndef GU_CTA
+#define GU_CTA 0
+#endif
+#ifndef GU_RTA
+#define GU_RTA 0
+#endif
+// GU_PSTEP: this RISC streams every GU_PSTEP-th push of its column(s) -- the first at runtime arg 5's page, each next
+// GU_PSTEP pushes on (tt/down_decode.py's one-column cores split a column's pushes over both RISCs)
+#ifndef GU_PSTEP
+#define GU_PSTEP 1
+#endif
+
+void kernel_main() {
+    constexpr uint32_t Kt = get_compile_time_arg_val(GU_CTA + 0);  // K tiles
+    constexpr uint32_t NB = get_compile_time_arg_val(GU_CTA + 1);  // DRAM banks the weight is interleaved over
+    constexpr uint32_t NC = get_compile_time_arg_val(GU_CTA + 2);  // columns a core
+    constexpr uint32_t RB = get_compile_time_arg_val(GU_CTA + 3);  // K rows a push
+    constexpr uint32_t w_tile = get_compile_time_arg_val(GU_CTA + 4);
+    constexpr uint32_t cb_w = get_compile_time_arg_val(GU_CTA + 5);
+    constexpr uint32_t DEPTH = get_compile_time_arg_val(GU_CTA + 6);  // pushes cb_w holds
+    constexpr bool OWNER = get_compile_time_arg_val(GU_CTA + 7);
+    constexpr uint32_t sem_ready = get_compile_time_arg_val(GU_CTA + 8);
+    constexpr uint32_t sem_valid = get_compile_time_arg_val(GU_CTA + 9);
+    constexpr uint32_t out_tile = get_compile_time_arg_val(GU_CTA + 10);
+    constexpr uint32_t OUT_NC = get_compile_time_arg_val(GU_CTA + 11);  // output tiles the OWNER writes
+    constexpr auto w_args = TensorAccessorArgs<GU_CTA + 12>();
+    constexpr auto o_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
+    static_assert(Kt % (RB * GU_PSTEP) == 0, "gate_up blocking");
+
+    const auto w = TensorAccessor(w_args, get_arg_val<uint32_t>(GU_RTA + 0));
+    const uint32_t n0 = get_arg_val<uint32_t>(GU_RTA + 1);  // this core's first output column
+    uint32_t page = get_arg_val<uint32_t>(GU_RTA + 5);      // first page of this core's first push
     constexpr uint32_t T = RB * NC;                // tiles a push
     constexpr uint32_t cb_x = 0, cb_out = 16;
     volatile tt_l1_ptr uint32_t* valid = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_valid));
 
     bool have_x = !OWNER;
     if constexpr (OWNER) {
-        const uint32_t sx = get_arg_val<uint32_t>(3), sy = get_arg_val<uint32_t>(4);  // the sender, NOC coordinates
+        // the sender, NOC coordinates
+        const uint32_t sx = get_arg_val<uint32_t>(GU_RTA + 3), sy = get_arg_val<uint32_t>(GU_RTA + 4);
         cb_reserve_back(cb_x, Kt);
         noc_semaphore_inc(get_noc_addr(sx, sy, get_semaphore(sem_ready)), 1);
     }
 
     uint32_t push = 0;
-    for (uint32_t k0 = 0; k0 < Kt; k0 += RB, ++push) {
+    for (uint32_t k0 = 0; k0 < Kt / GU_PSTEP; k0 += RB, ++push) {
         if (!have_x) {
             // compute consumes no weight before x: once cb_w is full, x must be handed over before reserving more
             invalidate_l1_cache();
-            if (push >= DEPTH || *valid != 0) {
-                noc_semaphore_wait(valid, 1);
+            if (push >= DEPTH || *valid >= GU_NSEND) {
+                noc_semaphore_wait(valid, GU_NSEND);
                 cb_push_back(cb_x, Kt);
                 have_x = true;
             }
         }
         cb_reserve_back(cb_w, T);
         noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), T * w_tile);
-        page += T * NB;
+        page += T * NB * GU_PSTEP;
         noc_async_read_barrier();
         cb_push_back(cb_w, T);
     }
 
     if constexpr (OWNER) {
         if (!have_x) {
-            noc_semaphore_wait(valid, 1);
+            noc_semaphore_wait(valid, GU_NSEND);
             cb_push_back(cb_x, Kt);
         }
-        const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(2));
+        const auto out = TensorAccessor(o_args, get_arg_val<uint32_t>(GU_RTA + 2));
         cb_wait_front(cb_out, OUT_NC);
         const uint32_t l1 = get_read_ptr(cb_out);
         for (uint32_t c = 0; c < OUT_NC; ++c) {

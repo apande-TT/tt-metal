@@ -142,6 +142,11 @@ class TtMinistral3Attention:
     # Set by the decoder layer: the width-sharded layout its decode residual add runs in. The decode all_gather of
     # the reduced o_proj shard writes straight into it, so the add reads two shards (no interleaved row).
     decode_gather_mem = None
+    # Set by the decoder layer: decode's o_proj all_reduce as one collective (tt/decode_all_reduce.py).
+    decode_all_reduce = None
+    # Set by the decoder layer (per call): decode returns o_proj's partials un-reduced, in decode_all_reduce's width
+    # shards -- the layer's gate / up program reduces them (TtMinistral3MLP.decode_ar).
+    defer_decode_reduce = False
 
     def __init__(self, device, torch_module, in_scale=None, meta_rope=False) -> None:
         """in_scale: optional per-input-feature scale (the input RMSNorm's gamma) folded into q/k/v.
@@ -314,6 +319,14 @@ class TtMinistral3Attention:
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,  # L1 accumulation made batched prefill matmuls non-repeatable
+        )
+        # The decode QKV (fp32 norm shards x block-float8 weight, 320 tile products a core on 24 cores) at HiFi2.
+        self.qkv_decode_cfg = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
         )
         # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi2 matmuls, fp32 DEST kept.
         self.prefill_sdpa_cfg = ttnn.init_device_compute_kernel_config(
@@ -496,6 +509,28 @@ class TtMinistral3Attention:
         return ttnn.add(
             ttnn.multiply(x, cos),
             ttnn.multiply(ttnn.matmul(x, self.rot, compute_kernel_config=self.compute_cfg), sin),
+        )
+
+    def _prefill_mm_cfg(self, mt, nt):
+        """minimal_matmul config of the prefill QKV / o_proj: _one_block_cfg's single block per core for short prompts;
+        otherwise 8-tile M blocks with N blocks of exactly each core's (narrow) N range -- the 416-row QKV's 5-tile
+        range ran the default 8-tile block, computing 6 tiles for 5 -- in 4 x 1 subblocks for an odd width, 1 x 4 for a
+        multiple of 4 (QKV 994 -> 869 us). Blocking leaves each output tile's K accumulation order unchanged."""
+        cfg = self._one_block_cfg(mt, nt)
+        if cfg is not None:
+            return cfg
+        grid = self.device.compute_with_storage_grid_size()
+        n = -(-nt // (grid.y if mt > nt else grid.x))  # minimal_matmul puts N along y when M > N
+        if n > 8:
+            return None
+        sh, sw = (1, 4) if n % 4 == 0 else (4, 1) if n % 2 else (2, 2)
+        return ttnn.MinimalMatmulConfig(
+            M_block_size=8,
+            K_block_size=8,
+            N_block_size=n,
+            subblock_h=sh,
+            subblock_w=sw,
+            compute_with_storage_grid_size=grid,
         )
 
     def _one_block_cfg(self, mt, nt):
@@ -706,10 +741,13 @@ class TtMinistral3Attention:
         heads_l1 = self.meta_rope and 0 < qkv_bytes // (grid.x * grid.y) <= self.PREFILL_HEADS_L1_BYTES
         qkv_l1 = heads_l1 and qkv_bytes // (grid.x * grid.y) <= self.PREFILL_QKV_L1_BYTES
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
-        qkv = ttnn.experimental.minimal_matmul(
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        qkv = self._prefill_mm(
+            minimal_mm,
             x,
             self.wqkv,
-            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
+            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=ttnn.bfloat16,
@@ -775,22 +813,30 @@ class TtMinistral3Attention:
         attn_core_bytes = (qkv_bytes * 2 // 3) // (grid.x * grid.y)
         concat_l1 = self.tp > 1 and 0 < attn_core_bytes <= self.PREFILL_HEADS_L1_BYTES
         sdpa_l1 = concat_l1 and attn_core_bytes <= self.PREFILL_SDPA_OUT_L1_BYTES
-        attn = ttnn.transformer.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=mask is None,
-            attn_mask=mask,
-            scale=self.scale,
-            program_config=ttnn.SDPAProgramConfig(
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-                q_chunk_size=q_chunk,
-                k_chunk_size=k_chunk,
-                exp_approx_mode=False,
-            ),
-            compute_kernel_config=self.prefill_sdpa_cfg,
-            memory_config=ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG,
+        sdpa_cfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
+            q_chunk_size=q_chunk,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=False,
         )
+        sdpa_mem = ttnn.L1_MEMORY_CONFIG if sdpa_l1 else ttnn.DRAM_MEMORY_CONFIG
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import sdpa_prefill
+
+        if sdpa_prefill.supported(q, k, v, mask is None, mask, self.prefill_sdpa_cfg):
+            # the same program with the softmax's scale + exp as one SFPU pass (tt/sdpa_prefill.py), bit-identical
+            attn = sdpa_prefill.sdpa(q, k, v, True, self.scale, sdpa_cfg, self.prefill_sdpa_cfg, sdpa_mem)
+        else:
+            attn = ttnn.transformer.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=mask is None,
+                attn_mask=mask,
+                scale=self.scale,
+                program_config=sdpa_cfg,
+                compute_kernel_config=self.prefill_sdpa_cfg,
+                memory_config=sdpa_mem,
+            )
         heads = attn
         concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
         if self.concat_heads is not None and self.concat_heads.supports(attn):
@@ -813,10 +859,13 @@ class TtMinistral3Attention:
             and not self.prefill_gather
             and 2 * int(b) * int(s) * int(self.wo.shape[-1]) // (grid.x * grid.y) <= self.PREFILL_OPROJ_OUT_L1_BYTES
         )
-        out = ttnn.experimental.minimal_matmul(
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        out = self._prefill_mm(
+            minimal_mm,
             attn,
             self.wo,
-            config=self._one_block_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
+            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wo.shape[-1]) // ttnn.TILE_SIZE),
             compute_kernel_config=self.prefill_proj_cfg,
             memory_config=ttnn.L1_MEMORY_CONFIG if out_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=self.PREFILL_REDUCE_DTYPE if self.tp > 1 else self.OUT_DTYPE,
@@ -826,6 +875,14 @@ class TtMinistral3Attention:
         if in_rank == 3:
             return ttnn.reshape(out, (b, s, out.shape[-1]))
         return out
+
+    @staticmethod
+    def _prefill_mm(minimal_mm, x, w, config, compute_kernel_config, **kw):
+        """ttnn.experimental.minimal_matmul, as tt/minimal_mm.py's program when it covers the call: the same arithmetic,
+        the core ranges' padding skipped (SKIP_PADDING), which the power-capped prefill turns into speed."""
+        if config is not None and minimal_mm.supported(x, w, compute_kernel_config):
+            return minimal_mm.matmul(x, w, config, compute_kernel_config, **kw)
+        return ttnn.experimental.minimal_matmul(x, w, config=config, compute_kernel_config=compute_kernel_config, **kw)
 
     def _decode(self, x, position_embeddings, position_ids, kv_cache, cur_pos):
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
@@ -838,7 +895,7 @@ class TtMinistral3Attention:
                 program_config=self._sharded_qkv_pc(),
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_cfg,
+                compute_kernel_config=self.qkv_decode_cfg,
             )
             ttnn.deallocate(x)
         else:
@@ -922,6 +979,9 @@ class TtMinistral3Attention:
             )
             attn = ttnn.sharded_to_interleaved(attn, ttnn.L1_MEMORY_CONFIG)  # (1, 1, B, heads * head_dim)
         if self.stream_o is not None:  # one program streaming the bank-major o_proj copy (tt/down_decode.py)
+            if self.decode_all_reduce is not None:  # partials in its width shards, one collective
+                p = self.stream_o(attn, memory_config=self.decode_all_reduce.mem)
+                return p if self.defer_decode_reduce else self.decode_all_reduce(p)
             return self._reduce(self.stream_o(attn))
         return self._reduce(
             ttnn.linear(

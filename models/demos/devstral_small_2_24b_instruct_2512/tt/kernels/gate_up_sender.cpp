@@ -22,7 +22,60 @@ void kernel_main() {
 
     cb_reserve_back(cb_x, Kt);
     const uint32_t x_l1 = get_write_ptr(cb_x);
+#if defined(X_SLICE)
+    // One of the two RISCs of the sender core (tt/gate_up_decode.py dual_noc_sender_kernels): this one reads and
+    // multicasts only K tiles [k0, k1) of the activation, over its own NOC, and then raises the compute cores' valid
+    // semaphore by one (they wait for a count from each). A whole row multicast from one RISC ran at ~10-15 GB/s, and
+    // concurrent multicasts on one NOC serialize, so the two halves go out on the two NOCs at once. Both RISCs wait on
+    // the core's own ready count. Runtime args: x, k0, k1, rects. With X_GATHER the row is not read: both RISCs wait
+    // until all X_GATHER norm cores have written their slices here.
+    {
+        const uint32_t k0 = get_arg_val<uint32_t>(1), k1 = get_arg_val<uint32_t>(2);
 #ifdef X_GATHER
+        constexpr uint32_t sem_gather = get_compile_time_arg_val(5);
+        noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_gather)), X_GATHER);
+#else
+        constexpr auto x_args = TensorAccessorArgs<5>();
+        const auto x = TensorAccessor(x_args, get_arg_val<uint32_t>(0));
+        for (uint32_t k = k0; k < k1; ++k) {
+            noc_async_read_page(k, x, x_l1 + k * x_tile);
+        }
+        noc_async_read_barrier();
+#endif
+        noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_ready)), n_cores);
+        const uint32_t valid_l1 = get_semaphore(sem_valid);
+        constexpr uint32_t a0 = 3;
+        const uint32_t rects = get_arg_val<uint32_t>(a0);
+        const uint32_t off = k0 * x_tile, bytes = (k1 - k0) * x_tile;
+        // NOC 1 multicasts from the far corner
+        auto mcast_addr = [&](uint32_t r, uint32_t l1) {
+            const uint32_t x0 = get_arg_val<uint32_t>(a0 + 1 + 5 * r), y0 = get_arg_val<uint32_t>(a0 + 2 + 5 * r);
+            const uint32_t x1 = get_arg_val<uint32_t>(a0 + 3 + 5 * r), y1 = get_arg_val<uint32_t>(a0 + 4 + 5 * r);
+            return noc_index == 0 ? get_noc_multicast_addr(x0, y0, x1, y1, l1) : get_noc_multicast_addr(x1, y1, x0, y0, l1);
+        };
+        for (uint32_t r = 0; r < rects; ++r) {
+            const uint32_t cores = get_arg_val<uint32_t>(a0 + 5 + 5 * r);
+            if (cores == 1) {
+                const uint32_t cx = get_arg_val<uint32_t>(a0 + 1 + 5 * r), cy = get_arg_val<uint32_t>(a0 + 2 + 5 * r);
+                noc_async_write(x_l1 + off, get_noc_addr(cx, cy, x_l1 + off), bytes);
+            } else {
+                noc_async_write_multicast(x_l1 + off, mcast_addr(r, x_l1 + off), bytes, cores);
+            }
+        }
+        noc_async_write_barrier();  // the slice has landed everywhere before it is counted
+        for (uint32_t r = 0; r < rects; ++r) {
+            const uint32_t cores = get_arg_val<uint32_t>(a0 + 5 + 5 * r);
+            if (cores == 1) {
+                const uint32_t cx = get_arg_val<uint32_t>(a0 + 1 + 5 * r), cy = get_arg_val<uint32_t>(a0 + 2 + 5 * r);
+                noc_semaphore_inc(get_noc_addr(cx, cy, valid_l1), 1);
+            } else {
+                noc_semaphore_inc_multicast(mcast_addr(r, valid_l1), 1, cores);
+            }
+        }
+        noc_async_atomic_barrier();
+        return;
+    }
+#elif defined(X_GATHER)
     constexpr uint32_t sem_gather = get_compile_time_arg_val(5);
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_gather)), X_GATHER);
 #else

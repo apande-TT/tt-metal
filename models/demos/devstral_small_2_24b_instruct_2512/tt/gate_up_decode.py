@@ -53,6 +53,62 @@ def bank_major_page0(stream: int, kt: int, nb: int, nc: int, rb: int) -> int:
     return (stream // nb) * (kt // rb) * rb * nc * nb + stream % nb
 
 
+def stream_order(kt: int, nt: int, nb: int, streams, rb: int):
+    """bank_major for streams of unequal width: streams = [(first column, columns, bank)], together covering the nt
+    columns once and every bank equally. Each stream's pushes (rb K rows x its columns, row-major) fill consecutive
+    slots of its bank after the streams listed before it on that bank. Returns (order, page0s): weight tile order[page]
+    goes to interleaved page `page` (row-major tile index), page0s[s] = stream s's first page. With streams
+    [(s * nc, nc, s % nb)] this is bank_major / bank_major_page0 exactly."""
+    order = torch.full((kt * nt,), -1, dtype=torch.long)
+    slot, page0s = [0] * nb, []
+    for c0, nc, b in streams:
+        p = torch.arange(kt // rb).view(-1, 1)
+        t = torch.arange(rb * nc).view(1, -1)
+        page = (slot[b] + p * rb * nc + t) * nb + b
+        order[page.flatten()] = ((p * rb + t // nc) * nt + c0 + t % nc).flatten()
+        page0s.append(slot[b] * nb + b)
+        slot[b] += kt * nc
+    assert all(v == slot[0] for v in slot) and bool((order >= 0).all()), "streams must fill every bank equally"
+    return order, page0s
+
+
+def bank_major_order(w: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
+    """One device's [K, N] weight with its tiles permuted by stream_order's order."""
+    k, n = w.shape
+    kt, nt = k // 32, n // 32
+    tiles = w.reshape(kt, 32, nt, 32).permute(0, 2, 1, 3).reshape(kt * nt, 32, 32)
+    return tiles[order].reshape(kt, nt, 32, 32).permute(0, 2, 1, 3).reshape(k, n)
+
+
+def dual_noc_sender_kernels(
+    device, sender, kt, x_tile, n_cores, sem_ready, sem_valid, x, rects, x_acc, defines=(), gather=None
+):
+    """Two gate_up_sender.cpp X_SLICE kernels on ONE sender core: RISCV_0 multicasts K tiles [0, kt / 2) over NOC 0,
+    RISCV_1 the rest over NOC 1 at the same time (a multicast of the whole row from one RISC ran at ~10-15 GB/s;
+    concurrent multicasts on one NOC serialize). Both wait on the core's own ready count; the compute cores wait for
+    two valid counts (GU_NSEND 2). gather = (norm cores, gather semaphore): X_GATHER, the row comes from the norm cores
+    (x is not read; pass None)."""
+    rng = lambda c: ttnn.CoreRange(ttnn.CoreCoord(*c), ttnn.CoreCoord(*c))
+    out = []
+    for i, (risc, noc) in enumerate(
+        ((ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0), (ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1))
+    ):
+        k0, k1 = kt * i // 2, kt * (i + 1) // 2
+        out.append(
+            ttnn.KernelDescriptor(
+                kernel_source=str(_KDIR / "gate_up_sender.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=ttnn.CoreRangeSet([rng(sender)]),
+                compile_time_args=[kt, x_tile, n_cores, sem_ready, sem_valid]
+                + (x_acc if gather is None else [gather[1]]),
+                runtime_args=[(sender, [0 if x is None else x.buffer_address(), k0, k1] + list(rects))],
+                config=ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc),
+                defines=[("X_SLICE", "1")] + ([] if gather is None else [("X_GATHER", str(gather[0]))]) + list(defines),
+            )
+        )
+    return out
+
+
 class FusedGateUpDecode:
     NC = 4  # output columns a compute core (gate and up each): 2 * NC tiles fill the full-sync fp32 DEST
     RB = 8  # K rows a weight push (bf16)
@@ -60,7 +116,7 @@ class FusedGateUpDecode:
     # tiles), many in flight per CB, stream faster than few large ones (bf8 gate / up, measured: 35 KB pushes 225 us,
     # 17 KB 220 us, 9 KB 218 us, 4.4 KB 216 us; the bf4 layers gained on the decode trace too)
     RB_BY_DTYPE = {ttnn.bfloat8_b: 1, ttnn.bfloat4_b: 2}
-    CB_BYTES = 112 * 1024  # per weight CB (DEPTH = pushes that fit)
+    CB_BYTES = 256 * 1024  # per weight CB (DEPTH = pushes that fit; 112 KB: 218.5 us, 256 KB: 214.7 us at bf8)
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -89,14 +145,16 @@ class FusedGateUpDecode:
         k, n = int(w_gate.shape[0]), int(w_gate.shape[1]) // tp
         self.kt, self.nt = k // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         self.nb = nb = device.dram_grid_size().x
-        bm = lambda w: torch.cat(
-            [bank_major(w[:, d * n : (d + 1) * n], nb, self.NC, self.RB) for d in range(tp)], dim=-1
-        )
-        self.wg, self.wu = put(bm(w_gate), dtype), put(bm(w_up), dtype)
         n_cores = self.nt // self.NC
         g = device.compute_with_storage_grid_size()
         # Compute cores: the grid's first n_cores, row-major; the sender: the grid's last core.
         self.core_xy = [(c % g.x, c // g.x) for c in range(n_cores)]
+        # the weight streams: (logical core, first column, columns, DRAM bank), one per core (gate and up alike)
+        self.streams = self._streams(device)
+        order, self.page0s = stream_order(self.kt, self.nt, nb, [s[1:] for s in self.streams], self.RB)
+        bm = lambda w: torch.cat([bank_major_order(w[:, d * n : (d + 1) * n], order) for d in range(tp)], dim=-1)
+        self.wg, self.wu = put(bm(w_gate), dtype), put(bm(w_up), dtype)
+        del order
         full, rem = divmod(n_cores, g.x)
         rects = [(0, 0, g.x - 1, full - 1)] if full else []
         if rem:
@@ -122,6 +180,10 @@ class FusedGateUpDecode:
         cfg.dst_full_sync_en = True
         cfg.math_approx_mode = False
         self.cfg = cfg
+
+    def _streams(self, device):
+        """Core c streams columns c * NC .. c * NC + NC - 1 from bank c % NB (bank_major's layout)."""
+        return [(xy, c * self.NC, self.NC, c % self.nb) for c, xy in enumerate(self.core_xy)]
 
     def _cb(self, index, tiles, page, dtype):
         fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)
@@ -216,6 +278,47 @@ class NormGateUpDecode(FusedGateUpDecode):
 
     NORM_ORIGIN = (0, 6)
     NORM_SHAPE = (10, 4)  # NP = 40 cores, 4 K tiles each at K = 160
+    # SPREAD (ar_norm_call only): the norm cores take gate / up columns too, SPREAD_NORM_NC each (their half-sync
+    # DEST holds 4 fp32 tiles), and the stream cores share the rest -- 3 or 2 columns a core instead of NC = 4 -- so
+    # the matmul the activation waits for is split over 104 cores instead of 64 (the block-float4 layers are
+    # compute-bound after their prologue). Per column the same LLK calls accumulate the same products in the same
+    # order: bit-identical. The norm cores stream their gate columns after their norm dataflow (RISCV_0), their up
+    # columns from the start (RISCV_1), into weight CBs of NORM_CB_BYTES.
+    SPREAD = True
+    SPREAD_NORM_NC = 2
+    NORM_CB_BYTES = 128 * 1024
+    # ar_norm_call: the sender multicasts half of the normed row on each NOC (gate_up_sender.cpp X_SLICE + X_GATHER)
+    DUAL_NOC_SENDER = True
+
+    def _norm_xy(self):
+        (ox, oy), (nx, ny) = self.NORM_ORIGIN, self.NORM_SHAPE
+        return [(ox + i % nx, oy + i // nx) for i in range(nx * ny)]
+
+    def _streams(self, device):
+        """SPREAD: every bank still serves nt / NB columns of each weight -- SPREAD_NORM_NC from each of its norm cores
+        (norm core i reads bank i % NB), the rest split as evenly as possible over its stream cores (c % NB) -- in
+        column order stream cores 0.., then norm cores 0.."""
+        if not self.SPREAD:
+            return super()._streams(device)
+        nb, nn, n_s = self.nb, self.SPREAD_NORM_NC, len(self.core_xy)
+        norm_xy = self._norm_xy()
+        width = {}
+        for b in range(nb):
+            mine = [c for c in range(n_s) if c % nb == b]
+            need = self.nt // nb - nn * sum(1 for i in range(len(norm_xy)) if i % nb == b)
+            base, extra = divmod(need, len(mine))
+            for j, c in enumerate(mine):
+                width[c] = base + int(j < extra)
+        assert all(1 <= w <= self.NC for w in width.values()), width
+        streams, c0 = [], 0
+        for c, xy in enumerate(self.core_xy):
+            streams.append((xy, c0, width[c], c % nb))
+            c0 += width[c]
+        for i, xy in enumerate(norm_xy):
+            streams.append((xy, c0, nn, i % nb))
+            c0 += nn
+        assert c0 == self.nt, (c0, self.nt)
+        return streams
 
     @classmethod
     def supports_norm(cls, device, k, n, dtype) -> bool:
@@ -237,14 +340,32 @@ class NormGateUpDecode(FusedGateUpDecode):
         super().__init__(device, w_gate, w_up, dtype, math_fidelity, put, tp)
         import struct
 
+        self.math_fidelity = math_fidelity
+
         (ox, oy), (nx, ny) = self.NORM_ORIGIN, self.NORM_SHAPE
         self.np = nx * ny
         self.wt = self.kt // self.np  # tiles of a residual shard
-        self.norm_xy_logical = [(ox + i % nx, oy + i // nx) for i in range(self.np)]
+        self.norm_xy_logical = self._norm_xy()
         rng = lambda a, b, c, d: ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))
         self.norm_set = ttnn.CoreRangeSet([rng(ox, oy, ox + nx - 1, oy + ny - 1)])
         self.n_all = self.all.merge(self.norm_set)
         phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+        # the stream cores grouped by width (each group's kernels and weight CBs are built for its width)
+        n_s = len(self.core_xy)
+        widths = sorted({w for _, _, w, _ in self.streams[:n_s]})
+        one = lambda xy: rng(*xy, *xy)
+        self.stream_groups = [
+            (w, [s for s in range(n_s) if self.streams[s][2] == w]) for w in widths
+        ]
+        self.stream_group_sets = [
+            ttnn.CoreRangeSet([one(self.streams[s][0]) for s in idx]) for _, idx in self.stream_groups
+        ]
+        # SPREAD: the sender multicasts the activation to the norm cores too
+        self.spread_rects = list(self.rects)
+        if self.SPREAD:
+            lo, hi = phys(ox, oy), phys(ox + nx - 1, oy + ny - 1)
+            self.spread_rects[0] += 1
+            self.spread_rects += [lo.x, lo.y, hi.x, hi.y, nx * ny]
         # the gather core (norm core 0, the origin corner) and the other norm cores as rectangles it multicasts to
         gc = phys(ox, oy)
         self.gather_xy = [gc.x, gc.y]
@@ -263,6 +384,11 @@ class NormGateUpDecode(FusedGateUpDecode):
         modes[4] = ttnn.UnpackToDestMode.UnpackToDestFp32  # cb_h: fp32 straight to DEST for the SFPU square
         ncfg.unpack_to_dest_mode = modes
         self.ncfg = ncfg
+
+    def __call__(self, x):
+        if self.SPREAD:
+            raise NotImplementedError("NormGateUpDecode.SPREAD lays the weights out for ar_norm_call only")
+        return super().__call__(x)
 
     def accepts(self, h) -> bool:
         """h: the (1, 1, 32, K) fp32 decode residual, width-sharded into self.np shards of self.wt tiles."""
@@ -285,6 +411,8 @@ class NormGateUpDecode(FusedGateUpDecode):
     def norm_call(self, h):
         """h: the decode residual as accepts() requires; returns silu(norm(h) W_gate) * (norm(h) W_up), (1, 1, 32, N)
         bf16 in L1 (unit-gamma RMSNorm: its gamma is folded into the weights)."""
+        if self.SPREAD:
+            raise NotImplementedError("NormGateUpDecode.SPREAD lays the weights out for ar_norm_call only")
         kt, nt, nc, rb, w_tile, depth, nb = self.kt, self.nt, self.NC, self.RB, self.w_tile, self.depth, self.nb
         x_tile, o_tile, f32_tile = 2048, 2048, 4096
         out = ttnn.allocate_tensor_on_device(
@@ -378,3 +506,247 @@ class NormGateUpDecode(FusedGateUpDecode):
         ]
         ttnn.generic_op([h, self.wg, self.wu, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return out
+
+    # The attention's o_proj all_reduce folded in (ar_norm_call): one fabric-link worker core a link, on cores the
+    # program leaves free (stream cores: rows 0..5 up to column 8; norm cores: columns 0..9 of rows 6..9; the sender is
+    # the last core).
+    AR_WORKERS = ((10, 6), (10, 7))
+
+    def ar_accepts(self, x, p, ar) -> bool:
+        """Whether ar_norm_call can fold the all_reduce `ar` (tt/decode_all_reduce.py) of the partials p in here."""
+        if ar is None or ar.tp % 2 or len(self.AR_WORKERS) != ar.num_links or not self.accepts(x):
+            return False
+        g = self.device.compute_with_storage_grid_size()
+        used = {self.sender} | set(self.core_xy) | set(self.norm_xy_logical)
+        if any(c in used or c[0] >= g.x or c[1] >= g.y for c in self.AR_WORKERS):
+            return False
+        xs, ps, ss = x.memory_config().shard_spec, p.memory_config().shard_spec, ar.mem.shard_spec
+        return (
+            p.dtype == ttnn.bfloat16
+            and p.is_sharded()
+            and tuple(p.shape) == tuple(x.shape)
+            and ps is not None
+            and ps.grid == xs.grid == ss.grid
+            and tuple(ps.shape) == tuple(xs.shape) == tuple(ss.shape)
+            and len(xs.grid.ranges()) == 1
+            and xs.grid.num_cores() == self.np
+            and self.np % ar.num_links == 0
+        )
+
+    def ar_norm_call(self, x, p, ar):
+        """x: the decode residual (fp32, accepts()); p: this device's o_proj partials (bf16, in x's width shards);
+        ar: the DecodeAllReduce whose scratch and global semaphore the exchange uses (ar_accepts). Returns (h, m): the new
+        residual h = x + all_reduce(p) (fp32 in x's shards; all_reduce_async's sum + ttnn.add, bit for bit) and
+        m = silu(norm(h) W_gate) * (norm(h) W_up) as norm_call returns it.
+
+        Each device's link workers (kernels/ar_send.cpp) multicast its partial shards into slot `device` of every
+        device's scratch at program launch, so the exchange runs under the weight streams instead of before them; norm
+        core i waits for the TP slots of residual shard i, sums them, adds them to x (kernels/norm_shard_ar_*.cpp) and
+        norms the result as norm_call does."""
+        kt, nt, rb, w_tile, nb = self.kt, self.nt, self.RB, self.w_tile, self.nb
+        x_tile, o_tile, f32_tile, ar_tile = 2048, 2048, 4096, 2048
+        tp, wt, links = ar.tp, self.wt, ar.num_links
+        shard_bytes = wt * ar_tile
+        n_res = self.np // links
+        spread = self.SPREAD
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, ttnn.TILE_SIZE, nt * ttnn.TILE_SIZE)),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            self.device,
+            ttnn.L1_MEMORY_CONFIG,
+        )
+        h = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(tuple(int(d) for d in x.shape)), ttnn.float32, ttnn.TILE_LAYOUT, self.device, x.memory_config()
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        wdt = self.wg.dtype
+        norm, everyone = self.norm_set, self.n_all
+        rng = lambda a, b, c, d: ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))
+        workers = ttnn.CoreRangeSet([rng(*c, *c) for c in self.AR_WORKERS])
+        hdr_bytes = ttnn.get_tt_fabric_packet_header_size_bytes()
+        depth_of = lambda w, cb_bytes: max(2, cb_bytes // (rb * w * w_tile))
+        nn = self.SPREAD_NORM_NC
+        # the norm's own buffers first, then each core group's two weight CBs (sized for its width), then the output
+        cbs = [
+            self._ncb(0, kt, x_tile, ttnn.bfloat16, everyone),
+            self._ncb(3, self.np, f32_tile, ttnn.float32, norm),
+            self._ncb(4, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(5, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(6, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(7, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(8, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(9, 1, f32_tile, ttnn.float32, norm),
+            self._ncb(10, wt, x_tile, ttnn.bfloat16, norm),
+            self._ncb(11, wt, f32_tile, ttnn.float32, norm),
+            self._ncb(12, tp * wt, ar_tile, ttnn.bfloat16, norm),
+            self._ncb(13, wt, ar_tile, ttnn.bfloat16, norm),
+            self._ncb(14, wt, f32_tile, ttnn.float32, norm),
+        ]
+        groups = [(w, idx, cores, depth_of(w, self.CB_BYTES)) for (w, idx), cores in zip(self.stream_groups, self.stream_group_sets)]
+        for w, _, cores, dep in groups:
+            cbs += [self._ncb(1, dep * rb * w, w_tile, wdt, cores), self._ncb(2, dep * rb * w, w_tile, wdt, cores)]
+        computing = self.cores
+        if spread:
+            dep_n = depth_of(nn, self.NORM_CB_BYTES)
+            cbs += [self._ncb(1, dep_n * rb * nn, w_tile, wdt, norm), self._ncb(2, dep_n * rb * nn, w_tile, wdt, norm)]
+            computing = self.cores.merge(norm)
+        out_w = max(st[2] for st in self.streams)
+        cbs += [
+            self._ncb(16, out_w, o_tile, ttnn.bfloat16, computing),
+            self._ncb(17, n_res, shard_bytes, ttnn.bfloat16, workers),
+            self._ncb(18, 2, hdr_bytes, ttnn.uint32, workers),
+        ]
+        SEM_READY, SEM_VALID, SEM_PART, SEM_GATHER, SEM_R = 0, 1, 2, 3, 4
+        dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
+        dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
+        dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
+        stream_ct = lambda cb, owner, wt_, w, dep: [
+            kt,
+            nb,
+            w,
+            rb,
+            w_tile,
+            cb,
+            dep,
+            owner,
+            SEM_READY,
+            SEM_VALID,
+            o_tile,
+            w,
+        ] + acc(wt_, out)
+        stream_rt = lambda wt_, s: [wt_.buffer_address(), self.streams[s][1], out.buffer_address()] + self.sender_xy + [
+            self.page0s[s]
+        ]
+        # residual shard i lives on core i of x's shard grid (row-major); norm core i pairs with it
+        r0 = x.memory_config().shard_spec.grid.ranges()[0]
+        rw = r0.end.x - r0.start.x + 1
+        phys = lambda c: self.device.worker_core_from_logical_core(ttnn.CoreCoord(*c))
+        res_xy = [phys((r0.start.x + i % rw, r0.start.y + i // rw)) for i in range(self.np)]
+        norm_xy = [phys(c) for c in self.norm_xy_logical]
+        scratch_addr, sem_addr = ar.buffer.buffer_address(), ttnn.get_global_semaphore_address(ar.sem)
+        norm_args = lambda i: (
+            [i, res_xy[i].x, res_xy[i].y, x.buffer_address(), scratch_addr, h.buffer_address(), sem_addr]
+            + self.sender_xy
+            + self.gather_xy
+            + self.others
+        )
+        norm_dm_ct = [wt, self.np, x_tile, f32_tile, SEM_PART, SEM_GATHER, SEM_R, tp, ar_tile]
+        norm_cc_ct = [wt, self.np, self.inv_n_bits, self.eps_bits, tp]
+        norm_cc_rt = [(xy, [int(i == 0)]) for i, xy in enumerate(self.norm_xy_logical)]
+        n_s = len(self.core_xy)  # norm core i's stream is stream n_s + i
+        kern = lambda name, cores, ct, rt_, cfg, defines=(): ttnn.KernelDescriptor(
+            kernel_source=str(_KDIR / name),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt_,
+            config=cfg,
+            defines=list(defines),
+        )
+        worker_rt = lambda l: [p.buffer_address(), scratch_addr, sem_addr] + [
+            v
+            for i in range(l * n_res, (l + 1) * n_res)
+            for v in (res_xy[i].x, res_xy[i].y, norm_xy[i].x, norm_xy[i].y)
+        ]
+        stream_kernels = []
+        nsend = [("GU_NSEND", "2")] if self.DUAL_NOC_SENDER else []
+        for w, idx, cores, dep in groups:
+            at = lambda wt_: [(self.streams[s][0], stream_rt(wt_, s)) for s in idx]
+            stream_kernels += [
+                kern("gate_up_stream.cpp", cores, stream_ct(1, 0, self.wg, w, dep), at(self.wg), dm0, nsend),
+                kern("gate_up_stream.cpp", cores, stream_ct(2, 1, self.wu, w, dep), at(self.wu), dm1, nsend),
+                kern("gate_up_compute.cpp", cores, [kt, w, rb], [], self.cfg),
+            ]
+        if spread:
+            n_args = len(norm_args(0))
+            norm_kernels = [
+                kern(
+                    "norm_gate_stream_dm.cpp",
+                    norm,
+                    norm_dm_ct + stream_ct(1, 0, self.wg, nn, dep_n),
+                    [(xy, norm_args(i) + stream_rt(self.wg, n_s + i)) for i, xy in enumerate(self.norm_xy_logical)],
+                    dm0,
+                    [("GU_CTA", str(len(norm_dm_ct))), ("GU_RTA", str(n_args))],
+                ),
+                kern(
+                    "gate_up_stream.cpp",
+                    norm,
+                    stream_ct(2, 1, self.wu, nn, dep_n),
+                    [(xy, stream_rt(self.wu, n_s + i)) for i, xy in enumerate(self.norm_xy_logical)],
+                    dm1,
+                    nsend,
+                ),
+                kern(
+                    "norm_gate_up_compute.cpp",
+                    norm,
+                    norm_cc_ct + [kt, nn, rb, int(self.math_fidelity.value)],
+                    norm_cc_rt,
+                    self.ncfg,
+                    [("GU_CTA", str(len(norm_cc_ct))), ("GU_AFTER_NORM", "1")],
+                ),
+            ]
+        else:
+            norm_kernels = [
+                kern(
+                    "norm_shard_ar_dm.cpp",
+                    norm,
+                    norm_dm_ct,
+                    [(xy, norm_args(i)) for i, xy in enumerate(self.norm_xy_logical)],
+                    dm0,
+                ),
+                kern("norm_shard_ar_compute.cpp", norm, norm_cc_ct, norm_cc_rt, self.ncfg),
+            ]
+        n_compute = len(self.streams) if spread else n_s
+        rects = self.spread_rects if spread else self.rects
+        node = lambda d: self.device.get_fabric_node_id(ttnn.MeshCoordinate(0, d))
+        mpd = ttnn.MeshProgramDescriptor()
+        for d in range(tp):
+            # ring neighbours and line-multicast reach (all_reduce_async's Ring split, alternating by device parity)
+            fwd_n = -(-(tp - 1) // 2)
+            bwd_n = tp - 1 - fwd_n
+            if d % 2 == 0:
+                fwd_n, bwd_n = bwd_n, fwd_n
+            route = lambda n: [1, n, 0, 0, 0, 0]  # 1D fabric: start one hop out, reach n devices
+            if self.DUAL_NOC_SENDER:
+                senders = dual_noc_sender_kernels(
+                    self.device, self.sender, kt, x_tile, n_compute, SEM_READY, SEM_VALID, None, rects, [],
+                    gather=(self.np, SEM_GATHER),
+                )
+            else:
+                senders = [
+                    kern(
+                        "gate_up_sender.cpp",
+                        self.sender_set,
+                        [kt, x_tile, n_compute, SEM_READY, SEM_VALID, SEM_GATHER],
+                        [(self.sender, [0] + rects)],
+                        dm0,
+                        [("X_GATHER", str(self.np))],
+                    )
+                ]
+            kernels = (
+                senders
+                + stream_kernels
+                + norm_kernels
+                + [
+                    kern(
+                        "ar_send.cpp",
+                        workers,
+                        [d, 18, 17, shard_bytes, n_res] + route(fwd_n) + route(bwd_n),
+                        [(c, worker_rt(l)) for l, c in enumerate(self.AR_WORKERS)],
+                        dm0,
+                    ),
+                ]
+            )
+            sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=everyone, initial_value=0) for i in range(5)]
+            pd = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems)
+            for l, c in enumerate(self.AR_WORKERS):
+                args = pd.kernels[len(kernels) - 1].runtime_args[c[0]][c[1]]
+                for nbr, n in (((d + 1) % tp, fwd_n), ((d - 1) % tp, bwd_n)):
+                    args.append(int(n > 0))
+                    if n > 0:
+                        args.extend(ttnn.setup_fabric_connection(node(d), node(nbr), l, pd, ttnn.CoreCoord(*c)))
+            coord = ttnn.MeshCoordinate(0, d)
+            mpd[ttnn.MeshCoordinateRange(coord, coord)] = pd
+        ttnn.generic_op([x, p, ar.buffer, self.wg, self.wu, h, out], mpd)
+        return h, out

@@ -27,6 +27,9 @@ class TtPixtralMLP(TtMinistral3MLP):
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     DOWN_DTYPE = ttnn.bfloat16
+    # fp32 down output into the L1-resident residual stream (8 x 256 x 1024 fp32: 76 KB a core)
+    DOWN_OUT_L1_BYTES = 96 * 1024
+    FUSE_RESIDUAL_DOWN = True  # the layer's ffn residual add folded into the down (see TtMinistral3MLP)
 
     def _tp_degree(self, device, mesh):
         return pixtral_attention.vision_tp(device)[0]

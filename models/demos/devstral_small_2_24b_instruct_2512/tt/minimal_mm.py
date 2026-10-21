@@ -1,0 +1,350 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+"""ttnn.experimental.minimal_matmul as a generic_op program whose compute kernel the model owns (kernels/mm_compute.cpp).
+
+The program is the stock op's (minimal_matmul_program_factory.cpp, plain path: no bias / ternary / fused activation /
+fused CCL): the same core grid split, block sizes, semaphores, circular buffers and runtime arguments, and the stock
+data-movement kernels themselves (dm_in0_sender.cpp, dm_in1_sender_out.cpp). Only the compute kernel differs, in its
+output stage (see mm_compute.cpp): the fused SwiGLU runs silu and the up multiply as one SFPU pass with its inits once
+a block (416-row text gate/up 9844 -> 9722 us, vision 245 -> 234 us), bit-identical to the stock op.
+
+Call matmul(x, w, config, compute_kernel_config, ...) exactly as ttnn.experimental.minimal_matmul (config required)."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import ttnn
+
+_KDIR = Path(__file__).resolve().parent / "kernels"
+_COMPUTE = str(_KDIR / "mm_compute.cpp")
+_DM_DIR = "ttnn/cpp/ttnn/operations/experimental/minimal_matmul/device/kernels/"
+_DM_IN0 = _DM_DIR + "dm_in0_sender.cpp"
+# the stock in0 reader with its block read remapped to a heads-layout in0 (matmul(..., in0_heads=))
+_DM_IN0_HEADS = str(_KDIR / "mm_in0_heads.cpp")
+_DM_IN1 = _DM_DIR + "dm_in1_sender_out.cpp"
+
+_TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+_INVALID, _VALID = 0, 1
+
+# Output-stage grouping (mm_compute.cpp): tiles a DEST acquire in the plain epilogue (fp32 DEST half: 4 tiles), and
+# gate/up pairs a DEST acquire in the SwiGLU epilogue.
+EPI_TILES = 4
+SWIGLU_PAIRS = 2
+# The SwiGLU epilogue's SFPU pass (silu * up) runs on the PACK thread (kernels/mm_compute.cpp pack_silu_mul) while MATH
+# copies the next pair group's partials into the other DEST half.
+SWIGLU_PACK_SFPU = True
+# ... with the exp polynomial's constants held in registers across the rows (mm_compute.cpp
+# calculate_silu_mul_hoisted: 42 instead of 52 SFPU instructions a row, the same arithmetic)
+SWIGLU_HOIST = True
+# Skip the padding of the core ranges (the last core row's M rows past M_tiles, the last core column's N tiles past
+# N_tiles): no matmul subblocks or epilogue work for tiles the writer never stores (identical real tiles; less FPU /
+# SFPU energy, which is what the power-capped prefill and encode run on).
+SKIP_PADDING = True
+
+
+def _round_up(a, b):
+    return -(-a // b) * b
+
+
+def _core_order(core, transpose, axis_len, noc, axis_is_x, initial):
+    """minimal_matmul_program_factory.cpp build_core_order_for_axis: the forwarding chain along one grid axis."""
+    order = [initial]
+    if transpose:
+        cur = core[1] if axis_is_x else core[0]
+    else:
+        cur = core[0] if axis_is_x else core[1]
+    increasing = noc == ttnn.NOC.NOC_0
+    idx = 0
+    for w in range(1, axis_len):
+        x, y = core
+        v = w if increasing else axis_len - w
+        if transpose:
+            if axis_is_x:
+                y = v
+            else:
+                x = v
+        else:
+            if axis_is_x:
+                x = v
+            else:
+                y = v
+        if v == cur:
+            idx = w
+        order.append((x, y))
+    return order, idx
+
+
+def supported(x, w, compute_kernel_config=None, fuse_swiglu=False) -> bool:
+    """Shapes / layouts the program covers (else call the stock op); the SwiGLU epilogue replays fp32-DEST math only."""
+    if fuse_swiglu and not (compute_kernel_config is not None and compute_kernel_config.fp32_dest_acc_en):
+        return False
+    if x.layout != ttnn.TILE_LAYOUT or w.layout != ttnn.TILE_LAYOUT or x.is_sharded() or w.is_sharded():
+        return False
+    if x.dtype not in _TILE_BYTES or w.dtype not in _TILE_BYTES:
+        return False
+    xs, ws = [int(d) for d in x.padded_shape], [int(d) for d in w.padded_shape]
+    return xs[-1] == ws[-2] and all(d == 1 for d in ws[:-2])
+
+
+def default_config(device, compute_kernel_config=None, x=None, w=None):
+    """The blocking ttnn.experimental.minimal_matmul runs when given no config (minimal_matmul_program_factory.cpp
+    determine_default_block_sizes): 8 x 8 x 8 blocks on the device's compute grid, 2 x 2 subblocks with fp32 DEST
+    (else 2 x 4 when N >= M, 4 x 2 when M > N; x, w needed then)."""
+    sub_h, sub_w = 2, 2
+    if compute_kernel_config is not None and not compute_kernel_config.fp32_dest_acc_en:
+        xs = [int(d) for d in x.padded_shape]
+        m = 1
+        for d in xs[:-1]:
+            m *= d
+        sub_h, sub_w = (2, 4) if int(w.padded_shape[-1]) >= m else (4, 2)
+    return ttnn.MinimalMatmulConfig(
+        M_block_size=8,
+        K_block_size=8,
+        N_block_size=8,
+        subblock_h=sub_h,
+        subblock_w=sub_w,
+        compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+    )
+
+
+def _in0_view(x, in0_heads):
+    """x's padded shape as the matmul sees it: (B, 1, S, NH * HD) for a heads-layout (B, NH, S, HD) in0."""
+    xs = [int(d) for d in x.padded_shape]
+    if in0_heads is None:
+        return xs
+    b, nh, sq, hd = xs
+    return [b, 1, sq, nh * hd]
+
+
+def supports_heads(x, w) -> bool:
+    """Whether matmul(x, w, in0_heads=...) can read x, a tiled interleaved (B, NH, S, HD) attention output, as its
+    head concat (B, 1, S, NH * HD)."""
+    if x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(x.padded_shape) != 4:
+        return False
+    b, nh, sq, hd = (int(d) for d in x.padded_shape)
+    return sq % ttnn.TILE_SIZE == 0 and hd % ttnn.TILE_SIZE == 0 and nh * hd == int(w.padded_shape[-2])
+
+
+def supports_residual(x, w, residual, dtype, in0_heads=None) -> bool:
+    """Whether matmul(..., residual=residual) can fold the fp32 residual add in (a fp32 output of the residual's shape)."""
+    if dtype != ttnn.float32 or residual is None or residual.dtype != ttnn.float32:
+        return False
+    if residual.layout != ttnn.TILE_LAYOUT or residual.is_sharded():
+        return False
+    out = _in0_view(x, in0_heads)[:-1] + [int(w.padded_shape[-1])]
+    return [int(d) for d in residual.padded_shape] == out
+
+
+def matmul(
+    x,
+    w,
+    config,
+    compute_kernel_config,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    dtype=ttnn.bfloat16,
+    fuse_swiglu=False,
+    residual=None,
+    in0_heads=None,
+):
+    """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
+    residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
+    does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output.
+    in0_heads (True, supports_heads): x is an attention output (B, NH, S, HD) multiplied as its head concat
+    (B, 1, S, NH * HD) -- the in0 reader (kernels/mm_in0_heads.cpp) fetches each tile where nlp_concat_heads would
+    have copied it from, so the concat program is not needed; same tiles, same matmul."""
+    assert residual is None or not fuse_swiglu
+    device = x.device()
+    grid = config.compute_with_storage_grid_size
+    gx, gy = int(grid.x), int(grid.y)
+    fidelity = compute_kernel_config.math_fidelity
+    fp32_acc = bool(compute_kernel_config.fp32_dest_acc_en)
+    approx = bool(compute_kernel_config.math_approx_mode)
+
+    xs = _in0_view(x, in0_heads)
+    K = xs[-1]
+    M = 1
+    for d in xs[:-1]:
+        M *= d
+    N = int(w.padded_shape[-1])
+    T = ttnn.TILE_SIZE
+    M_tiles, K_tiles, N_tiles = M // T, K // T, N // T
+
+    M_block, K_block, N_block = int(config.M_block_size), int(config.K_block_size), int(config.N_block_size)
+    sub_h, sub_w = int(config.subblock_h), int(config.subblock_w)
+
+    transpose = M > N
+    dram_read, dram_write = ttnn.NOC.NOC_0, ttnn.NOC.NOC_1  # Blackhole preferred NOCs
+    small_noc, small_risc = dram_write, ttnn.DataMovementProcessor.RISCV_1
+    large_noc, large_risc = dram_read, ttnn.DataMovementProcessor.RISCV_0
+    in0_noc, in0_risc = (large_noc, large_risc) if transpose else (small_noc, small_risc)
+    in1_noc, in1_risc = (small_noc, small_risc) if transpose else (large_noc, large_risc)
+    in0_par = gx if transpose else gy
+    in1_par = gy if transpose else gx
+
+    padded_M = _round_up(M_tiles, in0_par)
+    padded_K = _round_up(K_tiles, K_block)
+    if fuse_swiglu:
+        out_N = N_tiles // 2
+        padded_out_N = _round_up(out_N, in1_par)
+        padded_N = 2 * padded_out_N
+        N_per_core = 2 * (padded_out_N // in1_par)
+        assert N_tiles % 2 == 0 and N_per_core % 2 == 0 and N_block % 2 == 0
+    else:
+        padded_N = _round_up(N_tiles, in1_par)
+        N_per_core = padded_N // in1_par
+    M_per_core = padded_M // in0_par
+    K_blocks = padded_K // K_block
+    M_blocks_per_core = -(-M_per_core // M_block)
+    N_blocks_per_core = -(-N_per_core // N_block)
+
+    in0_tile, in1_tile = _TILE_BYTES[x.dtype], _TILE_BYTES[w.dtype]
+    out_tile = _TILE_BYTES[dtype]
+    interm_dtype = ttnn.float32 if fp32_acc else ttnn.bfloat16
+    interm_tile = _TILE_BYTES[interm_dtype]
+
+    out_block = M_block * N_block
+    out_written = out_block // 2 if fuse_swiglu else out_block
+
+    out_shape = xs[:-1] + [N // 2 if fuse_swiglu else N]
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)
+
+    core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))])
+    rng = lambda a, b, c, d: ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))])
+    if transpose:
+        in0_senders, in0_receivers = rng(0, 0, gx - 1, 0), rng(0, 1, gx - 1, gy - 1)
+        in1_senders, in1_receivers = rng(0, 0, 0, gy - 1), rng(1, 0, gx - 1, gy - 1)
+    else:
+        in0_senders, in0_receivers = rng(0, 0, 0, gy - 1), rng(1, 0, gx - 1, gy - 1)
+        in1_senders, in1_receivers = rng(0, 0, gx - 1, 0), rng(0, 1, gx - 1, gy - 1)
+
+    S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID = range(6)
+    sems = [
+        ttnn.SemaphoreDescriptor(id=i, core_ranges=core_grid, initial_value=v)
+        for i, v in enumerate((_INVALID, _INVALID, _VALID, _INVALID, _INVALID, _VALID))
+    ]
+
+    def cb(index, tiles, page, fmt):
+        f = ttnn.CBFormatDescriptor(buffer_index=index, data_format=fmt, page_size=page)
+        return ttnn.CBDescriptor(total_size=tiles * page, core_ranges=core_grid, format_descriptors=[f])
+
+    # ONE output block buffer: the writer drains block i at K step `defer` (<= K_blocks - 1) of block i + 1, before it
+    # reads that K block, so compute -- which packs block i + 1 only after its last K block -- never waits on it. (The
+    # vision MLP's 7 x 12-tile SwiGLU block: 86 KB less static L1, which the decode all_reduce's scratch needs.)
+    out_bufs = 1
+    cbs = [
+        cb(0, M_block * K_block * 2, in0_tile, x.dtype),
+        cb(1, K_block * N_block * 2, in1_tile, w.dtype),
+        cb(2, out_written * out_bufs, out_tile, dtype),
+        cb(3, out_block, interm_tile, interm_dtype),
+    ]
+    if residual is not None:
+        # the stock readers' FUSE_TERNARY CBs: the residual block ("a", unpacked to DEST unrounded) and the broadcast "b"
+        # row they read with it (the residual's first row here; the compute pops it unused)
+        cbs += [cb(5, out_block, _TILE_BYTES[residual.dtype], residual.dtype)]
+        cbs += [cb(6, N_block, _TILE_BYTES[residual.dtype], residual.dtype)]
+
+    acc = lambda t: list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    res_ct = [] if residual is None else acc(residual) + acc(residual)
+    head = [M_tiles, padded_M, K_tiles, padded_K, N_tiles, padded_N, M_block, K_block, N_block]
+    head += [M_blocks_per_core, N_blocks_per_core]
+    in0_ct = lambda injector: (
+        head
+        + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector, 1, N_tiles]
+        + [in1_tile]
+        + acc(x)
+        + acc(out)
+        + res_ct
+    )
+    in1_ct = lambda injector: (
+        head
+        + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector, 1, N_tiles]
+        + acc(w)
+        + acc(out)
+        + res_ct
+    )
+
+    skip_padding = SKIP_PADDING
+    k_blocks_per_core = -(-K_blocks // (in1_par if transpose else in0_par))
+    max_defer = max(min(y * k_blocks_per_core, K_blocks - 1) for y in range(gy))
+    phys = {}
+
+    def pxy(c):
+        if c not in phys:
+            p = device.worker_core_from_logical_core(ttnn.CoreCoord(*c))
+            phys[c] = (int(p.x), int(p.y))
+        return phys[c]
+
+    x_addr, w_addr, o_addr = x.buffer_address(), w.buffer_address(), out.buffer_address()
+    # FUSE_TERNARY runtime args (before the output address): a, b (broadcast row), broadcast flag
+    tern = [] if residual is None else [residual.buffer_address(), residual.buffer_address(), 1]
+    rt_in0_s, rt_in0_r, rt_in1_s, rt_in1_r, rt_c = [], [], [], [], []
+    for cy in range(gy):
+        for cx in range(gx):
+            core = (cx, cy)
+            in0_idx = cx if transpose else cy
+            in1_idx = cy if transpose else cx
+            left, top = (0, cy), (cx, 0)
+            o0, i0 = _core_order(core, transpose, in1_par, in0_noc, True, top if transpose else left)
+            o1, i1 = _core_order(core, transpose, in0_par, in1_noc, False, left if transpose else top)
+            prev0, next0 = o0[max(i0 - 1, 0)], o0[min(i0 + 1, len(o0) - 1)]
+            prev1, next1 = o1[max(i1 - 1, 0)], o1[min(i1 + 1, len(o1) - 1)]
+            m0, m1 = M_per_core * in0_idx, M_per_core * (in0_idx + 1)
+            n0, n1 = N_per_core * in1_idx, N_per_core * (in1_idx + 1)
+            defer = min(cy * k_blocks_per_core, K_blocks - 1)
+            a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, *tern, o_addr]
+            a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
+            a1 += [o_addr]
+            (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
+            (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
+            rt_c.append((core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else [])))
+
+    defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
+    in0_src, in0_defines = _DM_IN0, []
+    if in0_heads is not None:
+        nh, sq, hd = [int(d) for d in x.padded_shape][1:]
+        in0_src = _DM_IN0_HEADS
+        in0_defines = [("IN0_NH", str(nh)), ("IN0_ST", str(sq // T)), ("IN0_HDT", str(hd // T))]
+    if residual is not None:
+        defines += [("FUSE_TERNARY", "1")]
+    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
+    cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
+    if fuse_swiglu and SWIGLU_PACK_SFPU:
+        cdefines += [("SWIGLU_PACK_SFPU", "1")]
+        if SWIGLU_HOIST:
+            cdefines += [("SWIGLU_HOIST", "1")]
+    if skip_padding:
+        cdefines += [("SKIP_PADDING", "1")]
+    if residual is not None:
+        cdefines += [("FUSE_RESIDUAL", "1")]
+
+    dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
+    kern = lambda src, cores, ct, rt, cfg, d: ttnn.KernelDescriptor(
+        kernel_source=src,
+        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+        core_ranges=cores,
+        compile_time_args=ct,
+        runtime_args=rt,
+        config=cfg,
+        defines=d,
+    )
+    ccfg = ttnn.ComputeConfigDescriptor()
+    ccfg.math_fidelity = fidelity
+    ccfg.fp32_dest_acc_en = fp32_acc
+    ccfg.math_approx_mode = approx
+    ccfg.dst_full_sync_en = False
+    if residual is not None:
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[5] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the residual, as binary_ng unpacks a fp32 add's operands
+        ccfg.unpack_to_dest_mode = modes
+    c_ct = [K_blocks, M_block, K_block, N_block, M_blocks_per_core, N_blocks_per_core, sub_h, sub_w]
+    kernels = [
+        kern(in0_src, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines + in0_defines),
+        kern(in0_src, in0_receivers, in0_ct(0), rt_in0_r, dm(in0_risc, in0_noc), defines + in0_defines),
+        kern(_DM_IN1, in1_senders, in1_ct(1), rt_in1_s, dm(in1_risc, in1_noc), defines),
+        kern(_DM_IN1, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
+        kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
+    ]
+    ios = [x, w, out] if residual is None else [x, w, residual, out]
+    ttnn.generic_op(ios, ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
+    return out

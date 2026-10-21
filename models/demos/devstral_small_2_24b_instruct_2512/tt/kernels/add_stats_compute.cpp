@@ -4,7 +4,9 @@
 
 // Compute kernel of tt/add_stats.py, per tile row: h = x + d on the SFPU in fp32 (into a row-wide private buffer),
 // a copy of h to the writer, h^2 on the SFPU, and the row sums of h^2 by the accurate (fp32 SFPU) row reduce --
-// the same steps rms_norm_pre_all_gather runs on an fp32 input, without re-reading h from DRAM.
+// the same steps rms_norm_pre_all_gather runs on an fp32 input, without re-reading h from DRAM. The row-sum tile then
+// has its columns 1..31 (the reduce's partials) zeroed by an fp32 multiply with a column-0 mask (column 0 * 1.0 is
+// exact), so the gathered stats need no masking before they are summed.
 
 #include <cstdint>
 
@@ -12,6 +14,8 @@
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/reduce.h"
 #include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/pack.h"
 #include "api/compute/tile_move_copy.h"
 #include "ttnn/cpp/ttnn/kernel_lib/eltwise/api/chain.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/eltwise/api/convenience.hpp"
@@ -32,7 +36,9 @@ void kernel_main() {
     constexpr uint32_t cb_h = tt::CBIndex::c_3;       // h = x + d, the whole row (private)
     constexpr uint32_t cb_x2 = tt::CBIndex::c_4;      // h^2, the whole row (private)
     constexpr uint32_t cb_out = tt::CBIndex::c_16;    // h to the writer
-    constexpr uint32_t cb_s = tt::CBIndex::c_17;      // row sums of h^2
+    constexpr uint32_t cb_s = tt::CBIndex::c_17;      // row sums of h^2, columns 1..31 zeroed
+    constexpr uint32_t cb_mask = tt::CBIndex::c_5;    // fp32 column-0 mask (the reader's)
+    constexpr uint32_t cb_sraw = tt::CBIndex::c_18;   // the reduce's row-sum tile
 
     compute_kernel_hw_startup(cb_x, cb_d, cb_h);
 
@@ -40,6 +46,7 @@ void kernel_main() {
     constexpr auto h_row =
         ckl::input(cb_h, ckl::WaitPolicy::Cumulative, ckl::PopPolicy::None, ckl::InputTileMapping::Block);
 
+    cb_wait_front(cb_mask, 1);
     for (uint32_t r = 0; r < nr; ++r) {
         ckl::binary_sfpu<
             ckl::AddBinary<>,
@@ -54,11 +61,30 @@ void kernel_main() {
             ReduceDim::REDUCE_ROW,
             cb_x2,
             cb_scaler,
-            cb_s,
+            cb_sraw,
             compute_kernel_lib::ReduceInputPolicy::BulkWaitBulkPop,
             compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT_AND_OUTPUT,
             ReduceFp32Mode::Accurate>(compute_kernel_lib::ReduceInputBlockShape::row(WT));
         cb_pop_front(cb_h, WT);
+
+        cb_wait_front(cb_sraw, 1);
+        cb_reserve_back(cb_s, 1);
+        tile_regs_acquire();
+        reconfig_data_format_srca(cb_sraw);
+        copy_init(cb_sraw);
+        copy_tile(cb_sraw, 0, 0);
+        copy_init(cb_mask);
+        copy_tile(cb_mask, 0, 1);
+        mul_binary_tile_init();
+        mul_binary_tile(0, 1, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_s);
+        pack_tile(0, cb_s);
+        tile_regs_release();
+        cb_push_back(cb_s, 1);
+        cb_pop_front(cb_sraw, 1);
     }
+    cb_pop_front(cb_mask, 1);
     cb_pop_front(cb_scaler, 1);
 }

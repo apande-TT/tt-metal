@@ -42,6 +42,17 @@ class TtAttention:
     # dtype the attention norm output enters the QKV in when it fits in L1 (norm output to L1, cast there, freed by
     # the QKV): bf16 halves the activation blocks the HiFi4 QKV unpacks. None: the fp32 norm output from DRAM.
     QKV_INPUT_DTYPE = ttnn.bfloat16
+    # The fp32 residual stream stays in L1 -- the residual adds write L1, read the L1 o_proj / down outputs (their
+    # OUT_L1_BYTES / DOWN_OUT_L1_BYTES) and free what they consumed -- while it takes at most this many bytes per core
+    # (8 images x 256 patches x 1024 fp32: 76 KB). The same ops on the same values, only placed in L1: each add and the
+    # norm behind it otherwise stream the 8 MB stream through DRAM. 0: DRAM.
+    RESIDUAL_L1_BYTES = 96 * 1024
+    # Both residual adds ride in the output stage of the matmul feeding them (o_proj, the MLP down): attention /
+    # feed_forward take residual= and return the sum, through the same SFPU add (tt/minimal_mm.py residual=).
+    FUSE_RESIDUAL_ADDS = True
+    # The L1 casts of the norm outputs to bf16 run as tt/local_cast.py (every core casts the pages of its own L1 bank;
+    # ttnn.typecast's compute, bit-identical) instead of ttnn.typecast (one page at a time across the chip).
+    LOCAL_CAST = True
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -88,28 +99,63 @@ class TtAttention:
         # (row norms ~1e4) around layer 13, and whether a patch row crosses that onset depends on low bits a
         # bf16 residual drops: a bf16 stream (TT's or the CPU reference's alike) moves rows away from the
         # fp32 result there. Norm outputs go to the matmuls in MATMUL_INPUT_DTYPE; the sub-blocks return fp32.
-        if x.dtype != ttnn.float32:
-            x = ttnn.typecast(x, ttnn.float32)
         grid = self.device.compute_with_storage_grid_size()
         n_bytes = 4 * int(x.shape[0]) * int(x.shape[-2]) * int(x.shape[-1]) // (grid.x * grid.y)
+        if x.dtype != ttnn.float32:  # the stack's bf16 input joins the (L1) fp32 residual stream
+            x = ttnn.typecast(
+                x, ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG if 0 < n_bytes <= self.RESIDUAL_L1_BYTES else None
+            )
         l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
         if l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
             n32 = self.attention_norm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
-            n = ttnn.typecast(n32, self.QKV_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            n = self._l1_cast(n32, self.QKV_INPUT_DTYPE)
             ttnn.deallocate(n32)
         else:
             n = self._mm_in(self.attention_norm(x))
-        h = ttnn.add(x, self.attention(n, attention_mask=mask, position_embeddings=(cos, sin)))
+        res_l1 = 0 < n_bytes <= self.RESIDUAL_L1_BYTES
+        res_mem = ttnn.L1_MEMORY_CONFIG if res_l1 else None
+        if self.FUSE_RESIDUAL_ADDS:
+            # o_proj and the MLP down add their output into the residual themselves (tt/minimal_mm.py residual=)
+            h = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin), residual=x)
+            self._free_l1(x)
+        else:
+            a = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin))
+            h = ttnn.add(x, a, memory_config=res_mem)
+            self._free_l1(a, x)
         n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
         if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
-            n32, n = n, ttnn.typecast(n, self.GATE_UP_INPUT_DTYPE, memory_config=ttnn.L1_MEMORY_CONFIG)
+            n32, n = n, self._l1_cast(n, self.GATE_UP_INPUT_DTYPE)
             ttnn.deallocate(n32)
-            out = ttnn.add(h, self.feed_forward(n))
         else:
-            out = ttnn.add(h, self.feed_forward(self._mm_in(n)))
+            n = self._mm_in(n)
+        if self.FUSE_RESIDUAL_ADDS:
+            out = self.feed_forward(n, residual=h)
+            self._free_l1(h)
+        else:
+            f = self.feed_forward(n)
+            out = ttnn.add(h, f, memory_config=res_mem)
+            self._free_l1(f, h)
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
+
+    def _l1_cast(self, t, dtype):
+        """t (L1) cast to dtype, the result in L1."""
+        if self.LOCAL_CAST:
+            if getattr(self, "_local_cast", None) is None:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt.local_cast import LocalCast
+
+                self._local_cast = LocalCast(self.device)
+            if self._local_cast.supports(t, dtype):
+                return self._local_cast(t, dtype)
+        return ttnn.typecast(t, dtype, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+    @staticmethod
+    def _free_l1(*ts):
+        """Free the L1 tensors among ts (sub-block outputs and the L1 residual a layer has added from)."""
+        for t in ts:
+            if t.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(t)
 
     def _mm_in(self, t):
         return t if t.dtype == self.MATMUL_INPUT_DTYPE else ttnn.typecast(t, self.MATMUL_INPUT_DTYPE)

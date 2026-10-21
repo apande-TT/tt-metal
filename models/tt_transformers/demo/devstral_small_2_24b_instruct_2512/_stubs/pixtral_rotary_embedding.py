@@ -19,11 +19,13 @@ import ttnn
 
 
 class TtPixtralRotaryEmbedding:
-    def __init__(self, device, torch_module) -> None:
+    def __init__(self, device, torch_module, signed_sin=False) -> None:
+        """signed_sin: the sin table's first half negated (exact), the table a TtPixtralAttention built with
+        CPP_HEADS_ROPE reads: it carries rotate_half's negation."""
         self.device = device
         self._repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
         inv_freq = torch_module.inv_freq.detach().float()  # (positions, head_dim)
-        self.head_dim = inv_freq.shape[-1]
+        self.head_dim = hd = inv_freq.shape[-1]
 
         def _table(t):
             return ttnn.from_torch(
@@ -36,7 +38,10 @@ class TtPixtralRotaryEmbedding:
             )
 
         self.cos_table = _table(inv_freq.cos())
-        self.sin_table = _table(inv_freq.sin())
+        sin = inv_freq.sin()
+        if signed_sin:
+            sin = torch.cat((-sin[:, : hd // 2], sin[:, hd // 2 :]), dim=-1)
+        self.sin_table = _table(sin)
 
     @classmethod
     def build(cls, device, torch_module):

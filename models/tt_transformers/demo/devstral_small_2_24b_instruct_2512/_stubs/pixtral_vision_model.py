@@ -35,6 +35,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs import pixtral_attention
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_r_m_s_norm import TtPixtralRMSNorm
 from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtral_rotary_embedding import (
     TtPixtralRotaryEmbedding,
@@ -45,15 +46,27 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 
 
 class TtPixtralVisionModel:
+    # bf16 vision features (the transformer's output) stay in L1 up to this many bytes a core; 0: DRAM
+    FEATURES_L1_BYTES = 48 * 1024
+    # Every layer's head split and q / k RoPE as one C++ program (pixtral_attention.CPP_HEADS_ROPE), reading a signed
+    # sin table.
+    CPP_HEADS_ROPE = True
+
     def __init__(self, device, torch_module, n_layers=None) -> None:
         self.device = device
         cfg = torch_module.config
         self.patch_size = p = torch_module.patch_size
         self.max_side = cfg.image_size // cfg.patch_size
         self.hidden = hidden = cfg.hidden_size
-        self.transformer = TtPixtralTransformer(device, torch_module.transformer, n_layers=n_layers)
+        pixtral_attention.CPP_HEADS_ROPE = self.CPP_HEADS_ROPE
+        try:
+            self.transformer = TtPixtralTransformer(device, torch_module.transformer, n_layers=n_layers)
+        finally:
+            pixtral_attention.CPP_HEADS_ROPE = False
         self.ln_pre = TtPixtralRMSNorm.build(device, torch_module.ln_pre)
-        self.patch_positional_embedding = TtPixtralRotaryEmbedding(device, torch_module.patch_positional_embedding)
+        self.patch_positional_embedding = TtPixtralRotaryEmbedding(
+            device, torch_module.patch_positional_embedding, signed_sin=self.CPP_HEADS_ROPE
+        )
         self.head_dim = self.transformer.head_dim
         self._repl = repl = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
 
@@ -165,20 +178,29 @@ class TtPixtralVisionModel:
         # The patch projection on minimal_matmul over the full grid (ttnn.linear ran the 32 x 256-row batch on 88
         # cores: 552 us): one K block of the whole 588-wide patch (19 tiles; 8-tile blocks would pad it to 24) and
         # 4 x 4-tile output blocks (each core's N range is 4 tiles).
-        x = ttnn.experimental.minimal_matmul(
-            x,
-            self.w_patch,
-            config=ttnn.MinimalMatmulConfig(
-                M_block_size=4,
-                K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
-                N_block_size=4,
-                subblock_h=2,
-                subblock_w=2,
-                compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
-            ),
-            compute_kernel_config=self.compute_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        patch_cfg = ttnn.MinimalMatmulConfig(
+            M_block_size=4,
+            K_block_size=-(-int(self.w_patch.shape[-2]) // ttnn.TILE_SIZE),
+            N_block_size=4,
+            subblock_h=2,
+            subblock_w=2,
+            compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
         )
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        if minimal_mm.supported(x, self.w_patch, self.compute_cfg):
+            # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
+            x = minimal_mm.matmul(
+                x, self.w_patch, patch_cfg, self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=x.dtype
+            )
+        else:
+            x = ttnn.experimental.minimal_matmul(
+                x,
+                self.w_patch,
+                config=patch_cfg,
+                compute_kernel_config=self.compute_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
         x = self.ln_pre(x)
         s = x.shape[-2]
 
@@ -197,7 +219,18 @@ class TtPixtralVisionModel:
             cos, sin = ttnn.pad(cos, padding=pad, value=0.0), ttnn.pad(sin, padding=pad, value=0.0)
         mask = None if (batched and sp == s) else self._mask(s, sp, grids, batched)
 
-        out = ttnn.typecast(self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin)), ttnn.bfloat16)
+        # (the layers keep their fp32 residual stream in L1; the bf16 features stay in L1 while they take at most
+        # FEATURES_L1_BYTES a core -- 8 x 256 x 1024: 38 KB -- for the projector's norm and unfold, else DRAM)
+        h = self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin))
+        grid = self.device.compute_with_storage_grid_size()
+        f_bytes = 2 * int(h.shape[0]) * int(h.shape[-2]) * int(h.shape[-1]) // (grid.x * grid.y)
+        out = ttnn.typecast(
+            h,
+            ttnn.bfloat16,
+            memory_config=ttnn.L1_MEMORY_CONFIG if 0 < f_bytes <= self.FEATURES_L1_BYTES else ttnn.DRAM_MEMORY_CONFIG,
+        )
+        if h.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(h)
         if sp != s:
             out = ttnn.slice(out, (0, 0, 0, 0), (out.shape[0], 1, s, out.shape[-1]))
         return ttnn.reshape(out, (out.shape[0], s, out.shape[-1]))

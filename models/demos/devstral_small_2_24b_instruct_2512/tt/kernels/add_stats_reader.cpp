@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Reader of tt/add_stats.py: the unit reduce scaler once, then for each of this core's tile rows the fp32 residual
-// x and its delta d, BLK tiles at a time.
+// x and its delta d, BLK tiles at a time. STATS_MASK: also the fp32 column-0 mask tile the compute kernel applies to
+// each row-sum tile.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -29,6 +30,21 @@ void kernel_main() {
     const uint32_t d_bytes = get_tile_size(cb_d);
 
     dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<cb_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>();
+#ifdef STATS_MASK
+    // fp32 column-0 mask (1.0 in column 0, 0 elsewhere): column 0 of a tile is column 0 of faces 0 and 2
+    constexpr uint32_t cb_mask = 5;
+    cb_reserve_back(cb_mask, 1);
+    volatile tt_l1_ptr uint32_t* m = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_mask));
+    for (uint32_t i = 0; i < 1024; ++i) {
+        m[i] = 0;
+    }
+    for (uint32_t f = 0; f < 4; f += 2) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            m[f * 256 + i * 16] = 0x3F800000u;
+        }
+    }
+    cb_push_back(cb_mask, 1);
+#endif
 
     for (uint32_t r = r0; r < r0 + nr; ++r) {
         for (uint32_t t = 0; t < WT; t += BLK) {
