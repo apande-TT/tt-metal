@@ -69,7 +69,7 @@ inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
         f = j * sfpi::vConstFloatPrgm2 + f;
         r = r * f + c_p1;
         r = r * f + 4.16695364e-2f;
-        r = r * f + 1.66664720e-1f;
+        r = r * f + sfpi::vConstFloatPrgm0;  // 1.66664720e-1f, set by the caller for this pass
         r = r * f + 4.99999851e-1f;
         i = sfpi::abs(sfpi::as<sfpi::vInt>(sm));
         y = r * f + 1.0f;
@@ -128,8 +128,11 @@ ALWI void exp_tile(
     if constexpr (!approx && !scale_en && iterations == 32 && is_fp32_dest_acc_en) {
         if (pending) {
             pending = false;
+            // one more polynomial constant in vConstFloatPrgm0 for the pass, its 2.0 (the reciprocal's) restored after
+            MATH((sfpi::vConstFloatPrgm0 = 1.66664720e-1f));
             MATH(SFPU_UNARY_CALL(
                 DST_SYNC_MODE, DST_ACCUM_MODE, calculate_scaled_exp_hoisted, (32), idst, vector_mode, pending_scale));
+            MATH((sfpi::vConstFloatPrgm0 = 2.0f));
             return;
         }
     }
