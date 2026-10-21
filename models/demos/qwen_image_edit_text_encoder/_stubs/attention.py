@@ -555,6 +555,9 @@ def _bmm_split_m_config(a, b, transpose_b):
 
 # split_matmul's plain products on _bmm_split_m_config (M split over the grid) instead of BMM_CORE_GRID alone
 BMM_SPLIT_M = False
+# split_matmul's plain two-limb products as one product over the limbs concatenated along K (False: three products
+# + two adds)
+BMM_CONCAT_K = False
 
 
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
@@ -576,6 +579,18 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             p, q, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc, **kw
         )
 
+    if not exact and BMM_CONCAT_K and limbs == 2 and int(pa_all[0].shape[-1]) % TILE == 0:
+        # the three terms as ONE product over a 3x K: [ah | ah | al] @ [bh ; bl ; bh], accumulated in the fp32 dest
+        a3 = ttnn.concat([pa_all[0], pa_all[0], pa_all[1]], dim=-1)
+        b3 = ttnn.concat([pb_all[0], pb_all[1], pb_all[0]], dim=-1 if transpose_b else -2)
+        pc3 = _bmm_split_m_config(a3, b3, transpose_b) if BMM_SPLIT_M and BMM_CORE_GRID is not None else None
+        kw = {} if pc3 is not None or BMM_CORE_GRID is None else {"core_grid": BMM_CORE_GRID}
+        y = ttnn.matmul(
+            a3, b3, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc3, **kw
+        )
+        ttnn.deallocate(a3)
+        ttnn.deallocate(b3)
+        return y
     if not exact:
         y = None
         for pa, pb in terms:
