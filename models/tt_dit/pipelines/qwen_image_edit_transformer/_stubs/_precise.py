@@ -34,6 +34,12 @@ def precise_config():
 
 def split_bf16(x):
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+    if _te.SPLIT_LIMBS is not None:  # the text encoder's one-pass limb split when the pipeline hooks it in
+        parts = _te.SPLIT_LIMBS(x32, 2)
+        if parts is not None:
+            return tuple(parts)
     hi = ttnn.typecast(x32, ttnn.bfloat16)
     lo = ttnn.typecast(ttnn.subtract(x32, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
     return hi, lo
