@@ -238,6 +238,9 @@ class MiniCPM5Pipeline:
         self.noise_buf = self._tt(torch.zeros(1, S, B, W), ttnn.bfloat16)
         self.noise_seg_base = self._tt(torch.arange(S, dtype=torch.float32).mul_(W).reshape(1, S, 1, 1), ttnn.float32)
         self.noise_steps = []
+        # The noise the sampler reads: noise_buf (traced steps copy their noise into it), or the step's own
+        # resident noise tensor in eager decode_step (no 8 MB copy per token).
+        self.noise_src = self.noise_buf
         self.real_len = self.prompt_len
 
     def load_request(self, input_ids, noise):
@@ -263,6 +266,7 @@ class MiniCPM5Pipeline:
             for t in range(noise.shape[0])
         ]
         ttnn.copy(self.noise_steps[0], self.noise_buf)
+        self.noise_src = self.noise_buf
 
     # ------------------------------------------------------------------ on-device sampler
     def _sample(self, logits):
@@ -379,7 +383,7 @@ class MiniCPM5Pipeline:
         inside = ttnn.multiply(ttnn.ge(local, 0.0), ttnn.lt(local, float(W)))
         local = ttnn.typecast(ttnn.clamp(local, 0.0, float(W - 1)), ttnn.uint32)
         # The gathered noise follows the candidates (L1 in decode) rather than the resident DRAM noise buffer.
-        seg_noise = ttnn.gather(self.noise_buf, -1, local, memory_config=local.memory_config())
+        seg_noise = ttnn.gather(self.noise_src, -1, local, memory_config=local.memory_config())
         seg_noise = ttnn.typecast(seg_noise, ttnn.float32)
         return ttnn.sum(ttnn.multiply(seg_noise, inside), dim=1, keepdim=True)
 
@@ -415,14 +419,14 @@ class MiniCPM5Pipeline:
             core_ranges=cores,
             compile_time_args=[k, k_tiles, _NOISE_SEG_W, 0]
             + list(ttnn.TensorAccessorArgs(top_idx).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(self.noise_buf).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(self.noise_src).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[top_idx.buffer_address(), self.noise_buf.buffer_address(), out.buffer_address()],
+            common_runtime_args=[top_idx.buffer_address(), self.noise_src.buffer_address(), out.buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=[cb])
-        return ttnn.generic_op([top_idx, self.noise_buf, out], program)
+        return ttnn.generic_op([top_idx, self.noise_src, out], program)
 
     def _pick_kernel(self, tail_mass, top_vals, scored, top_idx):
         """The top-p filter (keep, smallest kept logit, allowed) and the argmax of scored = top_vals + noise over the
@@ -628,9 +632,12 @@ class MiniCPM5Pipeline:
         return self._prefill_forward()
 
     def decode_step(self, step):
-        """Decode new token `step` (1-based after the prefill's token 0) with that step's noise."""
-        ttnn.copy(self.noise_steps[step], self.noise_buf)
-        return self._decode_forward()
+        """Decode new token `step` (1-based after the prefill's token 0) with that step's noise (read in place)."""
+        self.noise_src = self.noise_steps[step]
+        try:
+            return self._decode_forward()
+        finally:
+            self.noise_src = self.noise_buf
 
     # AR decode contract: decode_prefill seeds the resident self-attn KV; decode_step reads it.
     def decode_prefill(self, input_ids, noise):
@@ -710,6 +717,7 @@ class MiniCPM5Pipeline:
         self.load_request(inputs["input_ids"], inputs["noise"])
         self._prefill_forward()  # seeds the resident KV + first token outside the trace
         ttnn.copy(self.noise_steps[1], self.noise_buf)
+        self.noise_src = self.noise_buf
 
     def decode_trace_step(self):
         return self._decode_forward()
