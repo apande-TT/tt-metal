@@ -53,6 +53,29 @@ def _resolve_target(target: str, repo_root: Path):
     return d.resolve() if d else None
 
 
+def _resolve_test_node(node: str, repo_root: Path) -> str:
+    """Spell a `path::test` node through the same symlinks _resolve_target follows for the model.
+
+    The isolation worktree stages the model under its RESOLVED path only. emit-e2e links its demo
+    from a second folder, so a --pcc-test spelled through that link named a file the worktree never
+    had (Mistral-Small-4-119B-2603, 2026-10-13: the model resolved to the link's target, the gate
+    stayed on the link, and discovery stopped with `--pcc-test file ... not found`).
+
+    A relative node stays repo-relative and an absolute one stays absolute. A file that does not
+    exist, or lies outside the repo, keeps its own spelling so the engine reports it as before."""
+    file_part, sep, rest = str(node).partition("::")
+    p = Path(file_part)
+    f = p if p.is_absolute() else repo_root / p
+    if not f.is_file():
+        return node
+    real = f.resolve()
+    try:
+        rel = real.relative_to(repo_root.resolve())
+    except ValueError:
+        return node
+    return (str(real) if p.is_absolute() else rel.as_posix()) + sep + rest
+
+
 # What classify_pipeline answers. Named because a branch now DEPENDS on the answer (topology is left
 # to an emitted demo), and a typed string literal at the comparison site is how that silently stops
 # matching if the wording ever changes.
@@ -124,6 +147,35 @@ def _stage_untracked_data(repo_root: Path, rel: Path, wt: Path) -> None:
             print(f"  [optimize/cc] isolation: WARN could not exclude staged data: {exc}")
 
 
+# The worktree lives in /tmp with none of the main tree's git-ignored host artifacts, and the cc
+# engine points TT_METAL_HOME at the worktree. `runtime` is one of them: it holds the repo's pinned
+# sfpi kernel compiler, and without it the JIT silently falls back to the system /opt sfpi. On
+# 2026-10-12 that fallback (7.16 against the repo's 7.84) built MiniCPM5-2B kernels that hung the
+# device on every perf test, while the same test passed with the main tree as TT_METAL_HOME.
+_HOST_BUILD_DIRS = ("python_env", "build", "build_Release", "runtime")
+
+
+def _borrow_host_build_dirs(repo_root: Path, wt: Path) -> list:
+    """Symlink the main tree's host build dirs into the worktree (same binaries, same toolchain).
+
+    Returns the dirs the main tree has but the worktree still does not share afterwards -- a JIT
+    toolchain that differs from the main tree's is a hang waiting to happen, not a warning."""
+    unshared = []
+    for d in _HOST_BUILD_DIRS:
+        src = repo_root / d
+        if not src.exists():
+            continue
+        dst = wt / d
+        if not dst.exists():
+            try:
+                dst.symlink_to(src)
+            except OSError as exc:  # noqa: BLE001
+                print(f"  [optimize/cc] isolation: WARN could not symlink {d}: {exc}")
+        if not dst.exists() or dst.resolve() != src.resolve():
+            unshared.append(d)
+    return unshared
+
+
 def _setup_isolation(repo_root: Path, demo_dir: Path):
     """Isolate an EXISTING tt-metal demo's optimization in a throwaway git worktree on a fresh
     branch, so the user's working tree + current branch are never mutated. The cc engine derives
@@ -148,16 +200,14 @@ def _setup_isolation(repo_root: Path, demo_dir: Path):
             wt_mod.destroy(session)
             print(f"  [optimize/cc] isolation: branch create failed: {co.stderr.strip()}")
             return None
-        # the worktree lives in /tmp and has no build artifacts or venv — borrow them from the
-        # main tree so `import ttnn` and the venv python resolve (symlinks, same binaries).
-        for d in ("python_env", "build", "build_Release"):
-            src = repo_root / d
-            dst = wt / d
-            if src.exists() and not dst.exists():
-                try:
-                    dst.symlink_to(src)
-                except OSError as exc:  # noqa: BLE001
-                    print(f"  [optimize/cc] isolation: WARN could not symlink {d}: {exc}")
+        unshared = _borrow_host_build_dirs(repo_root, wt)
+        if unshared:
+            wt_mod.destroy(session)
+            print(
+                "  [optimize/cc] isolation: the worktree does not share %s with %s -- kernels would be "
+                "JIT-built with a different toolchain than the main tree's" % (", ".join(unshared), repo_root)
+            )
+            return None
         _stage_untracked_data(repo_root, rel, wt)
         return {"wt": wt, "branch": branch, "demo_in_wt": wt / rel, "session": session}
     except Exception as exc:  # noqa: BLE001
@@ -703,6 +753,43 @@ def _reexec_under_memory_scope():
         return
 
 
+def add_cpp_flags(popt) -> None:
+    """--max-cpp-attempts and --cpp-only on the optimize parser. Defined here beside _apply_cpp_flags,
+    which reads them, so cli.py carries one line for both."""
+    popt.add_argument(
+        "--max-cpp-attempts",
+        type=int,
+        default=None,
+        dest="max_cpp_attempts",
+        help="clean (measured, not crashed) C++ kernel tries each open op gets before its C++ rung closes. "
+        "Default 1. Raise it for a large op whose first hand kernel lost: each later try is handed the "
+        "previous attempt's note and builds on that kernel (sets PERF_MCP_MAX_CPP_ATTEMPTS).",
+    )
+    popt.add_argument(
+        "--cpp-only",
+        action="store_true",
+        dest="cpp_only",
+        help="offer only the C++ kernel rung: no knob, structural, tt-lang or fusion rungs, and no structural "
+        "gates. Ops with no C++ kernel to write clear at once. Pair with --max-cpp-attempts for several tries "
+        "per op (sets PERF_MCP_CPP_ONLY=1).",
+    )
+
+
+def _apply_cpp_flags(args) -> str | None:
+    """--max-cpp-attempts / --cpp-only into the variables perf_mcp reads (_kernel_cap / _cpp_only).
+
+    Set only when asked, so a run without the flags keeps whatever the environment already says.
+    Returns an error message for an unusable value, else None."""
+    mca = getattr(args, "max_cpp_attempts", None)
+    if mca is not None:
+        if mca < 1:
+            return "--max-cpp-attempts must be 1 or more"
+        os.environ["PERF_MCP_MAX_CPP_ATTEMPTS"] = str(mca)
+    if getattr(args, "cpp_only", False):
+        os.environ["PERF_MCP_CPP_ONLY"] = "1"
+    return None
+
+
 def cmd_optimize(args) -> int:
     _reexec_under_memory_scope()
     _tf = invalid_trace_flag_error()
@@ -710,12 +797,25 @@ def cmd_optimize(args) -> int:
         print("error: " + _tf)
         return 1
     os.environ["PERF_MCP_DEVICES"] = (getattr(args, "devices", "") or "").strip()
+    _alo = getattr(args, "achievable_low", None)
+    _ahi = getattr(args, "achievable_high", None)
+    if _alo is not None and _ahi is not None:
+        os.environ["TT_PERF_ACHIEVABLE_BAND"] = "%s-%s" % (str(_alo).strip(), str(_ahi).strip())
+    elif _alo is not None or _ahi is not None:
+        print(
+            "  [optimize] --achievable-low and --achievable-high must be given together; "
+            "ignoring the achievable-band override."
+        )
     # Both the BEFORE bookend (this env var's own default) and every check_full_pipeline_latency
     # verdict read PERF_MCP_FULLPIPE_SAMPLES, so passing --fullpipe-samples here keeps the two
     # comparable at whatever sample count the operator picks -- see run.py's own note on why a
     # mismatched sample count between the two manufactured a false gain from noise on every run.
     if getattr(args, "fullpipe_samples", None) is not None:
         os.environ["PERF_MCP_FULLPIPE_SAMPLES"] = str(args.fullpipe_samples)
+    _cpp_err = _apply_cpp_flags(args)
+    if _cpp_err:
+        print("error: " + _cpp_err)
+        return 1
     if os.environ.get("PERF_MCP_SUPERVISED") != "1":
         _sweep_stale_perf_mcp()
         try:
@@ -895,6 +995,8 @@ def cmd_optimize(args) -> int:
     repo_root = _repo_root()
     model_dir = getattr(args, "model_dir", None)
     pcc_test = getattr(args, "pcc_test", None)
+    if pcc_test:
+        pcc_test = _resolve_test_node(pcc_test, repo_root)
     target = model_dir or args.target
     if not target:
         print("  [optimize] need a target (model_id / demo dir) or --model-dir.")

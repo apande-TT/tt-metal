@@ -381,6 +381,9 @@ class Counter:
 
 CONSEC_CRASH = Counter("consec_crash")
 RESET_FAILS = Counter("reset_fails")
+# Device runs killed for making no progress since the last run that worked (see note_kill).
+CONSEC_KILLS = Counter("consec_kills")
+KILL_STREAK_LIMIT = int(os.environ.get("TT_RECOVERY_KILL_STREAK", "2") or "2")
 
 
 def board_map_file():
@@ -534,6 +537,17 @@ def _live_temps() -> list:
         return []
 
 
+def _device_runs_work():
+    """probes.device_runs_work, read at CALL time like _live_temps (so the suite's stub holds). None --
+    no evidence -- when it cannot be asked."""
+    try:
+        from .probes import device_runs_work
+
+        return device_runs_work()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _board_needs_reset() -> bool:
     """True when at least one chip cannot report a die temperature -- the evidence a reset is for.
 
@@ -573,6 +587,10 @@ def board_needs_reset() -> bool:
     return _board_needs_reset()
 
 
+# Where the kernel driver exposes the boards. Every "who holds the device" question reads it.
+DEVICE_NODE_DIR = "/dev/tenstorrent"
+
+
 def device_holders() -> set:
     """Pids holding /dev/tenstorrent open, except this process and its ancestors. Best-effort: no
     `fuser` or an unreadable node yields fewer holders, never an exception. The one scan both the
@@ -581,7 +599,7 @@ def device_holders() -> set:
     import subprocess as _sp
 
     holders = set()
-    for node in _glob.glob("/dev/tenstorrent/*"):
+    for node in _glob.glob(DEVICE_NODE_DIR + "/*"):
         try:
             r = _sp.run(["fuser", node], capture_output=True, text=True, timeout=30)
             holders.update(int(t) for t in (r.stdout + " " + r.stderr).split() if t.strip().isdigit())
@@ -616,22 +634,34 @@ def reap_device_holders() -> list:
 DEVICES_ENV = "PERF_MCP_DEVICES"
 
 
-def requested_chip_count(devices: str):
-    """How many chips --devices asks for, or None when it does not narrow the host.
+def requested_chip_ids(devices: str):
+    """WHICH chips --devices asks for, in the order given and without repeats, or None when it does
+    not narrow the host.
 
     "all" (and anything unparseable) means the whole host and must NOT pin visibility. "single" is
-    one chip. An explicit list is its own length, so "0,1" is two. Pure string work: nothing here
-    opens a device, so it is safe to ask at the moment a device just died.
+    chip 0. An explicit list is those chips, so "2" is chip 2 -- not "one chip", which visibility
+    used to turn into chip 0 whatever id was asked for. Pure string work: nothing here opens a
+    device, so it is safe to ask at the moment a device just died.
     """
     text = str(devices or "").strip().lower()
     if not text or text == "all":
         return None
     if text == "single":
-        return 1
+        return [0]
     ids = [part for part in re.split(r"[,\s]+", text) if part]
     if ids and all(part.isdigit() for part in ids):
-        return len(ids)
+        return list(dict.fromkeys(int(part) for part in ids))
     return None
+
+
+def requested_chip_count(devices: str):
+    """How many chips --devices asks for, or None when it does not narrow the host.
+
+    The length of requested_chip_ids, so "0,1" is two and "single" is one; one parser, so the count
+    and the ids can never disagree.
+    """
+    ids = requested_chip_ids(devices)
+    return len(ids) if ids else None
 
 
 def reset_is_mandatory_after_kill(devices=None, env=None, chip_count=None) -> bool:
@@ -777,14 +807,26 @@ def recover(
     # not the output. Without this the two halves disagreed -- measured 2026-09-25, the caller
     # correctly decided "reset mandatory" and this still answered "no reset issued", because every
     # ARC was warm and error_text was empty.
+    # A WARM ARC IS NOT A WORKING CHIP. The veto above reads the ARC, and so does tt-smi; neither can
+    # see hung Tensix cores, which is what a killed device run usually leaves behind on a single chip.
+    # So before the veto gets the last word, the device is asked to run one op (probes.device_runs_work).
+    # Only an answer of False -- the op failed or hung -- overrides it: a passing probe or no probe at
+    # all leaves the veto exactly as it was, so a healthy board is still never reset.
     if not fault_is_certain and not is_dead_board(error_text) and not _board_needs_reset():
-        if log:
-            log(
-                "reset SKIPPED at %s: every chip reports a die temperature (%s), so nothing is "
-                "wedged -- resetting a live board is what took two chips down on 2026-08-17"
-                % (where, ", ".join("%.1fC" % t for t in _live_temps()[:4]) or "n/a")
-            )
-        return True
+        if _device_runs_work() is False:
+            if log:
+                log(
+                    "reset NOT skipped at %s: every chip reports a die temperature, but the device could "
+                    "not run a single op -- a hung chip with a live ARC" % where
+                )
+        else:
+            if log:
+                log(
+                    "reset SKIPPED at %s: every chip reports a die temperature (%s), so nothing is "
+                    "wedged -- resetting a live board is what took two chips down on 2026-08-17"
+                    % (where, ", ".join("%.1fC" % t for t in _live_temps()[:4]) or "n/a")
+                )
+            return True
     targets = targets_for(error_text, config_target, expand=expand)
     for tgt in targets:
         try:
@@ -795,6 +837,7 @@ def recover(
             continue
         if device_is_healthy():
             RESET_FAILS["n"] = 0
+            CONSEC_KILLS["n"] = 0
             if log:
                 log("device recovered at %s via target=%s" % (where, tgt))
             return True
@@ -872,9 +915,10 @@ def note_crash(where: str, reset, error_text: str = "", config_target: str = "",
         if ok:
             CONSEC_CRASH["n"] = 0
         return ok
+    hung_again = killed_for_no_progress(error_text) and note_kill()
     CONSEC_CRASH["n"] = CONSEC_CRASH["n"] + 1
-    if CONSEC_CRASH["n"] >= 2:
-        ok = recover(where, reset, error_text, config_target, log, expand)
+    if CONSEC_CRASH["n"] >= 2 or hung_again:
+        ok = recover(where, reset, error_text, config_target, log, expand, fault_is_certain=hung_again)
         if ok:
             CONSEC_CRASH["n"] = 0
         return ok
@@ -888,5 +932,34 @@ def note_ok() -> None:
     board that alternates working and wedging would clear it on every good measurement -- restoring
     exactly the unbounded retrying the limit exists to stop. The reset count is scoped to the run
     instead (see _run_stamp), which is the honest lifetime for "have resets stopped working here".
+    The kill streak clears with it: a run that worked is the evidence the last kill left no hang.
     """
     CONSEC_CRASH["n"] = 0
+    CONSEC_KILLS["n"] = 0
+
+
+def killed_for_no_progress(text) -> bool:
+    """Does this failure text say a watchdog killed the run for making NO progress (not for running
+    past its ceiling while still moving)? probes.kill_kind owns the wording."""
+    try:
+        from .probes import KILL_STALL, kill_kind
+
+        return kill_kind(text) == KILL_STALL
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def note_kill() -> bool:
+    """Record a device run killed for making no progress; True when this is the KILL_STREAK_LIMIT-th
+    in a row with no working run between -- the reset is then due whatever the veto says.
+
+    THE VETO CANNOT SEE THIS HANG. On a single chip recover() skips the reset while every ARC is warm
+    and the one-op work probe passes. Run 1791998839 (2026-10-14, minicpm5_2b, --devices 0): board 0
+    hung in fetch_queue_reserve_back on every large upload while both checks passed, so each kill's
+    reset was skipped and five stalled runs in a row -- on the edit and on the clean HEAD alike -- went
+    to the same hung chip for ~80 minutes. One kill is still ambiguous (a slow op, a contended device)
+    and keeps the veto, the 2026-08-17 protection; a second with nothing working between is not.
+    note_ok and a verified reset clear the streak.
+    """
+    CONSEC_KILLS["n"] = CONSEC_KILLS["n"] + 1
+    return CONSEC_KILLS["n"] >= KILL_STREAK_LIMIT

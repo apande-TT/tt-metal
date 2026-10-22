@@ -35,6 +35,7 @@ from __future__ import annotations
 # The seam names live in ONE module -- see stage_seams. A RELATIVE import resolves under both
 # names this package is imported by, so neither spelling has to be guarded.
 from . import stage_seams as _seams
+from .layer_depth import TOKENS_ENV
 from .profiler_drain import ProfilerDrain, capacity_cadence, is_device
 
 import ast
@@ -194,13 +195,22 @@ def looks_like_a_pipeline(obj) -> bool:
     return bool(names) and any(callable(getattr(obj, _seams.hook(n, _seams.STEP), None)) for n in names)
 
 
+def _parsed_method(fn):
+    """(its def node, the name it calls its own instance), read from fn's source; None when there is
+    no source or fn is not a method."""
+    try:
+        f = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        return f, f.args.args[0].arg
+    except Exception:  # noqa: BLE001 -- no source, or not a method: nothing to read
+        return None
+
+
 def _methods_a_hook_calls(hook) -> set:
     """Names of the methods `hook` calls on its own instance, read from its source."""
-    try:
-        fn = ast.parse(textwrap.dedent(inspect.getsource(hook))).body[0]
-        me = fn.args.args[0].arg
-    except Exception:  # noqa: BLE001 -- no source, or not a method: nothing to read
+    parsed = _parsed_method(hook)
+    if parsed is None:
         return set()
+    fn, me = parsed
     return {
         n.func.attr
         for n in ast.walk(fn)
@@ -211,13 +221,9 @@ def _methods_a_hook_calls(hook) -> set:
     }
 
 
-def stage_methods(pipe) -> dict:
-    """{stage: the method the measured forward runs that stage through}, or {} when not every declared
-    stage resolves to exactly one.
-
-    Read from the model's own hooks, never from a name typed here: <stage>_trace_step exists to run
-    ONE stage, so the method it calls that no other stage's step also calls is that stage's own.
-    Helpers every hook shares (input prep, readback) drop out by that rule, and so do the seams."""
+def _own_methods(pipe) -> dict:
+    """{stage: sorted names its <stage>_trace_step calls on the instance that no other stage's step
+    also calls}, or {} when a declared stage has no step hook. The rule stage_methods narrows to one."""
     stages, _ = _declared_stages(pipe)
     seams = {_seams.hook(st, sm) for st in stages for sm in _seams.ALL}
     calls = {}
@@ -229,21 +235,31 @@ def stage_methods(pipe) -> dict:
     out = {}
     for st, names in calls.items():
         shared = set().union(*[v for k, v in calls.items() if k != st])
-        own = [n for n in sorted(names - shared - seams) if callable(getattr(pipe, n, None))]
-        if len(own) != 1:
-            return {}
-        out[st] = own[0]
+        out[st] = [n for n in sorted(names - shared - seams) if callable(getattr(pipe, n, None))]
+    return out
+
+
+def stage_methods(pipe) -> dict:
+    """{stage: the method the measured forward runs that stage through}, or {} when not every declared
+    stage resolves to exactly one.
+
+    Read from the model's own hooks, never from a name typed here: <stage>_trace_step exists to run
+    ONE stage, so the method it calls that no other stage's step also calls is that stage's own.
+    Helpers every hook shares (input prep, readback) drop out by that rule, and so do the seams."""
+    own = _own_methods(pipe)
+    if not own or any(len(v) != 1 for v in own.values()):
+        return {}
+    out = {st: v[0] for st, v in own.items()}
     return out if len(set(out.values())) == len(out) else {}
 
 
 def _self_calls(fn) -> list:
     """[(attr, sub)] for every call rooted at the function's own instance: `self.a(...)` gives
     (a, None), `self.a.b(...)` and deeper give (a, b)."""
-    try:
-        f = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
-        me = f.args.args[0].arg
-    except Exception:  # noqa: BLE001
+    parsed = _parsed_method(fn)
+    if parsed is None:
         return []
+    f, me = parsed
     out = []
     for n in ast.walk(f):
         if not isinstance(n, ast.Call):
@@ -315,6 +331,154 @@ def pipeline_tp(pipe) -> int:
 def pipeline_sp(pipe) -> int:
     """The sequence-parallel degree the pipeline says it runs at (stage_seams.SP_ATTR), or 0."""
     return _pipeline_degree(pipe, _seams.SP_ATTR)
+
+
+def _leaves(v, depth=0) -> list:
+    """Every non-container inside `v` (lists, tuples, sets and dict values opened, to a bounded depth),
+    or `v` itself when it is one. None is nothing, not a leaf."""
+    if v is None or depth > 3:
+        return []
+    if isinstance(v, dict):
+        v = list(v.values())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        out: list = []
+        for _i in v:
+            out.extend(_leaves(_i, depth + 1))
+        return out
+    return [v]
+
+
+def pipeline_gathered_tables(pipe) -> list:
+    """The tensors the pipeline says it reads by index (stage_seams.GATHERED_TABLES_ATTR), as a flat list.
+
+    A method is called, an attribute is read; one tensor, or any nesting of lists, tuples and dicts of
+    them, comes back flat. A pipeline that states nothing, or whose statement raises, declares no
+    table -- and every table it holds is then charged in full, which is the old behaviour."""
+    try:
+        v = getattr(pipe, _seams.GATHERED_TABLES_ATTR, None)
+        if callable(v):
+            v = v()
+        return _leaves(v)
+    except Exception:  # noqa: BLE001 -- an unstated or failed declaration charges every table in full
+        return []
+
+
+class ProfileWindowReached(Exception):
+    """The profiled forward asked a recurring stage for more passes than the profile window holds.
+
+    Raised by bound_profile_window's counter, BEFORE the pass the window has no room for dispatches,
+    and caught by the injected bracket around the eager call (window_reached), so the capture ends
+    with the window it was sized for and the test goes on to its stop mark."""
+
+
+def window_reached(exc) -> bool:
+    """Is `exc` the profile window closing (ProfileWindowReached), rather than a real failure?"""
+    return isinstance(exc, ProfileWindowReached)
+
+
+def _profile_window() -> int:
+    """The token window the tool set for this profiled run (layer_depth.TOKENS_ENV), or 0 for none.
+
+    0 outside a profiled run: the full-pipeline gate also sets TOKENS_ENV, but it times an unmarked,
+    unbracketed eager fallback that has nothing to catch the window closing -- and writes no device log."""
+    prof = _profiling_env()
+    if not prof or any(os.environ.get(k) != v for k, v in prof.items()):
+        return 0
+    try:
+        return max(0, int(os.environ.get(TOKENS_ENV) or 0))
+    except ValueError:
+        return 0
+
+
+def _attr_a_hook_returns(hook):
+    """The instance attribute `hook` states its count from -- the name in a body that is nothing but
+    `return self.<name>` (a docstring aside) -- or None for any other shape."""
+    parsed = _parsed_method(hook)
+    if parsed is None:
+        return None
+    fn, me = parsed
+    body = [st for st in fn.body if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return None
+    v = body[0].value
+    if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == me:
+        return v.attr
+    return None
+
+
+def _align_horizon(pipe, stage: str, window: int) -> str:
+    """Lower the pipeline's own horizon to the window when its REPEATS hook reads it straight off the
+    instance, so the forward simply runs `window` passes. Returns the attribute set, "" when none.
+
+    A count of passes on the stage's methods (bound_profile_window) stops the forward only when the
+    stage is next asked for a pass -- and the loop around it can index per-pass inputs before that:
+    the test sized its sampling draws to the window, Mistral-Small-4-119B-2603's generate() asked for
+    draw #3 on its way to the third decode and raised IndexError mid-baseline (2026-10-14). The
+    attribute is read from the model's own hook, never typed here; only an int is touched, and only
+    lowered."""
+    name = _attr_a_hook_returns(getattr(type(pipe), _seams.hook(stage, _seams.REPEATS), None))
+    cur = getattr(pipe, name, None) if name else None
+    if not isinstance(cur, int) or isinstance(cur, bool) or cur <= window:
+        return ""
+    setattr(pipe, name, window)
+    print(
+        "  [stage-marks] %r horizon %s %d -> %d (profile window, %s)" % (stage, name, cur, window, TOKENS_ENV),
+        file=sys.stderr,
+        flush=True,
+    )
+    return name
+
+
+def bound_profile_window(pipe) -> int:
+    """Hold the profiled forward to the token window on the stage that recurs. Returns the window
+    applied, 0 when none is.
+
+    THE WINDOW REACHES THE STAGE, NOT THE ENTRY POINT. The tool sets the window as an env var and
+    trusts the test to hand it to the pipeline; how a pipeline takes its horizon is its own choice
+    (a generate() argument, a constructor argument, nothing at all), so a test that guessed wrong
+    profiled a 1024-token decode at full rate and filled the disk with a 97 GB device log
+    (Mistral-Small-4-119B-2603, 2026-10-14). Counted on the stage's own methods, the window holds
+    however the horizon is spelled.
+
+    Only a stage that says it recurs (stage_seams.REPEATS, more passes than the window) and that is
+    the LAST one the model declares: cutting a recurring stage short ends the forward, and a stage
+    declared after it would then go unprofiled. Every method only that stage's step calls (the rule
+    stage_methods uses) is counted -- each runs once per pass -- and the first to be asked for a pass
+    past the window raises ProfileWindowReached instead of dispatching it. Bound methods only: a
+    callable attribute may be an object the model also reads fields from (a marks wrapper is looked
+    through to the method it wraps). On the instance, so nothing else sees it; installed after any
+    separate marked pass, which must not spend the window.
+
+    Where the stage states its count straight from an instance attribute, that horizon is lowered to
+    the window first (_align_horizon), so the loop ends on its own and the count is only a backstop."""
+    window = _profile_window()
+    stages, _ = _declared_stages(pipe)
+    if not window or not stages:
+        return 0
+    from .perf_adapter import _stated_count
+
+    last = stages[-1]
+    if _stated_count(pipe, last, _seams.REPEATS) <= window:
+        return 0
+    _align_horizon(pipe, last, window)
+    names = [n for n in _own_methods(pipe).get(last, []) if inspect.ismethod(inspect.unwrap(getattr(pipe, n, None)))]
+    for name in names:
+        fn = getattr(pipe, name)
+
+        def _bounded(*a, _fn=fn, _name=name, _ran=[0], **k):
+            if _ran[0] >= window:
+                print(
+                    "  [stage-marks] %r ran the %d pass(es) of the profile window (%s); ending the "
+                    "profiled forward before %s() runs again" % (last, window, TOKENS_ENV, _name),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise ProfileWindowReached("%s: %s() ran %d of %d passes" % (last, _name, _ran[0], window))
+            _ran[0] += 1
+            return _fn(*a, **k)
+
+        setattr(pipe, name, functools.wraps(fn)(_bounded))
+    return window if names else 0
 
 
 def mark_stages_on_forward(pipe) -> int:
@@ -550,6 +714,19 @@ def find_device_in_scope(scope: dict, pipe=None):
     return getattr(pipe, "device", None) if pipe is not None else None
 
 
+def _bound_window(pipe) -> None:
+    """bound_profile_window for the marked pipeline, never at the cost of its marks."""
+    try:
+        bound_profile_window(pipe)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "  [stage-marks] could not bound the profile window (%s: %s); the disk guard still watches "
+            "the run" % (type(exc).__name__, str(exc)[:140]),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def mark_stages_in_scope(scope: dict, device=None, bind=None) -> int:
     """Mark each stage of whatever pipeline is live in `scope`. Returns how many were marked.
 
@@ -576,6 +753,7 @@ def mark_stages_in_scope(scope: dict, device=None, bind=None) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+            _bound_window(pipe)
             return n
         print(
             "  [stage-marks] %s off, but the stages could not be matched to the forward's own methods; "
@@ -597,7 +775,9 @@ def mark_stages_in_scope(scope: dict, device=None, bind=None) -> int:
             )
     if device is None:
         device = find_device_in_scope(scope, pipe)
-    return mark_stages_for(pipe, device)
+    n = mark_stages_for(pipe, device)
+    _bound_window(pipe)  # after the separate pass, which must not spend the window
+    return n
 
 
 # --- deterministic injection into the generated perf test ----------------------------------------
@@ -635,6 +815,45 @@ _INJECT_TEMPLATE = """{i}# --- stage marks (injected by perf_test_gen) ---------
 {body}{i}if _tt_sm is not None:
 {i}    _tt_sm.signpost("stop")
 """
+
+# The eager call inside the bracket: a recurring stage that reached the profile window ends the call
+# (ProfileWindowReached) and the run goes on to its stop mark; anything else still fails the test.
+_WINDOW_GUARD_TEMPLATE = """{i}try:
+{i}    {call}
+{i}except Exception as _tt_e:  # noqa: BLE001
+{i}    if _tt_sm is None or not _tt_sm.window_reached(_tt_e):
+{i}        raise
+"""
+_WINDOW_GUARD_KEY = window_reached.__name__ + "("
+# The bracket lines either side of its body, read off _INJECT_TEMPLATE so the two cannot drift.
+_BRACKET_LINES = _INJECT_TEMPLATE.splitlines()
+_BODY_AT = next(j for j, ln in enumerate(_BRACKET_LINES) if ln.startswith("{body}"))
+_BRACKET_BEFORE = _BRACKET_LINES[_BODY_AT - 1].replace("{i}", "").strip()
+_BRACKET_AFTER = _BRACKET_LINES[_BODY_AT].replace("{body}", "").replace("{i}", "").strip()
+
+
+def _guarded_call(ind: str, line: str) -> str:
+    """The bracket's body for the bare eager call on `line` (indent `ind`)."""
+    return _WINDOW_GUARD_TEMPLATE.format(i=ind, call=line.strip())
+
+
+def _refresh_bracket(text: str) -> tuple:
+    """(text, refreshed?) -- a bracket injected before the window guard existed, given it in place.
+
+    Only the one line between the start mark and the stop guard is touched, and only when it is a bare
+    call; a bracket already guarded, or one a hand edit reshaped, is left alone."""
+    if _WINDOW_GUARD_KEY in text:
+        return text, False
+    lines = text.splitlines(keepends=True)
+    start = next((j for j, ln in enumerate(lines) if ln.strip() == _BRACKET_BEFORE), None)
+    if start is None or start + 2 >= len(lines) or lines[start + 2].strip() != _BRACKET_AFTER:
+        return text, False
+    call = lines[start + 1]
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)", call.strip()):
+        return text, False
+    ind = call[: len(call) - len(call.lstrip())]
+    return "".join(lines[: start + 1]) + _guarded_call(ind, call) + "".join(lines[start + 2 :]), True
+
 
 # The per-stage pass, appended INSIDE the function the bracket wraps -- the one that built the model.
 # locals() is what makes it name-free: the pipeline is in there under whatever the generator called
@@ -688,7 +907,7 @@ def _strip_mark_pass(text: str):
 # device stopped being passed by name. Named from the function itself, so a rename cannot drift.
 _MARK_PASS_CALL_KEY = mark_stages_in_scope.__name__ + "("
 _MARK_PASS_BIND_RE = re.compile(r"bind=([A-Za-z_][A-Za-z0-9_]*)")
-_REFRESHED = "refreshed the per-stage pass call (template changed)"
+_REFRESHED = "refreshed an injected block (template changed)"
 
 
 def _refresh_mark_pass(text: str) -> tuple:
@@ -748,7 +967,8 @@ def _relocate_mark_pass(text: str) -> tuple:
     (_refresh_mark_pass); that, too, is a block that fails every run, not a style preference.
     """
     text, _refreshed = _refresh_mark_pass(text)
-    _unchanged = _REFRESHED if _refreshed else "already injected"
+    text, _guarded = _refresh_bracket(text)
+    _unchanged = _REFRESHED if (_refreshed or _guarded) else "already injected"
     stripped, marker_line = _strip_mark_pass(text)
     if marker_line is None:
         return text, _unchanged  # only the outer start/stop bracket exists here
@@ -970,7 +1190,7 @@ def inject_stage_marks(text: str) -> tuple:
     end, find = _mark_pass_site(text, fname)
     if end is None:
         return text, "cannot find the body of %s() to append the per-stage pass to" % fname
-    lines[k] = _INJECT_TEMPLATE.format(i=ind, body=lines[k])
+    lines[k] = _INJECT_TEMPLATE.format(i=ind, body=_guarded_call(ind, lines[k]))
     out = "".join(lines)
     # Re-locate after the bracket edit shifted the lines below it.
     end2, find2 = _mark_pass_site(out, fname)

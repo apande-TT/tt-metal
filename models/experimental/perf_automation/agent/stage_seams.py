@@ -56,6 +56,43 @@ TP_ATTR = "tp"
 # The sequence-parallel degree a pipeline runs at, when it states one -- the same rule: the mesh rows
 # carry replicas as well as token groups, and only the pipeline knows how many of each.
 SP_ATTR = "sp"
+# The tensors a pipeline reads BY INDEX -- its lookup tables: token embeddings, position tables, any
+# tensor a row is selected from -- as a method or attribute returning them, in any nesting of lists,
+# tuples or dicts. A unit of work reads the ROWS an index selects from such a table, not the table,
+# and nothing else can tell a table from a weight of the same shape: voxtral's embed_tokens and
+# lm_head are both [131072, 3072], and an op the model wrote itself (a generic_op gather) carries no
+# API name to key on. Only the pipeline knows, so it says, ONCE; every reader -- the dispatch hook
+# that measures a stage's streamed bytes, the census that credits resident bytes to a subtree -- asks
+# here. Unstated, every table is charged in full: the floor reads too high and the stack too short,
+# the direction that keeps a run working rather than stopping it early.
+GATHERED_TABLES_ATTR = "gathered_tables"
+
+
+# A DECLARED STAGE THE MEASUREMENT COULD NOT TIME SAYS SO, on a line of its own:
+# TRACE_STAGE_UNMEASURED[<stage>]=<why>. The adapter and trace_replay give such a stage no row so the
+# others keep theirs -- and a whole-pipeline headline is then the sum of the stages that RAN. On a
+# 32-chip port (2026-10-13) an edit crashed three of five stages, the sum of the two left (170 ms)
+# was read as the full pipeline (12332 ms), banked as a -98.6% win and promoted to
+# the committed best, after which every real reading was refused as +7136% diverged. The gate reads
+# this line to know the reading is partial; printed and parsed only through the two helpers below.
+UNMEASURED_MARK = "TRACE_STAGE_UNMEASURED"
+
+
+def unmeasured_line(stage: str, why: str) -> str:
+    """The marker line for `stage`. `why` is folded onto one line so a reader can split on `]=`."""
+    return "%s[%s]=%s" % (UNMEASURED_MARK, stage, " ".join(str(why).split()) or "unknown")
+
+
+def parse_unmeasured(line: str):
+    """(stage, why) when `line` carries the marker, else None."""
+    if UNMEASURED_MARK + "[" not in line:
+        return None
+    rest = line.split(UNMEASURED_MARK + "[", 1)[1]
+    if "]=" not in rest:
+        return None
+    stage, why = rest.split("]=", 1)
+    stage = stage.strip()
+    return (stage, why.strip()) if stage else None
 
 
 def hook(stage: str, seam: str) -> str:

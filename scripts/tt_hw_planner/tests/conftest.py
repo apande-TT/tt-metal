@@ -47,6 +47,8 @@ _DEVICE_PRIMITIVES = (
     ("models.experimental.perf_automation.agent.device_recovery", "device_holders"),
     ("models.experimental.perf_automation.agent.device_recovery", "recover"),
     ("models.experimental.perf_automation.agent.probes", "_device_reset"),
+    # Opens every visible chip and runs an op on it -- a device run beside a live one.
+    ("models.experimental.perf_automation.agent.probes", "device_runs_work"),
     ("scripts.tt_hw_planner.trace_gate", "reclaim_mesh"),
     # Not a kill, but the same class of accident: this is what LAUNCHES a run on the board. A test
     # that drives the capture without patching above it would start a real device pytest beside a
@@ -77,6 +79,29 @@ def _no_real_device_from_this_suite(monkeypatch, request):
             continue
         if hasattr(mod, attr):
             monkeypatch.setattr(mod, attr, _blocked("%s.%s" % (mod_path.rsplit(".", 1)[-1], attr)))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_thermal_watcher_from_this_suite(monkeypatch):
+    """emit-e2e's thermal layers (e2e_thermal) read the REAL board and, at the abort limit, end device
+    holders. A test that reaches cmd_emit_e2e would otherwise start a watcher thread that outlives the
+    test and export the run tag and PYTEST_PLUGINS into every later test's subprocesses; a test that
+    reaches a gate step would wait on the real board's temperature, and have its failure judged by it.
+    All are replaced for the whole suite, including run.py's cooldown before a re-run. test_emit_e2e_thermal_protection exercises the real functions
+    against a fake thermometer."""
+    try:
+        from scripts.tt_hw_planner import e2e_thermal
+    except Exception:  # noqa: BLE001 -- a checkout without it cannot reach it either
+        yield
+        return
+    monkeypatch.setattr(e2e_thermal, "install", lambda recover=None: "")
+    monkeypatch.setattr(e2e_thermal, "hold_if_hot", lambda label: None)
+    monkeypatch.setattr(e2e_thermal, "_peak_during", lambda run_once: (run_once(), None))
+    run = e2e_thermal.thermal_owner("run")
+    if run is not None:  # the cooldown before a re-run waits on the real board too
+        monkeypatch.setattr(run, "_cool_before_rerun", lambda: None)
+    monkeypatch.delenv(e2e_thermal.RUN_ENV, raising=False)
     yield
 
 

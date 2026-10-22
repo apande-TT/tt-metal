@@ -123,10 +123,10 @@ LOOP:
     structural-decode / kv-cache -> the decode loop is repeat_prefill: it re-runs the FULL prefill every token because there is NO KV-cache (use_cache=False). This is a DISTINCT lever from the trace dispatch lever — trace removes DISPATCH gaps, it does NOT remove the REDUNDANT RECOMPUTE, so 'trace is already applied' does NOT satisfy this and 'irreducible' is NOT an acceptable answer. You MUST ADD a KV-cache + a single-token decode_step (each token attends to CACHED K/V and computes seq_len=1, not a re-prefill); Read the recipe via recall_knobs(op_class='decode'). measure the per-token ms; check_pcc only if it is faster (ORDER below); commit only a real win. record_kernel_attempt(op='generation_loop','kv-cache',measured_ms,beat_baseline). This target clears ONLY on a MEASURED per-token reduction from the cache (bounded retries; do NOT record 'none/irreducible' for it).
     tt-lang    -> author a tt-lang (ttl) kernel (Read GUIDELINES/11). measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'tt-lang',measured_ms,beat_baseline).
     cpp        -> author a C++ Metalium kernel via ttnn.generic_op (Read GUIDELINES/12). measure_candidate; check_full_pipeline_latency; check_pcc only if both say faster (ORDER below); commit a win else revert. record_kernel_attempt(op,'cpp',measured_ms,beat_baseline).
-  COVERAGE — the profiled slice is a REPRESENTATIVE set of layers, not all of them, so after a dtype knob or a kernel swap call check_lever_coverage(op_match, stale_dtype, new_dtype) to CONFIRM the lever reached EVERY layer instance. A repeated block is ONE class instantiated N times, so editing the SHARED block definition/config propagates to all N; editing an instance-specific path (e.g. layers[0], a per-layer override) changes only that one and silently misses the rest. If fully_applied is false, REAPPLY on the shared definition (target the reported missed_blocks) and re-check until fully_applied — a partial application is NOT a real win even if the slice looks faster.
+  COVERAGE — the profiled slice is a REPRESENTATIVE set of layers, not all of them, so after a dtype knob or a kernel swap call check_lever_coverage(op_match, stale_dtype, new_dtype) to CONFIRM the lever reached EVERY layer instance. A repeated block is ONE class instantiated N times, so editing the SHARED block definition/config propagates to all N; editing an instance-specific path (e.g. layers[0], a per-layer override) changes only that one and silently misses the rest. If fully_applied is false, REAPPLY on the shared definition (target the reported missed_blocks) and re-check until fully_applied — a partial application is NOT a real win even if the slice looks faster. The ONE exception is a PCC-BOUNDED PARTIAL try, which termination_check hands out by name after a whole-stack knob failed accuracy: there the subset IS the lever, so pass intended_blocks and require as_intended instead of fully_applied.
   ALWAYS pass note= to record_kernel_attempt: ONE line stating (a) WHY you tried this lever on this op (the hypothesis — e.g. 'op is DRAM-bw bound, bf8_b weights halve reads') and (b) WHY it won or failed (the outcome reason — e.g. 'kept: 4.1->3.6ms', 'reverted: PCC 0.71<0.95', 'no gain: 4.1->4.1ms bw-bound', 'OOM under trace'). This note is streamed LIVE into the model's RUN_REPORT.md the instant the attempt resolves (win OR fail), so it must explain the reasoning, not just restate the numbers. ALSO pass stages_json to record_kernel_attempt whenever you have per-stage trace timings (the SAME JSON list of {{"name","ms","dominant?"}} you'd pass hitl_gate, e.g. from check_full_pipeline_latency's stage breakdown) — this renders the block-level timing table in RUN_REPORT.md so BOTH hitl and non-hitl runs show where device time went per stage/block.
   TWO measurements are fed back to you each step — use BOTH: (1) measure_candidate returns the per-op tracy device_ms (the fast steering signal that tells you WHICH op moved); (2) check_full_pipeline_latency returns the robust whole-pipeline trace+1cq per-token ms (its `mode` field = trace+1cq, `full_pipeline_ms` + `delta_pct` vs best) — this is the per-iteration VERDICT you bank a compute win on. This is the ONLY production metric — the run is trace+1cq end to end: trace+1cq always engages (a single command queue), so a dtype/grid/fusion/kernel win it confirms is real. The BEFORE number is one 1cq bookend run and the AFTER number is simply your last committed 1cq verdict (no second full-model run at the end).
-  (IRON RULE: a real win = check_pcc ok AND check_full_pipeline_latency status 'ok' (moved TOWARD the target / not diverged, at its trace+1cq mode) AND measure_candidate verdict 'valid' AND is_real_gain AND (for a dtype/kernel lever) check_lever_coverage fully_applied (reached every layer, not just the profiled slice). REJECTED, pcc-fail, or a DIVERGED full-pipeline latency is never a win — revert. Note: check_full_pipeline_latency never fails for missing the target, only for getting SLOWER than the trace+1cq best-so-far.)
+  (IRON RULE: a real win = check_pcc ok AND check_full_pipeline_latency status 'ok' (moved TOWARD the target / not diverged, at its trace+1cq mode) AND measure_candidate verdict 'valid' AND is_real_gain AND (for a dtype/kernel lever) check_lever_coverage fully_applied (reached every layer, not just the profiled slice; as_intended for a PCC-BOUNDED PARTIAL try). REJECTED, pcc-fail, or a DIVERGED full-pipeline latency is never a win — revert. Note: check_full_pipeline_latency never fails for missing the target, only for getting SLOWER than the trace+1cq best-so-far.)
   ORDER (time before correctness): run check_pcc LAST, and only for a candidate that measure_candidate and check_full_pipeline_latency call faster (or that reports a stage_win). A slower or diverged candidate is reverted and recorded WITHOUT it: the end-to-end correctness run is the longest step of an attempt (~25 min on a 50-step diffusion model) and its answer cannot turn a slower candidate into a win. This changes WHEN check_pcc runs, never WHETHER a win needs it: every commit still requires check_pcc ok.
   WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs had no match), call distill_knob to persist the general technique; if the win RE-USED a provisional lever learned on another model, pass its id to distill_knob to graduate it.
   Re-run termination_check. Repeat. NEVER stop while can_stop=false. NEVER reason a lever "won't help" — prove it by measuring + recording the attempt. For a structural-decode/kv-cache target you may NOT record 'none'/'irreducible' and you may NOT point at an already-applied trace lever as the resolution — you MUST add the KV-cache and prove it by a measured per-token reduction; the gate will keep returning this target until a kv-cache attempt actually lowers the number.
@@ -433,8 +433,13 @@ def _mcp_config(repo_root: Path, manifest_path: str, pipe: dict, devices: str, k
     _seq = os.environ.get("TT_PERF_SEQ_LEN")
     if _seq:
         env["TT_PERF_SEQ_LEN"] = _seq
+    # The kernel-rung depth and the C++-only ladder (--max-cpp-attempts / --cpp-only) are read by the
+    # server's ladder and recorder, so they have to be in this dict or the flags reach nothing.
     for _k in (
         "PERF_MCP_TARGET_BAND",
+        "PERF_MCP_MAX_CPP_ATTEMPTS",
+        "PERF_MCP_MAX_TTL_ATTEMPTS",
+        "PERF_MCP_CPP_ONLY",
         "TT_PERF_MODULE_LEVEL",
         "TT_PERF_MESH_ROWS",
         "TT_PERF_MESH_COLS",
@@ -526,8 +531,9 @@ _HALT_REMEDY = {
 }
 
 
-def _reset_fullpipe_baselines() -> None:
-    """Drop the full-pipeline (trace+1cq) bar ONLY when there is no usable one for this (model, task).
+def _reset_fullpipe_baselines(head_sha: str = "") -> None:
+    """Drop the full-pipeline (trace+1cq) bar ONLY when there is no usable one for this (model, task),
+    or when the one there was measured on a different model tree than the one this run starts from.
 
     This used to unlink the file unconditionally at task start, and that single line defeated every
     protection built around the bar. The sequence each run was:
@@ -548,12 +554,38 @@ def _reset_fullpipe_baselines() -> None:
 
     So: a usable bar for THIS (model, task) is kept and reused. Anything else -- no file, an
     unparseable one, a non-positive value -- is cleared so the run establishes a fresh one.
-    PERF_MCP_FORCE_REBASELINE=1 forces the old unconditional behaviour."""
+    PERF_MCP_FORCE_REBASELINE=1 forces the old unconditional behaviour.
+
+    A BAR MEASURED ON A DIFFERENT TREE IS NOT A BAR. The scoreboard records the commit its reading
+    was taken at (perf_mcp._record_fullpipe_candidate stamps HEAD when a reading is banked). A plain
+    --persist relaunch after a run starts from that same commit -- the last win -- and reuses the bar,
+    which is the case above. But when the tree this run starts from is a DIFFERENT commit, the stored
+    best describes code that no longer exists, and nothing in the run would ever notice: Voxtral,
+    2026-10-05, two levers had been undone by hand and tt-metal updated; the current code measured
+    90.6 ms against a stored best of 89.36, so every reading would have been graded a regression
+    until something beat code that was gone -- a 1.3 ms handicap on every win. No environment
+    variable should be needed to avoid that from the same launch command, so the bar is reused only
+    while its commit is the commit the run starts at; otherwise it is dropped here, with a line
+    saying so, and this run's BEFORE establishes the new one. A bar with no recorded commit (written
+    before the stamp existed) is kept, as before, and so is one when HEAD cannot be read. NOTHING
+    ELSE the run remembers is touched: the ledger with the campaign's own BEFORE and the roofline
+    pins, the lever attempts, the gate verdicts and the knob memory all stay."""
     p = state_dir() / _fullpipe_1cq_name()
-    if str(os.environ.get("PERF_MCP_FORCE_REBASELINE", "")).lower() not in ("1", "true", "yes"):
+    forced = str(os.environ.get("PERF_MCP_FORCE_REBASELINE", "")).lower() in ("1", "true", "yes")
+    if not forced:
         try:
-            if float(json.loads(p.read_text()).get("full_pipeline_ms") or 0.0) > 0:
-                return
+            doc = json.loads(p.read_text())
+            ms = float(doc.get("full_pipeline_ms") or 0.0)
+            recorded = str(doc.get("sha") or "")
+            if ms > 0:
+                if not recorded or not head_sha or recorded == head_sha:
+                    return
+                print(
+                    "  [optimize/cc] full-pipeline bar %.4f ms was measured at %s but this run starts at %s -- a bar "
+                    "measured on a different tree is not a bar; dropping it so this run's BEFORE establishes the "
+                    "new one (nothing else the run remembers is touched)" % (ms, recorded[:11], head_sha[:11]),
+                    flush=True,
+                )
         except Exception:  # noqa: BLE001
             pass
     try:
@@ -617,25 +649,33 @@ def _pcc_gate_baseline(repo_root: Path, mcp_env: dict, devices: str) -> None:
     from agent.probes import adaptive_backstop
 
     _op = "pcc"
-    rc, out = _run_device_step(
-        [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
-        repo_root / PERF_DIR,
-        env,
-        devices,
-        # never shorter than the runner's own inner backstop, or this outer bound would kill a gate
-        # the runner was still prepared to wait for
-        max(adaptive_timer(repo_root, _op, env_key="PERF_MCP_PCC_BACKSTOP"), adaptive_backstop()),
-        "correctness gate (BEFORE)",
-        observe_op=_op,
-        observe_root=repo_root,
-    )
+    # Observed here, not by _run_device_step: a record REUSED at this HEAD runs nothing, and its
+    # sub-second wall time logged as the gate's cost made every later "pcc"-derived budget its 30 s
+    # floor -- a 10-minute full-pipeline check was then SIGKILLed at 30 s on every attempt of a run
+    # (an image-edit port, 2026-10-07: "pcc": [0.618] after a --persist relaunch). A run that did go to
+    # the device is observed as before, a kill included.
     doc = {}
-    for line in (out or "").splitlines():
-        if line.startswith("PCC_BASELINE="):
-            try:
-                doc = json.loads(line.split("=", 1)[1]) or {}
-            except ValueError:
-                doc = {}
+    _t0 = time.monotonic()
+    try:
+        rc, out = _run_device_step(
+            [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
+            repo_root / PERF_DIR,
+            env,
+            devices,
+            # never shorter than the runner's own inner backstop, or this outer bound would kill a gate
+            # the runner was still prepared to wait for
+            max(adaptive_timer(repo_root, _op, env_key="PERF_MCP_PCC_BACKSTOP"), adaptive_backstop()),
+            "correctness gate (BEFORE)",
+        )
+        for line in (out or "").splitlines():
+            if line.startswith("PCC_BASELINE="):
+                try:
+                    doc = json.loads(line.split("=", 1)[1]) or {}
+                except ValueError:
+                    doc = {}
+    finally:
+        if not doc.get("reused"):
+            record_observed(repo_root, _op, time.monotonic() - _t0)
     failed = doc.get("failed_tests") if isinstance(doc.get("failed_tests"), list) else None
     if rc is None or not doc.get("recorded") or failed is None:
         why = str(doc.get("status") or ("killed" if rc is None else "unknown"))
@@ -660,16 +700,7 @@ def _pcc_gate_baseline(repo_root: Path, mcp_env: dict, devices: str) -> None:
 
 
 def _fullpipe_e2e(repo_root: Path, mcp_env: dict, devices: str, label: str) -> float | None:
-    _fp_t0 = time.monotonic()
-    try:
-        return _fullpipe_e2e_inner(repo_root, mcp_env, devices, label)
-    finally:
-        # BUG 4 (#3): the full-pipeline gate is the dominant cost of a round on a big
-        # model (llama's is ~1400 s); record it so the pcc/round budgets learn from it.
-        try:
-            record_observed(repo_root, "pcc", time.monotonic() - _fp_t0)
-        except Exception:  # noqa: BLE001
-            pass
+    return _fullpipe_e2e_inner(repo_root, mcp_env, devices, label)
 
 
 def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str) -> float | None:
@@ -683,7 +714,7 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
     # so a pipeline whose run emits none used to display the PREVIOUS pipeline's throughput.
     _LAST_SCORECARD.clear()
     if os.environ.get("PERF_MCP_FULLPIPE_E2E", "1") != "1":
-        return None
+        return (None, "")
     code = (
         "import sys; sys.path.insert(0, sys.argv[1]); import perf_mcp as P; "
         "g=P.check_full_pipeline_latency\n"
@@ -715,17 +746,24 @@ def _fullpipe_e2e_inner(repo_root: Path, mcp_env: dict, devices: str, label: str
     # (6 x a 281 s capped baseline) when it needed 1734 s. `fullpipe` has its own history and its own
     # cold start, expressed in baseline-profile units like every other op.
     _fp_op = "fullpipe"
-    rc, out = _run_device_step(
-        [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
-        repo_root / PERF_DIR,
-        env,
-        devices,
-        adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_BACKSTOP"),
-        f"full-pipeline ({label})",
-        stall_s=adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_STALL_SEC"),
-        observe_op=_fp_op,
-        observe_root=repo_root,
-    )
+    _fp_t0 = time.monotonic()
+    try:
+        rc, out = _run_device_step(
+            [_python_bin(repo_root), "-c", code, str(repo_root / CC_DIR)],
+            repo_root / PERF_DIR,
+            env,
+            devices,
+            adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_BACKSTOP"),
+            f"full-pipeline ({label})",
+            stall_s=adaptive_timer(repo_root, _fp_op, env_key="PERF_MCP_FULLPIPE_STALL_SEC"),
+            observe_op=_fp_op,
+            observe_root=repo_root,
+        )
+    finally:
+        # BUG 4 (#3): the full-pipeline gate is the dominant cost of a round on a big model (llama's is
+        # ~1400 s); record it so the pcc/round budgets learn from it -- only around the device run, so a
+        # bookend that never ran (disabled above) logs no near-zero cost for those budgets to shrink to.
+        record_observed(repo_root, "pcc", time.monotonic() - _fp_t0)
     if rc is None:
         return (None, "")
     mode = ""
@@ -3751,14 +3789,19 @@ def _device_answers() -> bool:
     any device -- NOT the startup probe, which raises on an unrecognised board_type and would call
     this host's own `p300c` dead.
 
-    Failure to answer returns False, which resets exactly as before -- this only ever ADDS a reason
-    not to reset, never a reason to.
+    Failure to answer returns False, which resets exactly as before.
+
+    ANSWERING IS NOT WORKING. tt-smi reports the ARC, which keeps answering while the chip's cores are
+    hung -- the state a timed-out device run leaves behind. So a board that answers is also asked to run
+    one op (probes.device_runs_work, after the child was killed, so the device is free), and only a
+    definite failure there turns "answered" into "reset". No answer from that probe (None) keeps the
+    old verdict.
     """
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from agent.probes import device_is_responsive
+        from agent.probes import device_is_responsive, device_runs_work
 
-        return bool(device_is_responsive(_LIVENESS_PROBE_S))
+        return bool(device_is_responsive(_LIVENESS_PROBE_S)) and device_runs_work() is not False
     except Exception:  # noqa: BLE001 -- no answer, a slow answer, or no probe at all: reset as before
         return False
 
@@ -3950,26 +3993,90 @@ def _run_device_step(*args, **kwargs):
     fixed by a fourth attempt -- at that point the last result is returned and the ordinary failure
     handling upstream takes it from there.
     """
-    for attempt in range(1 + _THERMAL_ABORT_RETRIES):
+
+    def _attempt():
         _THERMAL_ABORTED[0] = False
-        result = _run_device_proc(*args, **kwargs)
-        if not _THERMAL_ABORTED[0]:
-            return result
-        if attempt >= _THERMAL_ABORT_RETRIES:
-            print(
-                "  [thermal-abort] the board reached the abort limit on every attempt (%d); "
-                "returning the last result rather than retrying forever" % (attempt + 1),
-                file=sys.stderr,
-                flush=True,
-            )
-            return result
+        return _run_device_proc(*args, **kwargs)
+
+    return rerun_after_thermal_abort(_attempt, lambda: _THERMAL_ABORTED[0])
+
+
+def rerun_after_thermal_abort(attempt, was_aborted, label: str = "that step", cool=None):
+    """Run `attempt()`, and run it again while `was_aborted()` says the board reached the abort limit
+    during it -- at most _THERMAL_ABORT_RETRIES more times, then the last result stands.
+
+    The one owner of "re-run the step, not the run" (see _run_device_step), shared with emit-e2e's
+    gate steps, whose aborts are detected differently but must be retried by the same rule.
+
+    THE STEP KEEPS WHAT IT FINISHED. Every attempt runs inside one probes.stages_kept_across_retries
+    record, so a re-run replays the trace stages an earlier attempt measured instead of re-heating the
+    board on them. An attempt that kept a new stage made progress and does not use up a retry; only
+    attempts that kept nothing count against the bound, so the loop still ends -- a step has finitely
+    many stages.
+
+    AND THE RE-RUN STARTS COOL. It waited only when the board was still at the safety ceiling, so a
+    board released at 95C that had dropped to the high 80s by the time the reset finished was re-run
+    from there, and reached the limit again before measuring anything. It now cools to the cool-back
+    target first, which is what "from a cool board" always said. `cool` replaces that wait for a caller
+    that owns its own cooldown (perf_mcp, which must not load a second copy of itself to reach one)."""
+    try:
+        from agent.probes import stages_kept_across_retries as _scope
+    except Exception as exc:  # noqa: BLE001 -- without it every attempt measures every stage, as before
         print(
-            "  [thermal-abort] retrying that step from a cool board (attempt %d of %d)"
-            % (attempt + 2, _THERMAL_ABORT_RETRIES + 1),
+            "  [thermal-abort] WARNING: a re-run of %s will measure every stage again (%s: %s)"
+            % (label, type(exc).__name__, str(exc)[:120]),
             file=sys.stderr,
             flush=True,
         )
-    return result
+        _scope = None
+    if _scope is None:
+        import contextlib
+
+        _scope = lambda: contextlib.nullcontext(lambda: 0)  # noqa: E731 -- nothing kept, nothing counted
+    with _scope() as kept:
+        n = 0  # re-runs that followed an attempt which kept nothing new
+        tries = 0
+        while True:
+            before = kept()
+            tries += 1
+            result = attempt()
+            if not was_aborted():
+                return result
+            if kept() > before:
+                print(
+                    "  [thermal-abort] %s kept %d more measured stage(s) before it was ended; that attempt "
+                    "does not count against the %d retries" % (label, kept() - before, _THERMAL_ABORT_RETRIES),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif n >= _THERMAL_ABORT_RETRIES:
+                print(
+                    "  [thermal-abort] the board reached the abort limit on every attempt (%d); "
+                    "returning the last result rather than retrying forever" % tries,
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return result
+            else:
+                n += 1
+            (cool or _cool_before_rerun)()
+            print(
+                "  [thermal-abort] retrying %s from a cool board (attempt %d; %d of %d retries without "
+                "progress used)" % (label, tries + 1, n, _THERMAL_ABORT_RETRIES),
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _cool_before_rerun() -> None:
+    """Cool to the cool-back target before re-running a step the board ended: perf_mcp's cooldown, which
+    waits as long as physics needs. Best-effort -- a thermometer that cannot be read must not stop the
+    work."""
+    try:
+        pm = _perf_mcp()
+        pm._cooldown_after_clamp(pm._COOL_BACK_TO_C, give_up_on_plateau=False)
+    except Exception as exc:  # noqa: BLE001
+        _warn_gate_broken(exc)
 
 
 def _reset_is_mandatory_after_kill(devices, env=None) -> bool:
@@ -4058,7 +4165,7 @@ def _run_device_proc(
     proc = subprocess.Popen(
         list(cmd),
         cwd=str(cwd),
-        env=env,
+        env=_pr.with_kept_stages(env),  # env predates the step's kept-stage record
         stdout=subprocess.PIPE if _piped else None,
         stderr=subprocess.STDOUT if _piped else None,
         text=True if _piped else None,
@@ -4067,6 +4174,7 @@ def _run_device_proc(
     )
     _mp = _pr.memory_pressure_watch_new()
     rc, out = None, ""
+    _stall_killed = [False]
     try:
         if stall_s:
             import sys as _sys
@@ -4165,11 +4273,12 @@ def _run_device_proc(
                 idle = now - last_progress
                 if idle >= limit:
                     print(
-                        f"  [optimize/cc] {label or 'device subprocess'} STALLED (no output, syscalls, "
-                        f"bytes or stack movement for "
+                        f"  [optimize/cc] {label or 'device subprocess'} STALLED (no output, and no syscalls, "
+                        f"bytes or stack movement except under a frozen stack, for "
                         f"{int(idle)}s > adaptive limit {limit}s) -- treating as wedge",
                         flush=True,
                     )
+                    _stall_killed[0] = True
                     raise subprocess.TimeoutExpired(cmd, limit)
                 # NO WALL-CLOCK KILL WHILE THE WORK IS REAL -- BUT THERE IS A CEILING.
                 #
@@ -4244,14 +4353,7 @@ def _run_device_proc(
         # A timeout means SLOW. It does not mean wedged, and the difference is cheap to establish:
         # measured on this host, a live board answers tt_smi_probe() in 0.24 s and a wedged one does
         # not answer at all. Resetting a working board is not a neutral act, so it needs evidence.
-        if reset_on_timeout and not _reset_is_mandatory_after_kill(devices, env) and _device_answers():
-            tail = "process group killed; device answered a liveness probe, so it was NOT reset"
-        else:
-            tail = (
-                _reclaim_device(devices, error_text=out, after_kill=True)
-                if reset_on_timeout
-                else "process group killed"
-            )
+        tail = _recover_after_ended_child(devices, env, out, reset_on_timeout, "process group killed")
         _lim = int(getattr(_te, "timeout", None) or timeout_s)
         _why = "no-progress stall" if _lim < timeout_s else "hard limit"
         print(
@@ -4276,7 +4378,15 @@ def _run_device_proc(
         # So it records in `finally`, on the timeout path as much as the success path, exactly as
         # _fullpipe_e2e already does for "pcc". A hard-limit kill at 900 s becomes 900 s of observed
         # cost, and the next budget is 6x that instead of a constant.
-        if observe_op and observe_root is not None:
+        #
+        # EXCEPT A STALL. A step killed for making no progress was hung, not slow: its duration is the
+        # stall window plus however long the hang went unnoticed, and says nothing about what the work
+        # costs. Recording a hang is what grew a 2B LLM's budgets on 2026-10-20: a gate check hung on
+        # a deadlocked kernel was booked as a 1891 s profile beside four of 21-69 s, p95 x 6 hit the 3 h
+        # ceiling, and the next hang was given 3 h as both its stall window and its budget. That one
+        # reached the ceiling only because the stack check could not read the test (probes._py_spy_dump);
+        # with the read working it is a stall, and a stall is not booked.
+        if observe_op and observe_root is not None and not _stall_killed[0]:
             try:
                 record_observed(observe_root, observe_op, time.monotonic() - _obs_t0)
             except Exception:  # noqa: BLE001
@@ -4289,8 +4399,34 @@ def _run_device_proc(
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:  # noqa: BLE001
             pass
+    # A CHILD THAT ENDED ITSELF FOR HEAT (probes.thermal_yield: it held the device at the safety ceiling,
+    # where waiting heats the board rather than cooling it) is the same event as the abort above, seen
+    # from inside: the step is re-run from a cool board, never booked as a failure. In a run whose
+    # watcher answers ABORT lines itself (emit-e2e), that watcher resets and re-runs; doing it here too
+    # would reset the board twice.
+    if _pr.ended_for_heat(rc) and not _pr.run_watcher_owns_recovery():
+        _THERMAL_ABORTED[0] = True
+        print(
+            "  [thermal-abort] %s ended itself at the safety ceiling to release the device -- %s; "
+            "the step re-runs once the board is cool"
+            % (
+                label or "device subprocess",
+                _recover_after_ended_child(devices, env, out, reset_on_timeout, "device released"),
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
     _wait_for_thermal_headroom_before_device_work("%s (post-run cooldown)" % (label or "device work"))
     return rc, out
+
+
+def _recover_after_ended_child(devices, env, out, reset_on_timeout, without_reset):
+    """After a device child ended without closing the device: reset only on evidence -- a kill of a run
+    whose fabric may be stuck (_reset_is_mandatory_after_kill), or a board that does not answer -- and
+    say what was done. `without_reset` names what happened when no reset is allowed at all."""
+    if reset_on_timeout and not _reset_is_mandatory_after_kill(devices, env) and _device_answers():
+        return "%s; device answered a liveness probe, so it was NOT reset" % without_reset
+    return _reclaim_device(devices, error_text=out, after_kill=True) if reset_on_timeout else without_reset
 
 
 def _progress_token(repo_root: Path, kernel_log: str):
@@ -5124,8 +5260,12 @@ def _run_round_with_watchdog(
         # BUG 4 (#3): feed the real round duration back so later budgets scale off OBSERVED
         # cost instead of a baseline-derived proxy. Without this the adaptive path never
         # learns and every timer stays on its estimate.
+        # EXCEPT A KILLED ROUND. Its length is the cap that killed it, not what a round costs, and
+        # booking it raised the next cap (2 x p95) toward the ceiling: a 2B LLM, 2026-10-20, two
+        # hung rounds booked at 9,185 s and 10,804 s.
         try:
-            record_observed(repo_root, "round", time.monotonic() - _now0)
+            if not wedge_reason:
+                record_observed(repo_root, "round", time.monotonic() - _now0)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -5696,6 +5836,121 @@ def _warn_dirty_model_tree(demo_dir, repo_root) -> list:
     return dirty
 
 
+# A file bigger than this is not copied into the round-start snapshot, and is then left alone by the
+# restore: model dirs hold no hand-edited source anywhere near this size.
+_SNAPSHOT_MAX_BYTES = 8 << 20
+_ABSENT = object()
+_AT_HEAD = object()
+
+
+def _model_tree_snapshot(repo_root, model_root) -> dict | None:
+    """The model dir's uncommitted state as a round starts: HEAD, and the content of every file that
+    differs from HEAD or is untracked. None when the model dir is not inside this repo or git cannot say.
+
+    WHAT A KILLED ROUND LEAVES BEHIND IS WHAT THE NEXT ONE RUNS. The round watchdog SIGKILLs the agent
+    mid-attempt, and nothing put back the edit it was measuring. Measured on a 2B LLM, 2026-10-20:
+    the agent single-buffered a C++ matmul's output CB, the measurement hung on the deadlocked chip, the
+    watchdog killed the round -- and the edit stayed. The gate check after it profiled the edit and hung,
+    the next round's agent saw the diff and called the gate check, which hung for its whole 3 h round,
+    and the check after that hung again: 6 h with nothing measured. The agent's own git_revert cannot
+    help, because a killed agent calls nothing. Taken per round rather than per run so the restore keeps
+    what was already there when the round began -- instrumentation, and anything an operator left."""
+    try:
+        from agent import gitio
+
+        rel = Path(model_root).resolve().relative_to(Path(repo_root).resolve())
+        head = gitio.head_sha(repo_root)
+        paths = set(gitio.changed_files(repo_root, "HEAD", pathspec=rel)) | gitio.untracked_under(repo_root, rel)
+    except Exception:  # noqa: BLE001
+        return None
+    files = {}
+    for p in paths:
+        f = Path(repo_root) / p
+        try:
+            if not f.exists():
+                files[p] = _ABSENT
+            elif f.is_file() and f.stat().st_size <= _SNAPSHOT_MAX_BYTES:
+                files[p] = f.read_bytes()
+            else:
+                files[p] = None
+        except OSError:
+            files[p] = None
+    return {"rel": rel, "head": head, "files": files}
+
+
+def _restore_model_tree(repo_root, snap, patch_path=None) -> list:
+    """Put the model dir back to `snap` after a killed round. Returns the repo-relative paths changed.
+
+    A file the round changed goes back to its round-start content: to HEAD if it was clean then, deleted
+    if the round created it. A file committed during the round is clean against the new HEAD and is not
+    touched -- a commit is how a win is banked, and nothing banked is undone. Before anything is
+    discarded, the round's uncommitted diff and the files it created are written to `patch_path`, so the
+    edit can still be read. Never raises: a restore that cannot run leaves the tree as the kill left it,
+    which is where it was before this existed."""
+    if not snap:
+        return []
+    try:
+        from agent import gitio
+
+        rel = snap["rel"]
+        head = gitio.head_sha(repo_root)
+        now = set(gitio.changed_files(repo_root, "HEAD", pathspec=rel)) | gitio.untracked_under(repo_root, rel)
+    except Exception:  # noqa: BLE001
+        return []
+    files = snap["files"]
+    # A file dirty at round start but clean now was reverted or committed during the round; put its
+    # round-start content back only if HEAD has not moved (nothing was committed).
+    cands = sorted(now | (set(files) if head == snap["head"] else set()))
+    todo = []
+    for p in cands:
+        f = Path(repo_root) / p
+        want = files.get(p, _AT_HEAD)
+        if want is None:
+            continue
+        try:
+            cur = f.read_bytes() if f.is_file() else _ABSENT
+        except OSError:
+            continue
+        if isinstance(want, bytes) and cur == want:
+            continue
+        if want is _ABSENT and cur is _ABSENT:
+            continue
+        todo.append((p, want))
+    if not todo:
+        return []
+    if patch_path is not None:
+        try:
+            diff = gitio.diff_text(repo_root, "HEAD", rel)
+            untracked = gitio.untracked_under(repo_root, rel)
+            created = [p for p, w in todo if w is _AT_HEAD and p in untracked]
+            Path(patch_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(patch_path).write_text(
+                diff + "".join("\n# created by the killed round (removed): %s\n" % p for p in created)
+            )
+        except Exception:  # noqa: BLE001 -- the record is a courtesy; the restore must still happen
+            pass
+    tracked = set(gitio.present_at(repo_root, head, [p for p, w in todo if w is _AT_HEAD]))
+    done = []
+    for p, want in todo:
+        f = Path(repo_root) / p
+        try:
+            if want is _AT_HEAD:
+                if p in tracked:
+                    gitio.checkout(repo_root, head, p)
+                elif f.is_file():
+                    f.unlink()
+            elif want is _ABSENT:
+                if f.is_file():
+                    f.unlink()
+            else:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(want)
+            done.append(p)
+        except Exception:  # noqa: BLE001
+            continue
+    return done
+
+
 def _preflight_tool(repo_root: Path) -> bool:
     """Run the TOOL'S OWN test suite against the copy this run will execute. Returns True to proceed.
 
@@ -5964,7 +6219,7 @@ def optimize_pipeline(
     prompt = (_HITL_PROMPT if hitl else _PROMPT).format(model=model_name, task=task, metric=metric)
     start_sha = _git(repo_root, "rev-parse", "HEAD")
     mcp_env = cfg["mcpServers"]["perf-mcp"]["env"]
-    _reset_fullpipe_baselines()
+    _reset_fullpipe_baselines(start_sha)
     # The BEFORE bookend is a full-model run of several minutes AND it defines the bar every win is
     # graded against. If this (model, task) already has one, re-measuring it can only move the bar to
     # whatever the board felt like doing today -- which is exactly how a clamped 68.3241 ms replaced a
@@ -6032,6 +6287,8 @@ def optimize_pipeline(
             print(
                 "  [optimize/cc] round %d starts with stacks still short of their band: %s" % (rounds + 1, st["short"])
             )
+        _model_root = mcp_env.get("PERF_MCP_MODEL_ROOT") or os.environ.get("PERF_MCP_MODEL_ROOT")
+        _snap = _model_tree_snapshot(repo_root, _model_root) if _model_root else None
         wedged = _run_round_with_watchdog(
             round_cmd, repo_root, devices, kernel_log, stall_sec, agent_env=_round_launch.env
         )
@@ -6092,6 +6349,18 @@ def optimize_pipeline(
         else:
             auth_strikes = 0
         if wedged:
+            # The killed agent cannot revert the edit it was measuring; put the model dir back to where
+            # the round found it, or the next gate check and round run that edit (see
+            # _model_tree_snapshot).
+            _mani = _latest_manifest(repo_root / PERF_DIR)
+            _patch = (_mani.parent if _mani else Path(kernel_log).parent) / ("killed_round_%d.patch" % (rounds + 1))
+            _undone = _restore_model_tree(repo_root, _snap, _patch)
+            if _undone:
+                print(
+                    "  [optimize/cc] WATCHDOG: restored %d model file(s) the killed round left uncommitted "
+                    "(%s); its diff is kept in %s" % (len(_undone), ", ".join(_undone[:5]), _patch),
+                    flush=True,
+                )
             wedge_strikes += 1
             if wedge_strikes >= max_wedge:
                 print(
@@ -6624,6 +6893,15 @@ def _perf_target_inputs(demo_dir, model_id_hint, manifest) -> dict | None:
         # xB -> xGB rule was bypassed for exactly the models least able to report the error themselves.
         if _snap:
             _unread_w = _mb.unread_weight_files(_snap)
+            # SAID, NOT SILENT. A second copy of the weights is skipped by rule (model_bytes.loader_copy);
+            # naming the files keeps a reader from taking the smaller count for a short read.
+            _dup_w = [p.name for p in _mb.duplicate_weight_files(_snap)]
+            if _dup_w:
+                facts_note = (
+                    "  [optimize/cc] checkpoint ships its weights twice; counted once, from the copy the loader reads (skipped: %s)"
+                    % ", ".join(_dup_w[:6])
+                )
+                print(facts_note, flush=True)
             _an = _mb.weight_bytes(
                 _snap,
                 # Unknown unit -> count as "token", which EXCLUDES lookup-only tensors. One row of an

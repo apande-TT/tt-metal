@@ -213,6 +213,131 @@ def device_is_responsive(timeout_s: float = 20.0) -> bool:
         return False
 
 
+# How long the work probe below may sit with nothing being built before its silence is read as a hung
+# device. A healthy chip opens, runs and closes in 2-5 s (measured, warm and cold cache alike; build
+# time is not counted -- see _work_probe_once), so this is a wide margin, not an estimate.
+# 0 switches the probe off (device_runs_work answers None, and every caller keeps its old behaviour).
+WORK_PROBE_TIMEOUT_S = float(os.environ.get("PERF_MCP_WORK_PROBE_S", "60") or "0")
+# How many failures in a row it takes to call the device unable to run work (see device_runs_work).
+_WORK_PROBE_ATTEMPTS = int(os.environ.get("PERF_MCP_WORK_PROBE_ATTEMPTS", "3") or "1")
+# The build that may precede the op is bounded by this multiple of the timeout, and how often the
+# probe's process group is looked at for a running build.
+_WORK_PROBE_CEILING_MULT = 5
+_WORK_PROBE_POLL_S = 2.0
+_WORK_PROBE_READY = "PERF_WORK_PROBE_READY"
+_WORK_PROBE_OK = "PERF_WORK_PROBE_OK"
+# Every chip this process may see -- the run's own scope, inherited through TT_VISIBLE_DEVICES and its
+# descriptor -- is opened in turn and asked to add a tile to itself. ttnn's own TILE_SIZE, no shape of
+# ours. READY is printed once ttnn imported, so "could not run the probe" never reads as "device hung".
+_WORK_PROBE_CODE = """
+import torch, ttnn
+print(%(ready)r, flush=True)
+x = torch.ones(ttnn.TILE_SIZE, ttnn.TILE_SIZE, dtype=torch.bfloat16)
+for i in ttnn.get_device_ids():
+    d = ttnn.open_device(device_id=i)
+    try:
+        t = ttnn.from_torch(x, layout=ttnn.TILE_LAYOUT, device=d)
+        assert torch.equal(ttnn.to_torch(ttnn.add(t, t)).to(x.dtype), x + x), "chip %%s added wrong" %% i
+    finally:
+        ttnn.close_device(d)
+print(%(ok)r, flush=True)
+""" % {
+    "ready": _WORK_PROBE_READY,
+    "ok": _WORK_PROBE_OK,
+}
+
+
+def device_runs_work(timeout_s: float = None, attempts: int = None):
+    """Can the device RUN anything? True, False, or None when the question could not be put.
+
+    THE OTHER LIVENESS SIGNALS READ THE ARC. device_is_responsive asks tt-smi and board_telemetry reads
+    the die temperature; both come from the board-management firmware, which keeps answering while the
+    Tensix cores are hung. Measured 2026-10-13/14 on a QB2 (MiniCPM5-2B on chip 3): after the first
+    hang every device run on that chip hung -- the profiler, and the trace run without it -- for
+    fifteen hours across four rounds, while each recovery printed "no reset issued" because tt-smi
+    answered and every chip reported a die temperature. A manual `tt-smi -r` of that board cleared it.
+
+    So this asks the question a run actually needs answered: open each visible chip, add a tile to
+    itself, check the sum, close. Each attempt runs in its own session and is bounded, so a hung chip
+    costs the timeout per attempt and the probe's process group is killed, never left holding the device.
+
+    True:  every visible chip ran the op and returned the right answer.
+    False: ttnn imported, then a chip failed, answered wrong, or did not finish in time -- a device that
+           cannot run work, whatever its ARC says.
+    None:  the probe is switched off, or ttnn itself could not be imported -- no evidence either way,
+           so a caller must decide exactly as it did before this probe existed.
+
+    ONE FAILURE IS NOT A VERDICT. Measured 2026-10-14 on an idle, healthy p300c chip with `tt-smi -s`
+    running in a loop beside it (the dashboard and the run's own telemetry poll it): one probe in three
+    hung until it was killed, and the probes either side of it passed in 2.5 s. A probe that resets on
+    one failure would reset healthy boards on a busy host. A hung chip fails EVERY attempt; contention
+    does not. So False needs `attempts` failures in a row, and any pass is a pass.
+
+    Never call it while this process holds the device: it opens the device itself.
+    """
+    timeout_s = WORK_PROBE_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    if timeout_s <= 0:
+        return None
+    attempts = max(1, int(_WORK_PROBE_ATTEMPTS if attempts is None else attempts))
+    answers = []
+    for n in range(attempts):
+        if n:
+            time.sleep(_WORK_PROBE_POLL_S)
+        answers.append(_work_probe_once(timeout_s))
+        if answers[-1] is True:
+            return True
+    return False if all(a is False for a in answers) else None
+
+
+def _work_probe_once(timeout_s: float):
+    """One bounded run of the work probe: True, False or None, as device_runs_work describes."""
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _WORK_PROBE_CODE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 -- no interpreter to run it with: no evidence
+        return None
+    # THE CLOCK RUNS ONLY WHILE NOTHING IS BEING BUILT. A cold JIT cache compiles the firmware and the
+    # op's kernels first, in compiler subprocesses of the probe. Measured 2026-10-14 on an idle,
+    # healthy p300c chip with the host loaded: the cold probe was still compiling at 180 s, while the
+    # same probe warm finished in under a second (21/21 cache hits). Counting that build against the
+    # timeout would call a healthy chip hung and reset it -- the 2026-08-17 failure. A device wait
+    # spawns no process, so "no member of the probe's group but the probe itself" is the hang clock,
+    # and the build is bounded separately by the ceiling.
+    started = quiet_since = time.monotonic()
+    ceiling = timeout_s * _WORK_PROBE_CEILING_MULT
+    building = False
+    while True:
+        try:
+            out, _ = proc.communicate(timeout=_WORK_PROBE_POLL_S)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.monotonic()
+        building = any(p != proc.pid for p in _pgroup_members(proc.pid))
+        if building:
+            quiet_since = now
+        if now - quiet_since >= timeout_s or now - started >= ceiling:
+            _reap_process_group(proc.pid)
+            try:
+                out, _ = proc.communicate(timeout=30)
+            except Exception:  # noqa: BLE001
+                out = ""
+            # Silent before ttnn even imported is a slow host, and a build still running at the
+            # ceiling is a slow build: neither is an answer from the device.
+            if _WORK_PROBE_READY not in (out or "") or building:
+                return None
+            return False
+    out = out or ""
+    if _WORK_PROBE_READY not in out:
+        return None
+    return proc.returncode == 0 and _WORK_PROBE_OK in out
+
+
 # WHERE tt-smi IS, ASKED ONCE. Nine sites resolved this independently -- eight spelled
 # `tt_smi_bin()` and the ninth, tt_smi_probe,
 # ran the bare name and trusted PATH. That one fails from any launch that does not inherit an
@@ -389,6 +514,13 @@ class TracyHangError(TracyRunError):
     crash. Retriable: reset the device and re-profile."""
 
 
+class DiskFullError(TracyRunError):
+    """Watchdog killed a run because the disk its profile writes to fell below the free-space floor
+    (disk_floor_breached). NOT retriable as a hang: the space is still gone, so a retry would only
+    fill it again. Raised so the run fails with the reason instead of every process on the box
+    failing with ENOSPC."""
+
+
 _ERR_RE = re.compile(
     r"^[A-Za-z_][\w.]*(Error|Exception|Interrupt|Fault):"  # `ExceptionType: message` (not a `raise X(` line)
     r"|Segmentation fault|Aborted|core dumped|TT_FATAL|terminate called|Fatal Python error",
@@ -508,6 +640,22 @@ def detect_marker_drop(log_text: str) -> str | None:
 # marker in to survive emit-e2e's gate. Disabling the plugin ends both. pytest.ini registers the
 # `timeout` mark, so a test carrying one still collects. Hangs stay bounded by _execute's watch.
 PYTEST_NO_TIMEOUT = ("-p", "no:timeout")
+
+
+def pytest_argv(*rest) -> list:
+    """The argv every site that clears pytest.ini's addopts starts from -- with the repo's import mode kept.
+
+    The repo's addopts carry `--import-mode=importlib` together with `-vvs ...`; the tool clears addopts
+    wherever it needs flat --collect-only output or its own plugins, and that silently dropped the import
+    mode too. pytest then named the test module from the __init__.py chain above it, so an emitted demo
+    with tests/__init__.py and no demo-root __init__.py became `tests.e2e.<file>` -- shadowed by tt-metal's
+    own top-level `tests` package: `ModuleNotFoundError: No module named 'tests.e2e'`, 0 collected in 0.08 s,
+    "perf test selects no cases" at optimize's final check (Kolibri-1, 2026-10-08), while every other
+    pytest call in the run kept the repo's options and ran the same file. ONE owner for the prefix, so the
+    four sites that clear addopts (collect_cases, preflight_collect, the pcc runner, the pcc gate) cannot
+    disagree on what they dropped. A list, fresh per call: callers append to it."""
+    return [sys.executable, "-m", "pytest", "-o", "addopts=", "--import-mode=importlib", *rest]
+
 
 # The generated perf test drains the device profiler every <this many> wrapped ttnn calls; the
 # profiling env carries it (measure._capacity_scaled_osl sets it), so a retry can change it.
@@ -763,12 +911,28 @@ def _pgroup_io_counters(pgid) -> tuple:
     """
     calls = 0
     total = 0
+    for c, b in _tree_io_counters(pgid).values():
+        calls += c
+        total += b
+    return calls, total
+
+
+def _tree_io_counters(pgid) -> dict:
+    """{pid: (syscalls, io_bytes)} for every member of the run -- its group and everything its leader
+    started (see _pgroup_io_counters, which sums this). {} when /proc cannot be read.
+
+    Per process, because the stall check needs to know WHICH processes are moving the counters: a
+    hung test's background threads keep ticking its syscall count while its main thread sits in one
+    call for hours, and only that process's stack can say so."""
     members = {pid for pid, fields in _proc_stat_fields() if len(fields) > 2 and fields[2] == str(pgid)}
     try:
         members.update(_descendant_pids(int(pgid)))
     except (TypeError, ValueError):
         pass
+    out = {}
     for pid in members:
+        calls = 0
+        total = 0
         try:
             with open("/proc/%d/io" % pid) as fh:
                 for line in fh:
@@ -779,31 +943,112 @@ def _pgroup_io_counters(pgid) -> tuple:
                         total += int(v)
         except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, ValueError):
             continue
-    return calls, total
+        out[pid] = (calls, total)
+    return out
+
+
+def _py_spy_exe() -> str:
+    """py-spy on PATH, else the one installed beside the running interpreter, else "".
+
+    A supervisor started as `python_env/bin/python -m ...` without activating the venv has the venv's
+    bin off PATH, so a py-spy pip-installed into that venv was invisible and every stack read came
+    back empty -- the stack check silently never ran."""
+    import shutil as _shutil
+
+    exe = _shutil.which("py-spy")
+    if exe:
+        return exe
+    beside = Path(sys.executable).parent / "py-spy"
+    return str(beside) if beside.is_file() and os.access(beside, os.X_OK) else ""
+
+
+# How py-spy may read another process here, learned at the first refused read and kept: "plain",
+# "elevated" (through _ELEVATE) or "refused" (neither works).
+_PY_SPY_MODE = ["plain"]
+
+
+def _py_spy_dump(exe, pid):
+    """`py-spy dump` of pid, or None when it cannot run.
+
+    PTRACE IS NOT A GIVEN. Under Yama ptrace_scope=1 -- the default on Ubuntu -- only an ANCESTOR may
+    read a process, and py-spy is the supervisor's child, a sibling of the test, so every read came back
+    "Permission Denied" and the stack check never ran at all. Measured on a 2B LLM, 2026-10-20: a
+    profile hung in `to_torch` for 90 minutes, then 3 hours, with its stack never read once, while the
+    test's background threads ticked the syscall counter and kept the stall clock from starting.
+    Reproduced with a profiled pytest frozen after `import ttnn`: the stall check never fired and only
+    the 4x ceiling stopped it. So a refused read is retried once elevated, with the non-interactive
+    sudo this tool already uses for its other privileged steps (pkgtools._ELEVATE), and the answer is
+    kept for the rest of the process. Where neither works the check stays off, as it always was there,
+    but says so once instead of failing silently."""
+    import subprocess as _sp
+
+    from .pkgtools import _ELEVATE
+
+    args = [exe, "dump", "--pid", str(int(pid)), "--locals", "--nonblocking"]
+
+    def _run(prefix):
+        try:
+            return _sp.run(list(prefix) + args, capture_output=True, text=True, timeout=8)
+        except Exception:  # noqa: BLE001 -- an unsampleable process contributes nothing, never an error
+            return None
+
+    def _refused(res):
+        text = (getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")
+        return res is not None and "permission denied" in text.lower()
+
+    mode = _PY_SPY_MODE[0]
+    if mode == "refused":
+        return None
+    if mode == "elevated":
+        return _run(_ELEVATE)
+    r = _run(())
+    if not _refused(r):
+        return r
+    r2 = _run(_ELEVATE)
+    if r2 is not None and r2.returncode == 0:
+        _PY_SPY_MODE[0] = "elevated"
+        return r2
+    if r2 is not None and not _refused(r2) and "sudo" not in (getattr(r2, "stderr", "") or "").lower():
+        return None  # elevated, but this one process could not be read (it exited): decide on a later one
+    _PY_SPY_MODE[0] = "refused"
+    print(
+        "  [probes] WARNING: py-spy may not read the run's processes (ptrace refused, and `sudo -n` "
+        "did not help): the stall check cannot see a frozen stack and falls back to syscall counters, "
+        "which a hung run's background threads keep moving. Allow it with "
+        "`sudo sysctl kernel.yama.ptrace_scope=0` or passwordless sudo for py-spy.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return None
 
 
 def _stack_fingerprint(pid) -> str:
-    """The top of the process's Python stack, or "" when it cannot be sampled.
+    """A digest of the process's Python stacks AND their local variables, or "" when it cannot be
+    sampled.
 
     THE ONE SIGNAL A KERNEL-SIDE LIVELOCK CANNOT FAKE. A poll loop asking the driver "ready yet?"
     moves the syscall counter forever, so the counters above call it alive; its STACK does not move.
     Sampled with py-spy when it is installed -- optional by design, because the counters already
     cover the common case and a missing profiler must not make the tool refuse to run.
-    """
-    import shutil as _shutil
-    import subprocess as _sp
 
-    exe = _shutil.which("py-spy")
+    LOCALS, because a healthy loop can sit on the same line every time it is sampled: a decode loop
+    that spends most of each step waiting in one read lands there sample after sample, and frames
+    alone would call it frozen. Its loop variable does not stay still; a hung call's locals do.
+    --nonblocking, because pausing a profiled run to look at it would show up in what it measures.
+    Digested whole rather than cut to a prefix: py-spy prints the innermost frame first, so a prefix
+    keeps the frame that never changes and drops the outer loop that does.
+    """
+    import hashlib as _hashlib
+
+    exe = _py_spy_exe()
     if not exe:
         return ""
-    try:
-        r = _sp.run([exe, "dump", "--pid", str(int(pid))], capture_output=True, text=True, timeout=8)
-    except Exception:  # noqa: BLE001 -- an unsampleable process contributes nothing, never an error
-        return ""
-    if r.returncode != 0:
+    r = _py_spy_dump(exe, pid)
+    if r is None or r.returncode != 0:
         return ""
     # The frames only -- not the thread header, which carries a state that flickers between samples.
-    return "\n".join(ln.strip() for ln in (r.stdout or "").splitlines() if ln.startswith("    "))[:2000]
+    frames = "\n".join(ln.strip() for ln in (r.stdout or "").splitlines() if ln.startswith("    "))
+    return _hashlib.sha1(frames.encode()).hexdigest() if frames else ""
 
 
 def progress_signature(pgid, log_path=None, pid=None) -> tuple:
@@ -839,9 +1084,17 @@ class ProgressWatch:
     already diverging on the day it was written. So it lives here, once.
 
     Holds the last signature and the last time a stack was sampled; `moved()` folds a fresh sample
-    in and answers. The stack is the expensive field -- it costs a subprocess -- so it is only
-    sampled once the cheap counters have been still for half the stall window (and never more often
-    than _STACK_EVERY_S), and only when the caller offers a pid.
+    in and answers. The stack is the expensive field -- it costs a subprocess -- so it is never
+    sampled more often than _STACK_EVERY_S, and only when the caller offers a pid.
+
+    WHEN THE COUNTERS MOVE, THE STACKS OF WHOEVER MOVED THEM DECIDE. The counters were trusted on
+    their own, and the stack only consulted once they went quiet -- which a hung device run never
+    does. Measured 2026-10-12 on a MiniCPM5-2B profile: the test sat in one `to_torch` for three
+    hours, Python stack byte-identical across samples, while its background threads moved ~200
+    syscalls every 20 s. Every poll called that progress, so the stall clock never started and only
+    the 12 h ceiling stood behind it. Now counters that move only count while the processes moving
+    them also move their stacks (frames and locals). A process whose stack cannot be read -- a
+    compiler, the capture tool, a box without py-spy -- keeps the counters' word, exactly as before.
     """
 
     def __init__(self, pgid, log_path=None, stall_s=0.0):
@@ -851,6 +1104,10 @@ class ProgressWatch:
         self._sig = progress_signature(pgid, log_path)
         self._last_stack_at = 0.0
         self._max_gap = 0.0
+        # pid -> (its io counters, its stack digest) as of the last busy-tree sample.
+        self._busy = {}
+        # True while every process moving the counters was last seen with an unchanged stack.
+        self._frozen = False
 
     # A WINDOW MAY NEVER BE TIGHTER THAN A GAP THIS RUN HAS ALREADY SURVIVED.
     #
@@ -883,7 +1140,38 @@ class ProgressWatch:
         did = new[:3] != old[:3] or (bool(new[3]) and bool(old[3]) and new[3] != old[3])
         # Keep the last stack we managed to read, so a poll that skipped it does not look like a change.
         self._sig = new if (new[3] or not old[3]) else (new[0], new[1], new[2], old[3])
+        if new[0] != old[0]:
+            # The log grew. Nothing a hung process does writes its log, so this is never second-guessed.
+            self._frozen = False
+            return True
+        if pid is not None and new[1:3] != old[1:3]:
+            if now - self._last_stack_at >= _STACK_EVERY_S:
+                self._last_stack_at = now
+                self._frozen = self._busy_and_frozen()
+            return not self._frozen
+        if did:
+            self._frozen = False
         return did
+
+    def _busy_and_frozen(self) -> bool:
+        """Is every process that moved the counters since the last sample sitting on the stack it had
+        then? False whenever any of them cannot be read, is new, or moved -- the counters then decide.
+
+        Stops sampling at the first mover that is not frozen: one is enough to call the run alive,
+        and a compile can have dozens of short-lived movers that py-spy cannot read anyway. A mover
+        left unsampled is remembered with no stack, so it cannot read as frozen next time either.
+        """
+        io = _tree_io_counters(self._pgid)
+        movers = [p for p, v in io.items() if p not in self._busy or self._busy[p][0] != v]
+        stacks = {p: "" for p in movers}
+        frozen = bool(movers)
+        for p in movers:
+            stacks[p] = _stack_fingerprint(p)
+            if not (stacks[p] and p in self._busy and stacks[p] == self._busy[p][1]):
+                frozen = False
+                break
+        self._busy = {p: (v, stacks[p] if p in stacks else self._busy[p][1]) for p, v in io.items()}
+        return frozen
 
 
 def _pgroup_cpu_jiffies(pgid: int) -> int:
@@ -1320,10 +1608,156 @@ def thermal_yield(label: str = "") -> None:
         if now - _thermal_yield_last[0] < _THERMAL_YIELD_MIN_GAP_S:
             return
         _thermal_yield_last[0] = now
-        _cc_optimize("perf_mcp").cool_if_over_safety_ceiling(label or "next unit")
+        pm = _cc_optimize("perf_mcp")
+        # A PROCESS THAT HOLDS THE DEVICE CANNOT COOL IT BY WAITING. Measured on a 4-chip p300c,
+        # 2026-10-13, nothing else on the box: the mesh opened and left idle -- no op running -- took
+        # every chip from 20 W to 85-91 W and the board from 58C to 92.5C in fifteen minutes. Closed,
+        # the same chips idle at ~20 W, and the board fell from 95C to 65C in about twelve minutes,
+        # every time today's runs ended a holder. So the wait below, done with the device open, was
+        # not a cooldown: Devstral's perf test sat in it for forty-five minutes climbing 91.5C -> 94.7C
+        # until the abort limit ended it, and on 2026-10-11 the same wait went 87.6C -> 95.1C.
+        # Ending the process is what releases the device; whoever started it re-runs the step from a
+        # cool board, and the stages this step already measured are kept (stages_kept_across_retries).
+        try:
+            from .thermal_pytest_plugin import end_for_heat, holds_device
+        except Exception as exc:  # noqa: BLE001 -- without it, the wait below is still the old behaviour
+            _warn_thermal_inert("thermal_yield handoff", exc)
+            end_for_heat, holds_device = None, lambda: False
+        if holds_device():
+            hot, cur = pm.board_over_safety_ceiling()
+            if hot:
+                end_for_heat(
+                    "[thermal-handoff] %s: board at %.1fC, at or above the %.1fC safety ceiling, and this "
+                    "process holds the device -- which keeps the board heating, not cooling. Ending it so the "
+                    "device is released; the step re-runs from a cool board and keeps what it already measured."
+                    % (label or "next unit", cur, pm._SAFETY_CEILING_C),
+                    cur,
+                    "handoff",
+                )
+        pm.cool_if_over_safety_ceiling(label or "next unit")
     except Exception as exc:  # noqa: BLE001 -- a thermometer that cannot be read must never stop the work
         _warn_thermal_inert("thermal_yield", exc)
         return
+
+
+def ended_for_heat(rc) -> bool:
+    """Whether a child's exit status says it ended ITSELF to protect the board (end_for_heat) -- not a
+    failure, and not a measurement: the step is re-run from a cool board."""
+    from .thermal_pytest_plugin import ABORT_EXIT_CODE
+
+    return rc == ABORT_EXIT_CODE
+
+
+def run_watcher_owns_recovery() -> bool:
+    """See thermal_pytest_plugin.run_watcher_owns_recovery: a launcher in such a run leaves a child that
+    ended for heat to the run's watcher."""
+    from .thermal_pytest_plugin import run_watcher_owns_recovery as _owns
+
+    return _owns()
+
+
+def reset_after_ended_child(error_text: str = "", env=None) -> bool:
+    """Reset after a device process ended without closing the device -- killed, or ended for heat --
+    under the one rule for that (device_recovery.reset_is_mandatory_after_kill: a multi-chip run's
+    fabric may be left stuck whatever the telemetry says). Returns whether the device came back."""
+    from . import device_recovery as _dr
+
+    _kill = {"fault_is_certain": True} if _dr.reset_is_mandatory_after_kill(env=env) else {}
+    return _device_reset(error_text=error_text, **_kill)
+
+
+def reset_after_killed_child(error_text: str = "", env=None) -> bool:
+    """reset_after_ended_child for a run a watchdog killed for making NO progress: the kill is counted
+    (device_recovery.note_kill), and a repeat with no working run between resets whatever the veto
+    says -- the hang a warm ARC and a passing one-op probe both miss."""
+    from . import device_recovery as _dr
+
+    if _dr.note_kill():
+        return _device_reset(error_text=error_text, fault_is_certain=True)
+    return reset_after_ended_child(error_text=error_text, env=env)
+
+
+# A RETRIED STEP KEEPS THE STAGES IT ALREADY MEASURED. The owner of a retried device step names a file
+# here; trace_replay appends each stage it finishes and, on the next attempt of the SAME step, replays
+# that stage's lines instead of measuring it again. Without it every attempt after a heat stop starts
+# from the first stage, heats the board the same way and is stopped at the same place.
+STAGES_KEPT_ENV = "TT_TRACE_REPLAY_KEPT"
+
+
+class stages_kept_across_retries:
+    """Context manager for the owner of a retried device step: names a fresh record in STAGES_KEPT_ENV
+    for every child launched inside it, and removes it after. Nested owners share the outermost one's
+    record, so one step's stages are never split across two. `as` gives kept_stage_count."""
+
+    def __enter__(self):
+        self._path = None
+        if not os.environ.get(STAGES_KEPT_ENV):
+            import tempfile
+
+            fd, self._path = tempfile.mkstemp(prefix="trace_replay_kept_", suffix=".jsonl")
+            os.close(fd)
+            os.environ[STAGES_KEPT_ENV] = self._path
+        return kept_stage_count
+
+    def __exit__(self, *exc):
+        if self._path is not None:
+            if os.environ.get(STAGES_KEPT_ENV) == self._path:
+                os.environ.pop(STAGES_KEPT_ENV, None)
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+        return False
+
+
+def _kept_records() -> list:
+    path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not path:
+        return []
+    out = []
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue  # a line cut short by an ended process is not a measurement
+                if isinstance(rec, dict) and {"node", "stage", "ms", "path", "lines"} <= set(rec):
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def with_kept_stages(env: dict) -> dict:
+    """`env` carrying this step's kept-stage record when one is open -- for a launcher handed an env built
+    before the step began. The caller's dict is not changed."""
+    rec = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec or env.get(STAGES_KEPT_ENV):
+        return env
+    return {**env, STAGES_KEPT_ENV: rec}
+
+
+def kept_stage_count() -> int:
+    """How many stages this step has kept so far: an attempt that raised it made progress."""
+    return len(_kept_records())
+
+
+def kept_stages(node: str) -> dict:
+    """{stage: record} that an earlier attempt of this step measured for `node` (its pytest node id)."""
+    return {r["stage"]: r for r in _kept_records() if r["node"] == node}
+
+
+def keep_stage(node: str, stage: str, ms: float, path: str, lines: list) -> None:
+    """Record a finished stage for the next attempt of this step. Best-effort; one line per stage."""
+    rec_path = os.environ.get(STAGES_KEPT_ENV, "")
+    if not rec_path:
+        return
+    try:
+        with open(rec_path, "a") as fh:
+            fh.write(json.dumps({"node": node, "stage": stage, "ms": ms, "path": path, "lines": list(lines)}) + "\n")
+    except OSError:
+        pass
 
 
 def detect_overheat(log_text: str) -> str | None:
@@ -1627,6 +2061,7 @@ def _execute(
     progress is what let one hide for ten hours. `timeout_s` remains as a generous
     ABSOLUTE backstop (hard ceiling `timeout_s * _HARD_CEILING_MULT`)."""
     _therm_label = "generated-test run"
+    env = with_kept_stages(env)
     try:
         _run = _cc_optimize("run")
         _thermal_watch_new = _run._thermal_watch_new
@@ -1652,10 +2087,10 @@ def _execute(
             preexec_fn=preexec_fn,  # e.g. memory_cap_preexec_fn(); runs in the child after the new session
         )
 
-        def _kill_and_raise(reason: str):
+        def _kill_and_raise(reason: str, error=TracyHangError):
             _kill_tree(proc.pid)
             proc.wait()
-            raise TracyHangError(f"{label} {reason}; log: {log_path}") from None
+            raise error(f"{label} {reason}; log: {log_path}") from None
 
         pgid = proc.pid
         start = time.monotonic()
@@ -1668,6 +2103,8 @@ def _execute(
         poll = 5.0
         _therm = _thermal_watch_new()
         _mempress = memory_pressure_watch_new()
+        _disk_paths = (log_path.parent, cwd)
+        _disk_floor = disk_floor(_disk_paths)
         while True:
             try:
                 rc = proc.wait(timeout=poll)
@@ -1687,6 +2124,9 @@ def _execute(
                 pass
             _thermal_watch_sample(_therm, _therm_label)
             memory_pressure_watch_sample(_mempress, _therm_label)
+            _disk_low = disk_floor_breached(_disk_paths, _disk_floor)
+            if _disk_low:
+                _kill_and_raise(f"stopped before it filled the disk: {_disk_low}", DiskFullError)
             now = time.monotonic()
             try:
                 size = log_path.stat().st_size
@@ -1698,9 +2138,9 @@ def _execute(
             _stall_limit = _watch.limit()
             if stall_timeout_s and now - last_progress >= _stall_limit:
                 _kill_and_raise(
-                    f"{KILL_STALL} for {int(_stall_limit)}s -- no log growth, no syscalls, "
-                    f"no bytes and an unchanged stack. CPU alone is not progress; a livelock has "
-                    f"plenty of it. Process group killed"
+                    f"{KILL_STALL} for {int(_stall_limit)}s -- no log growth, and no syscalls or "
+                    f"bytes except from processes whose stack had not moved. CPU alone is not "
+                    f"progress; a livelock has plenty of it. Process group killed"
                 )
             # THE SAME RULE AS _run_device_proc: a clock does not get to call working code dead.
             #
@@ -1781,7 +2221,7 @@ def collect_cases(
     nor the sub-agent supplied one."""
     # -o addopts= : neutralize pytest.ini verbosity so collect prints FLAT
     # node ids (repo addopts include -v, which turns the listing into a tree).
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts=", perf_test, "--collect-only", "-q"]
+    cmd = pytest_argv(perf_test, "--collect-only", "-q")
     proc = runner(
         cmd, cwd=Path(tt_metal_root), env=env or dict(os.environ), capture_output=True, text=True, timeout=120
     )
@@ -1864,7 +2304,7 @@ def preflight_collect(
 
     Catches the zero-selection trap ('5 deselected, 0 selected') in seconds.
     Returns the number of selected tests."""
-    cmd = [sys.executable, "-m", "pytest", "-o", "addopts=", perf_test, "--collect-only", "-q"]
+    cmd = pytest_argv(perf_test, "--collect-only", "-q")
     if case:
         cmd += ["-k", case]
     proc = runner(
@@ -2676,6 +3116,45 @@ def memory_cap_preexec_fn(margin_gb: float = None):
 
 _MEM_PRESSURE_WATCH_REPORT_S = 60.0
 _MEM_PRESSURE_WARN_PCT = float(os.environ.get("PERF_MCP_MEM_PRESSURE_WARN_PCT", "35") or "35")
+
+
+# THE DISK A PROFILE WRITES TO. A device log grows with every op of every core of every chip; a
+# decode that ignored its token window wrote a 97 GB profile_log_device.csv and filled the root disk
+# (Mistral-Small-4-119B-2603, 2026-10-14) -- the run died on ENOSPC, and so did every other process
+# writing to that disk. Below this many free GB the profiled run is stopped instead.
+_MIN_FREE_DISK_GB = float(os.environ.get("PERF_MCP_MIN_FREE_DISK_GB", "10") or "10")
+
+
+def _free_disk_gb(paths) -> dict:
+    """{path: free GB on its filesystem} for each path that can be measured."""
+    out = {}
+    for p in paths:
+        try:
+            out[p] = shutil.disk_usage(p).free / 1e9
+        except OSError:
+            continue
+    return out
+
+
+def disk_floor(paths) -> float:
+    """The free-space floor for a run about to write to `paths`: _MIN_FREE_DISK_GB, or half of what is
+    free at launch when that is less -- a disk that starts low is guarded against THIS run eating
+    what is left, rather than refused outright."""
+    free = _free_disk_gb(paths)
+    return min([_MIN_FREE_DISK_GB] + [f / 2 for f in free.values()])
+
+
+def disk_floor_breached(paths, floor_gb: float) -> str:
+    """'' while every measurable path's filesystem has at least floor_gb free; otherwise why not. A path
+    that cannot be measured is skipped: this guards a run, it never fails one by itself."""
+    for p, free_gb in _free_disk_gb(paths).items():
+        if free_gb < floor_gb:
+            return "%.1f GB free on the disk holding %s, under the %.1f GB floor (PERF_MCP_MIN_FREE_DISK_GB)" % (
+                free_gb,
+                p,
+                floor_gb,
+            )
+    return ""
 
 
 def memory_pressure_watch_new() -> dict:

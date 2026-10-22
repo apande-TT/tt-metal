@@ -22,6 +22,13 @@ DECODE CONTRACT (duck-typed on the built pipeline object):
                                           The purity rule above is waived.
     trace_path() -> str                   OPTIONAL, only meaningful with self_traced. Returns the real replay
                                           path ("trace+1cq") the pipeline actually took.
+    gathered_tables() -> tensors          OPTIONAL (method or attr; stage_seams.GATHERED_TABLES_ATTR). The
+                                          device tensors a step reads BY INDEX -- token embeddings, position
+                                          tables, anything a row is selected from -- in any nesting of
+                                          lists / tuples / dicts. The read-set hook charges an op reading
+                                          one beside an integer index for the rows that came out, not the
+                                          table; the census credits their bytes to their subtree for the
+                                          estimate. Undeclared, every table is charged in full.
 
 A pipeline WITHOUT decode_step (repeat-prefill / host-argmax decode) raises AttributeError in setup;
 the perf test's guard then falls back to FORWARD_WALL_MS and the detector reports 'repeat_prefill'.
@@ -480,6 +487,9 @@ class PipelineStageAdapter:
         self.batch = max(1, self._requested_batch)
         self._pipe = None
         self.stages = []
+        # {stage: why} for every declared stage that got no stage here; trace_replay states them
+        # (stage_seams.UNMEASURED_MARK) so a reading missing one is not taken for the whole pipeline.
+        self.unmeasured = {}
 
     def _inputs_dict(self):
         """The prompt, REPLICATED to `batch` rows -- every user gets the FULL sequence.
@@ -546,6 +556,7 @@ class PipelineStageAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+                self.unmeasured[name] = "%s is missing" % _seams.hook(name, _seams.STEP)
                 continue
             setup = getattr(p, _seams.hook(name, _seams.SETUP), None)
             if callable(setup):
@@ -574,6 +585,7 @@ class PipelineStageAdapter:
                         file=sys.stderr,
                         flush=True,
                     )
+                    self.unmeasured[name] = "cannot prepare its inputs (%s: %s)" % (type(exc).__name__, str(exc)[:120])
                     continue
             # Propagate self_traced: a pipeline that OWNS its capture must be timed natively, never
             # wrapped in a second begin_trace_capture. The decode fallback below already does this;

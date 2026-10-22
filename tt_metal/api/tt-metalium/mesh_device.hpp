@@ -4,13 +4,13 @@
 
 #pragma once
 
+#include <initializer_list>
 #include <tt_stl/span.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ostream>
 #include <set>
@@ -18,7 +18,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 #include <hostdevcommon/common_values.hpp>
@@ -30,12 +29,11 @@
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/mesh_device_view.hpp>
 #include <tt-metalium/mesh_trace_id.hpp>
-#include <tt_stl/small_vector.hpp>
 #include <tt-metalium/sub_device_types.hpp>
 // UMD: re-exports tt::ARCH (used in MeshDevice::arch return type).
-#include <umd/device/types/arch.hpp>
+#include <tt-umd/types/arch.hpp>
 // UMD: re-exports CoreType (used in MeshDevice::virtual_core_from_logical_core parameter).
-#include <umd/device/types/core_coordinates.hpp>
+#include <tt-umd/types/core_coordinates.hpp>
 
 namespace tt::tt_metal {
 class Allocator;
@@ -155,7 +153,6 @@ public:
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         ttsl::Span<const SubDeviceId> sub_device_ids) const override;
     const std::set<CoreCoord>& ethernet_cores() const override;
-    const std::set<CoreCoord>& storage_only_cores() const override;
     uint32_t get_noc_unicast_encoding(uint8_t noc_index, const CoreCoord& core) const override;
     uint32_t get_noc_multicast_encoding(uint8_t noc_index, const CoreRange& cores) const override;
     SystemMemoryManager& sysmem_manager() override;
@@ -228,6 +225,9 @@ public:
     // The type parameter allows the caller to specify how to linearize the devices in the mesh.
 
     // Returns the devices in the mesh in row-major order.
+    [[deprecated(
+        "Deprecated, retrieving physical devices can fail in distributed contexts. Iterate over MeshCoordinates or use "
+        "get_device_ids instead. This will be removed after 2026-11-19.")]]
     std::vector<IDevice*> get_devices() const;
     [[deprecated(
         "Deprecated, retrieving physical devices can fail in distributed contexts. This will be removed after "
@@ -247,6 +247,7 @@ public:
     // TODO: #17477 - Remove the methods that assume 2D mesh.
     size_t num_rows() const;
     size_t num_cols() const;
+    [[deprecated("Deprecated, use get_device(const MeshCoordinate&) instead. This will be removed after 2026-11-19.")]]
     IDevice* get_device(size_t row_idx, size_t col_idx) const;
 
     // Returns true if the coordinate is local to this mesh device.
