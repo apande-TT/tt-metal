@@ -267,7 +267,8 @@ def mm_swiglu(
         ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
     ]
     defines = chunk_fwd + (
-        [("FUSE_SWIGLU", "1")]
+        # SwiGLU: in0 streams through its M_block-row CB one row at a time (compute.cpp matmul_blocks_rows).
+        [("FUSE_SWIGLU", "1"), ("IN0_STRIP_ROWS", "1")]
         if fuse_swiglu
         else [("DIRECT_OUT", "1")] + ([("KSPLIT", "1"), ("IN0_STRIP_ROWS", str(subblock_h))] if K_blocks > 1 else [])
     )

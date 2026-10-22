@@ -271,6 +271,72 @@ void matmul_blocks(
     }
 }
 
+#if defined(FUSE_SWIGLU) && defined(IN0_STRIP_ROWS)
+// SwiGLU row streaming: matmul_blocks with the in0 block arriving / leaving one row slot at a time (the reader pushes
+// every row of the M_block-row CB, padding rows unread). The first N block of an M block waits only for the rows its
+// next subblock row needs; the last N block pops each subblock row once done (then the padding rows), so the reader
+// loads the next M block's rows while this block's remaining rows and epilogue run. Same matmul calls per tile.
+void matmul_blocks_rows(
+    const uint32_t in0_cb,
+    const uint32_t in1_cb,
+    const uint32_t out_cb,
+    const bool wait_rows,
+    const bool pop_rows,
+    const uint32_t full_M_block_tiles,
+    const uint32_t M_block_tiles,
+    const uint32_t N_block_tiles,
+    const uint32_t full_N_block_tiles,
+    const uint32_t K_block_tiles,
+    const uint32_t subblock_h,
+    const uint32_t subblock_w) {
+    CircularBuffer cb_in0(in0_cb);
+    uint32_t in0_index_offset = 0;
+    for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
+        const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
+        if (wait_rows) {
+            cb_in0.wait_front((pop_rows ? sh : M_start + sh) * K_block_tiles);
+        }
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, sh, K_block_tiles);
+        }
+        uint32_t in1_index_offset = 0;
+        for (uint32_t N_start = 0; N_start < N_block_tiles; N_start += subblock_w) {
+            tile_regs_acquire();
+            uint32_t in0_index = in0_index_offset;
+            uint32_t in1_index = in1_index_offset;
+            for (uint32_t inner_dim = 0; inner_dim < K_block_tiles; inner_dim++) {
+                matmul_block(in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, sh, K_block_tiles);
+                in0_index++;
+                in1_index += full_N_block_tiles;
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            uint32_t write_dst_index = 0;
+            for (uint32_t h = 0; h < sh; h++) {
+                for (uint32_t w = 0; w < subblock_w; w++) {
+                    pack_tile<true>(write_dst_index++, out_cb, (M_start + h) * full_N_block_tiles + N_start + w);
+                }
+            }
+            tile_regs_release();
+            in1_index_offset += subblock_w;
+        }
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+        }
+        if (pop_rows) {
+            cb_in0.pop_front(sh * K_block_tiles);  // the next row's tiles now start at the read pointer
+        } else {
+            in0_index_offset += sh * K_block_tiles;
+        }
+    }
+    if (pop_rows && full_M_block_tiles > M_block_tiles) {
+        const uint32_t pad_tiles = (full_M_block_tiles - M_block_tiles) * K_block_tiles;
+        cb_in0.wait_front(pad_tiles);
+        cb_in0.pop_front(pad_tiles);
+    }
+}
+#endif
+
 #ifdef KSPLIT
 // KSPLIT (DIRECT_OUT with K in several blocks): one K block of every subblock of the output block. Blocks after the
 // first reload the subblock's fp32 partials from `interm_cb` straight into DEST (the CB is UnpackToDestFp32, so the
@@ -504,6 +570,24 @@ void kernel_main() {
             // Accumulation buffer
             cb_intermediate.reserve_back(out_block_num_tiles);
             for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
+#if defined(FUSE_SWIGLU) && defined(IN0_STRIP_ROWS)
+                // Full K in one block (host-asserted): in0 rows stream in / out of the CB around this call.
+                cb_in1.wait_front(in1_block_num_tiles);
+                matmul_blocks_rows(
+                    in0_cb,
+                    in1_cb,
+                    intermediate_cb,
+                    n_block_iter == 0,
+                    n_block_iter == N_blocks_per_core - 1,
+                    M_block_tiles,
+                    current_M_block_tiles,
+                    current_N_block_tiles,
+                    N_block_tiles,
+                    K_block_tiles,
+                    current_subblock_h,
+                    current_subblock_w);
+                reuse_in0_block = true;  // popped row by row above
+#else
                 cb_in0.wait_front(in0_block_num_tiles);
                 cb_in1.wait_front(in1_block_num_tiles);
 
@@ -517,6 +601,7 @@ void kernel_main() {
                     K_block_tiles,
                     current_subblock_h,
                     current_subblock_w);
+#endif
 
                 if (k_block == K_num_blocks - 1) {
                     /**

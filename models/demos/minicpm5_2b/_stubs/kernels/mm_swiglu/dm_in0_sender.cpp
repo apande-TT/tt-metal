@@ -268,6 +268,14 @@ void kernel_main() {
                     }
                     cb_in0.push_back(strip_tiles);
                     }
+#if defined(FUSE_SWIGLU) && defined(IN0_STRIP_ROWS)
+                    // SwiGLU row streaming: every M block fills the whole M_block-row CB (padding rows pushed unread),
+                    // so each block starts at slot 0 and no subblock row wraps around the CB end.
+                    for (uint32_t pad_m = current_M_block_tiles; pad_m < M_block_tiles; pad_m += strip_rows) {
+                        cb_in0.reserve_back(strip_tiles);
+                        cb_in0.push_back(strip_tiles);
+                    }
+#endif
                 }
 #else
                 {
