@@ -520,7 +520,9 @@ class MiniCPM5Pipeline:
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         cur_pos = self.pos_rm  # [B] int32, one contiguous page (pos_i32 row-major, kept in step by _pos_step)
-        pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
+        # [B, 1, 1, 1] positions: only the non-kernel KV write and the non-table masks read them.
+        needs_pos = not attention_stub._USE_KV_WRITE_KERNEL or not (rows and _MASK_TABLE)
+        pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1)) if needs_pos else None
         # The one-hot cache-slot selector is read only by the non-kernel KV write.
         write = None
         if not attention_stub._USE_KV_WRITE_KERNEL:

@@ -41,7 +41,9 @@ class TtRotaryEmbedding:
         )
         cos, sin = self._rows_math(pos)
         sin_signed = ttnn.multiply(sin, rot_sign)
-        self.rows_table = (cos, sin_signed)
+        # One row-major [P, 2 * D] page per position: [cos | signed sin] (layout change and concat copy values).
+        rm = [ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT) for t in (cos, sin_signed)]
+        self.rows_table = ttnn.reshape(ttnn.concat(rm, dim=-1), (n_pos, 2 * self.head_dim))
 
     def _rows_math(self, pos):
         emb = ttnn.multiply(pos, self.inv_freq)
@@ -55,7 +57,7 @@ class TtRotaryEmbedding:
     def _gather_rows(self, pos_i32, memory_config):
         """(cos, signed sin) rows [1, 1, B, D] for the int32 [1, B] positions, gathered from the tables by one
         data-movement generic_op (kernels/rope_table)."""
-        cos_t, sin_t = self.rows_table
+        table = self.rows_table
         b = int(pos_i32.shape[-1])
         assert b == 32 and b % _GATHER_CORES == 0
         d_t = self.head_dim // 32
@@ -74,13 +76,12 @@ class TtRotaryEmbedding:
             kernel_source=os.path.join(_ROPE_TABLE_DIR, "gather_rows.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[0, 1, d_t, users]
+            compile_time_args=[0, 1, d_t, users, 2 * self.head_dim * 2]
             + list(ttnn.TensorAccessorArgs(pos_i32).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(cos_t).get_compile_time_args())
+            + list(ttnn.TensorAccessorArgs(table).get_compile_time_args())
             + list(ttnn.TensorAccessorArgs(outs[0]).get_compile_time_args()),
             runtime_args=rt,
-            common_runtime_args=[pos_i32.buffer_address(), cos_t.buffer_address(), sin_t.buffer_address()]
-            + [t.buffer_address() for t in outs],
+            common_runtime_args=[pos_i32.buffer_address(), table.buffer_address()] + [t.buffer_address() for t in outs],
             config=ttnn.ReaderConfigDescriptor(),
         )
         cbs = [
@@ -89,14 +90,14 @@ class TtRotaryEmbedding:
                 core_ranges=cores,
                 format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.int32, 4 * 32 * 32)],
             ),
-            ttnn.CBDescriptor(  # one 64 B (DRAM-aligned) span per gathered face row, plus alignment slack
-                total_size=users * 2 * d_t * 2 * 64 + 64,
+            ttnn.CBDescriptor(  # one table row per user, plus 64 B alignment slack
+                total_size=users * 4 * self.head_dim + 64,
                 core_ranges=cores,
-                format_descriptors=[ttnn.CBFormatDescriptor(1, ttnn.bfloat16, users * 2 * d_t * 2 * 64 + 64)],
+                format_descriptors=[ttnn.CBFormatDescriptor(1, ttnn.bfloat16, users * 4 * self.head_dim + 64)],
             ),
         ]
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
-        ttnn.generic_op([pos_i32, cos_t, sin_t] + outs, program)
+        ttnn.generic_op([pos_i32, table] + outs, program)
         return outs[0], outs[1]
 
     def __call__(self, x, position_ids=None, *args, rows=False, table_pos=None, memory_config=None, **kwargs):
