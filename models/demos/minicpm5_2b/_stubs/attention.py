@@ -1043,7 +1043,11 @@ class TtAttention:
             ttnn.Shape([1, b * seq, self.n_heads * self.head_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device,
             memory_config,
         )
-        cores, rt = self._spread(b * n_kv * r_t)
+        if _PREFILL_CAUSAL_SKIP:
+            # A unit's cost is its live key tiles (query tile index within S + 1): balance contiguous ranges by it.
+            cores, rt = self._spread(b * n_kv * r_t, weight=lambda u: u % s_t + 1)
+        else:
+            cores, rt = self._spread(b * n_kv * r_t)
         bf, f32 = ttnn.bfloat16, ttnn.float32
         tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
         (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(11)
@@ -1128,11 +1132,31 @@ class TtAttention:
         program = ttnn.ProgramDescriptor(kernels=[reader, writer, compute], semaphores=[], cbs=cbs)
         return ttnn.generic_op(tensors + [kv_cache.k, kv_cache.v, self.zero_tile, out], program)
 
-    def _spread(self, n_tiles):
-        """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args."""
+    def _spread(self, n_tiles, weight=None):
+        """Row-major core set over the grid for n_tiles work items, with [start, count] / [count] runtime args.
+        weight(item): optional per-item cost; the contiguous ranges then split the total cost evenly."""
         grid = self.device.compute_with_storage_grid_size()
         n_cores = min(n_tiles, grid.x * grid.y)
         base, extra = divmod(n_tiles, n_cores)
+        counts = [base + (1 if i < extra else 0) for i in range(n_cores)]
+        if weight is not None:
+            w = [weight(u) for u in range(n_tiles)]
+
+            def pack(cap):  # greedy contiguous ranges of cost <= cap
+                out, cur, cnt = [], 0, 0
+                for x in w:
+                    if cnt and cur + x > cap:
+                        out.append(cnt)
+                        cur, cnt = 0, 0
+                    cur, cnt = cur + x, cnt + 1
+                return out + [cnt]
+
+            lo, hi = max(w), sum(w)
+            while lo < hi:  # smallest per-core cost cap that fits on n_cores
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if len(pack(mid)) <= n_cores else (mid + 1, hi)
+            counts = pack(lo)
+            n_cores = len(counts)
         full_rows, rem = divmod(n_cores, grid.x)
         ranges = []
         if full_rows:
@@ -1142,7 +1166,7 @@ class TtAttention:
         rt = {"dm": ttnn.RuntimeArgs(), "cmp": ttnn.RuntimeArgs()}
         start = 0
         for i in range(n_cores):
-            count = base + (1 if i < extra else 0)
+            count = counts[i]
             rt["dm"][i % grid.x][i // grid.x] = [start, count]
             rt["cmp"][i % grid.x][i // grid.x] = [count]
             start += count
