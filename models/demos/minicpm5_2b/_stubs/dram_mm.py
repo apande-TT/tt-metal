@@ -102,6 +102,7 @@ class DramMatmul:
         norm_prologue=None,
         block_tiles=None,
         relay=False,
+        ep_tpc=None,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
@@ -261,7 +262,8 @@ class DramMatmul:
         self.ep = None
         if self.residual_add:
             free = [ttnn.CoreCoord(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in used]
-            ep_tpc = -(-n_t // len(free))
+            # ep_tpc: output tiles per epilogue helper (default: as few as the free cores allow).
+            ep_tpc = max(ep_tpc or 1, -(-n_t // len(free)))
             helpers = free[: -(-n_t // ep_tpc)]
             ep_rt = ttnn.RuntimeArgs()
             ep_xy = []
