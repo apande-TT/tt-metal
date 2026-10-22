@@ -99,6 +99,13 @@ void kernel_main() {
     uint32_t cur_bg = 0xFFFFFFFF;
     for (uint32_t u = u_start; u < u_start + u_count; ++u) {
         const uint32_t bg = u / Rt;
+#ifdef CAUSAL_SKIP
+        // Causal mask: key tiles n > the query tile's index within S are fully masked (-1e9), so they add exact
+        // zeros to the softmax sum and to probs @ V and never win the max -- skip them (same arithmetic otherwise).
+        const uint32_t nt = (u - bg * Rt) % Ct + 1;
+#else
+        const uint32_t nt = Ct;
+#endif
         if (bg != cur_bg) {
             if (cur_bg != 0xFFFFFFFF) {
                 cb_pop_front(cb_k, Ct * Kt);
@@ -113,7 +120,7 @@ void kernel_main() {
         reconfig_data_format(cb_k, cb_q);
         pack_reconfig_data_format(cb_t);
         cb_wait_front(cb_q, Kt);
-        for (uint32_t n = 0; n < Ct; ++n) {
+        for (uint32_t n = 0; n < nt; ++n) {
             matmul_init(cb_q, cb_k, true);
             tile_regs_acquire();
             for (uint32_t k = 0; k < Kt; ++k) {
@@ -164,7 +171,7 @@ void kernel_main() {
         reconfig_data_format(cb_sm_in, cb_sm_in);
         pack_reconfig_data_format(cb_exps);
         copy_init(cb_sm_in);
-        calc_numeric_stable<cb_sm_in, cb_max_scaler, cb_max, cb_exps>(Ct, ndst);
+        calc_numeric_stable<cb_sm_in, cb_max_scaler, cb_max, cb_exps>(nt, ndst);
         compute_kernel_lib::reduce<
             PoolType::SUM,
             ReduceDim::REDUCE_ROW,
@@ -172,7 +179,7 @@ void kernel_main() {
             cb_sum_scaler,
             cb_recip,
             compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop>(
-            compute_kernel_lib::ReduceInputBlockShape::row(Ct),
+            compute_kernel_lib::ReduceInputBlockShape::row(nt),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::NoAccumulation{},
             [](std::uint32_t) {
@@ -188,16 +195,16 @@ void kernel_main() {
             ckl::input(cb_exps, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd, ckl::InputTileMapping::Block),
             ckl::input(cb_recip, ckl::BroadcastDim::Col, ckl::WaitPolicy::Upfront, ckl::PopPolicy::AtEnd),
             ckl::output(cb_probs, ckl::ReservePolicy::PerBlockSize, ckl::PushPolicy::PerBlockSize)>(
-            ckl::IterationShape::tiles(Ct).block_size(ndst));
+            ckl::IterationShape::tiles(nt).block_size(ndst));
 
         // ---- 3. probs @ V -> cb_out (bf16) ----
         reconfig_data_format(cb_v, cb_probs);
         pack_reconfig_data_format(cb_out);
         matmul_init(cb_probs, cb_v, false);
-        cb_wait_front(cb_probs, Ct);
+        cb_wait_front(cb_probs, nt);
         for (uint32_t dt = 0; dt < Kt; ++dt) {
             tile_regs_acquire();
-            for (uint32_t k = 0; k < Ct; ++k) {
+            for (uint32_t k = 0; k < nt; ++k) {
                 matmul_tiles(cb_probs, cb_v, k, dt * Ct + k, 0);
             }
             tile_regs_commit();
@@ -207,7 +214,7 @@ void kernel_main() {
             tile_regs_release();
             cb_push_back(cb_out, 1);
         }
-        cb_pop_front(cb_probs, Ct);
+        cb_pop_front(cb_probs, nt);
     }
     if (cur_bg != 0xFFFFFFFF) {
         cb_pop_front(cb_k, Ct * Kt);

@@ -113,7 +113,13 @@ void kernel_main() {
         noc_async_read_barrier();
         cb_push_back(cb_q, Kt);
         const uint32_t s_t = t % Ct;
-        for (uint32_t n = 0; n < Ct; ++n) {
+#ifdef CAUSAL_SKIP
+        // Key tiles past the query tile's diagonal are fully masked (causal): compute skips them.
+        const uint32_t live = s_t + 1;
+#else
+        const uint32_t live = Ct;
+#endif
+        for (uint32_t n = 0; n < live; ++n) {
             cb_reserve_back(cb_mask, 1);
             noc_async_read_page(s_t * Ct + n, mask, get_write_ptr(cb_mask));
             noc_async_read_barrier();

@@ -69,6 +69,9 @@ _O_DMM = dict(block_tiles=8, ep_tpc=4, read_depth=4)
 # The decode KV-cache write done by each fused-attention core for its own (batch, KV head) instead of 46 extra
 # cores behind semaphores (the kv_write arithmetic under fp32 DEST: e2e bit-identical).
 _INLINE_KV_WRITE = True
+# Prefill fused attention skips the key tiles past each query tile's diagonal (fully masked by the causal mask:
+# exact zeros in the softmax sum and in probs @ V, never the row max), 2.5 of 4 key tiles on average at S = 128.
+_PREFILL_CAUSAL_SKIP = True
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
@@ -1077,6 +1080,7 @@ class TtAttention:
             accessor_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_ATTN_PREFILL_DIR, "reader_attn_prefill.cpp"),
+            defines=[("CAUSAL_SKIP", "1")] if _PREFILL_CAUSAL_SKIP else [],
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_mx, cb_sm, cb_v]
@@ -1111,6 +1115,7 @@ class TtAttention:
         compute_cfg.unpack_to_dest_mode = modes
         compute = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_ATTN_PREFILL_DIR, "compute_attn_prefill.cpp"),
+            defines=[("CAUSAL_SKIP", "1")] if _PREFILL_CAUSAL_SKIP else [],
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[
