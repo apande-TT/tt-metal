@@ -23,12 +23,52 @@ void kernel_main() {
     constexpr uint32_t cb_blocks = get_compile_time_arg_val(4);  // blocks the weight CB holds (>= NUM_SLOTS)
     constexpr uint32_t start_sem = get_compile_time_arg_val(5);  // local semaphore to wait on first, or ~0u
     constexpr uint32_t start_count = get_compile_time_arg_val(6);  // ... until it reaches this
+    // Relay (a partner core computes this worker's last groups): blocks from relay_from on are not pushed to this
+    // core's compute; each one, once landed, bumps the partner's relay semaphore and the partner reads it from here.
+    constexpr uint32_t relay_sem = get_compile_time_arg_val(7);  // ~0u: no relay on this program
 
     const uint32_t bank_id = get_arg_val<uint32_t>(0);
     const uint32_t vchannel = get_arg_val<uint32_t>(1);
     uint32_t w_offset = get_common_arg_val<uint32_t>(0) + get_arg_val<uint32_t>(3);  // this worker's part
     const uint32_t num_blocks = get_arg_val<uint32_t>(5);
+    uint32_t relay_from = num_blocks;  // == num_blocks: no relay
+    uint64_t relay_noc = 0;
+    if constexpr (relay_sem != 0xFFFFFFFF) {
+        relay_from = get_arg_val<uint32_t>(8);
+        relay_noc = get_noc_addr(get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), get_semaphore(relay_sem));
+    }
 
+    if constexpr (relay_sem != 0xFFFFFFFF) {
+        if (num_blocks == 0) {
+            // Relay partner: no DRAM stream. The worker (args 6, 7) lands this core's weight blocks in its own CB
+            // slots from..from + count - 1 (never reused: its whole part fits its CB) and bumps relay_sem once per
+            // landed block; copy every run of landed blocks from the worker's L1 (same CB address on every core of
+            // the program) into this CB in one read and push them.
+            constexpr uint32_t block_bytes = txns_per_block * txn_bytes;
+            const uint32_t src_x = get_arg_val<uint32_t>(6);
+            const uint32_t src_y = get_arg_val<uint32_t>(7);
+            const uint32_t from = get_arg_val<uint32_t>(8);
+            const uint32_t count = get_arg_val<uint32_t>(9);
+            auto* sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(relay_sem));
+            const uint32_t cb_base = get_write_ptr(cb_in1);
+            uint32_t done = 0;
+            while (done < count) {
+                noc_semaphore_wait_min(sem, done + 1);
+                const uint32_t landed = *sem;
+                const uint32_t n = (landed < count ? landed : count) - done;
+                cb_reserve_back(cb_in1, n * block_tiles);
+                noc_async_read(
+                    get_noc_addr(src_x, src_y, cb_base + (from + done) * block_bytes),
+                    get_write_ptr(cb_in1),
+                    n * block_bytes);
+                noc_async_read_barrier();
+                cb_push_back(cb_in1, n * block_tiles);
+                done += n;
+            }
+            noc_semaphore_set(sem, 0);
+            return;
+        }
+    }
     const uint64_t dram_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, 0);
     if constexpr (start_sem != 0xFFFFFFFF) {
         // A fused prologue's small DRAM reads go first: queued behind this stream they would stall it.
@@ -60,18 +100,31 @@ void kernel_main() {
             trid_to_issue = 1;
         }
         if (in_flight) {
+            // Block b - 1 has landed.
             noc_async_read_barrier_with_trid(trid_to_wait);
-            cb_push_back(cb_in1, block_tiles);
+            if (b - 1 < relay_from) {
+                cb_push_back(cb_in1, block_tiles);
+            } else {
+                noc_semaphore_inc(relay_noc, 1);
+            }
             if (++trid_to_wait > NUM_SLOTS) {
                 trid_to_wait = 1;
             }
-            // reserve_back is not incremental: one block is already reserved for the read in flight.
-            cb_reserve_back(cb_in1, 2 * block_tiles);
+            // reserve_back is not incremental: one block is already reserved for the read in flight. Relayed
+            // blocks (num_blocks <= cb_blocks then, host-checked) sit in slots this core's compute never reaches.
+            if (b + 1 < relay_from) {
+                cb_reserve_back(cb_in1, 2 * block_tiles);
+            }
         }
         in_flight = true;
     }
     noc_async_read_barrier_with_trid(trid_to_wait);
-    cb_push_back(cb_in1, block_tiles);
+    if (num_blocks - 1 < relay_from) {
+        cb_push_back(cb_in1, block_tiles);
+    } else {
+        noc_semaphore_inc(relay_noc, 1);
+        noc_async_atomic_barrier();
+    }
 }
 
 #undef NUM_SLOTS

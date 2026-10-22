@@ -62,7 +62,7 @@ _USE_QKV_ROPE = True
 _USE_DRAM_MM_NORM = True
 # QKV is compute-bound (HiFi4) once its norm prologue is done: 3 workers per bank (24 cores) beat 2 (+ the norm
 # prologue gives the stream a head start), 4 and 5 lose to bank contention.
-_QKV_DMM = dict(workers_per_bank=3, block_tiles=8)
+_QKV_DMM = dict(workers_per_bank=3, block_tiles=8, relay=True)
 # Decode o_proj (bf8_b) reads its weight in 8-tile blocks too (one read each): 8 beat 16 and 32 on QKV / o_proj, the
 # bf16 MLP and LM head streams are slower with them.
 _O_DMM = dict(block_tiles=8)

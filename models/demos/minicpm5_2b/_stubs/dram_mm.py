@@ -33,6 +33,7 @@ _NORM_CB_BLOCKS = 16  # with a norm: weight CB the stream runs ahead into during
 _CB_XIN, _CB_SCALER, _CB_EPS, _CB_GAMMA, _CB_NORMOUT = 2, 3, 4, 5, 17
 _CB_X2, _CB_EX2, _CB_EX2PE, _CB_FUSION, _CB_X2ALL, _CB_EX2PE_SEND = 24, 25, 26, 27, 28, 29
 _SEM_GATHER, _SEM_BCAST, _SEM_ALL, _SEM_START, _SEM_EP, _SEM_PRO = 0, 1, 2, 3, 4, 5
+_SEM_RELAY = 6
 # Helper CBs of the silu prologue + add epilogue (kernels/dram_mm/*_pro_silu.cpp).
 _CB_P_GATE, _CB_P_UP, _CB_P_POST, _CB_P_H, _CB_P_RES, _CB_P_MM, _CB_P_SUM = 0, 1, 3, 16, 4, 5, 17
 _CB_EP_LHS, _CB_EP_RHS, _CB_EP_OUT = 0, 1, 16  # on the epilogue helper cores only
@@ -100,6 +101,7 @@ class DramMatmul:
         silu_prologue=False,
         norm_prologue=None,
         block_tiles=None,
+        relay=False,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
@@ -113,7 +115,9 @@ class DramMatmul:
         (ttnn.multiply's binary_ng SFPU arithmetic) while the weight stream starts; __call__ then takes
         pro=(gate, up) instead of x. norm_prologue: an r_m_s_norm.TtRMSNorm whose shared-statistic kernels run on
         helper cores into an L1 tensor the projection then reads (the weight stream starts at once into a deep CB)
-        -- x is the norm's input."""
+        -- x is the norm's input. relay (with norm_prologue): a worker with several groups computes only the first
+        half; a partner core (no DRAM stream) computes the rest from the worker's landed blocks (kernels/dram_mm
+        reader_dram_mm.cpp's relay path) -- the same per-tile arithmetic on twice the cores, for compute-bound projections."""
         self.device = device
         self.norm = norm
         self.norm_pro = norm_prologue if norm is None else None
@@ -218,6 +222,38 @@ class DramMatmul:
                 return
             self.norm_cores = free[:n_norm]
             used |= {(c.x, c.y) for c in self.norm_cores}
+            self.relay_cores = None
+            bpg = k_t // k_block  # blocks per group
+            if relay and all(ng * bpg <= cb_blocks for ng in worker_groups):
+                partners = []
+                for c in all_cores:
+                    a = list(rt[c.x][c.y])
+                    ng = a[4]
+                    own = ng - ng // 2
+                    if ng < 2:
+                        rt[c.x][c.y] = a + [0, 0, a[5]]
+                        continue
+                    free = [
+                        (abs(x - c.x) + abs(y - c.y), abs(y - c.y), 0 if x > c.x else 1, x, y)
+                        for x in range(grid.x)
+                        for y in range(grid.y)
+                        if (x, y) not in used
+                    ]
+                    if not free:
+                        self.ok = False
+                        return
+                    *_, px, py = min(free)
+                    used.add((px, py))
+                    p = ttnn.CoreCoord(px, py)
+                    pq, cq = device.worker_core_from_logical_core(p), device.worker_core_from_logical_core(c)
+                    rt[c.x][c.y] = [a[0], a[1], a[2], a[3], own, a[5], pq.x, pq.y, own * bpg]
+                    rt[px][py] = [a[0], a[1], a[2] + own * group_w, 0, ng - own, 0, cq.x, cq.y, own * bpg, (ng - own) * bpg]
+                    partners.append(p)
+                if partners:
+                    self.relay_cores = _core_rects(partners)
+                    all_cores = all_cores + partners
+                    cores = _core_rects(all_cores)
+                    self.cores = cores
             self.mm_xy = []
             for c in all_cores:
                 q = device.worker_core_from_logical_core(c)
@@ -285,12 +321,16 @@ class DramMatmul:
         ]
         bt = self.block_tiles
         self.reader_ct = [_CB_IN1, bt, bt // _TXN_TILES, _TXN_TILES * w_tile_bytes, cb_blocks]
+        relaying = getattr(self, "relay_cores", None) is not None
         if norm is not None:
             self.reader_ct += [_SEM_START, 1]
         elif self.norm_pro is not None and _NORM_PRO_READS_FIRST:
             self.reader_ct += [_SEM_START, len(self.norm_cores)]
         else:
             self.reader_ct += [_NO_SEM, 0]
+        self.reader_ct += [_SEM_RELAY if relaying else _NO_SEM]
+        if relaying:
+            self.semaphores.append(ttnn.SemaphoreDescriptor(id=_SEM_RELAY, core_ranges=cores, initial_value=0))
         if norm is None:
             self.writer_src = "writer_dram_mm.cpp"
             self.writer_ct = [k_t, group_w, _IN0_CHUNK, _CB_IN0, _CB_OUT, self.split_n // _TILE]
