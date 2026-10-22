@@ -65,7 +65,7 @@ _USE_DRAM_MM_NORM = True
 _QKV_DMM = dict(workers_per_bank=3, block_tiles=8, relay=True)
 # Decode o_proj (bf8_b) reads its weight in 8-tile blocks too (one read each): 8 beat 16 and 32 on QKV / o_proj, the
 # bf16 MLP and LM head streams are slower with them.
-_O_DMM = dict(block_tiles=8, ep_tpc=2)
+_O_DMM = dict(block_tiles=8, ep_tpc=4)
 # The decode KV-cache write done by each fused-attention core for its own (batch, KV head) instead of 46 extra
 # cores behind semaphores (the kv_write arithmetic under fp32 DEST: e2e bit-identical).
 _INLINE_KV_WRITE = True
