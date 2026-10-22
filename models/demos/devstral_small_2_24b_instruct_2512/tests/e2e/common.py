@@ -246,7 +246,24 @@ def check_free_run(task, run, pipe, processor, hf_model, req):
         print(f"[{task}] row {r} (seed {req['seeds'][r]}): {txt!r}", flush=True)
     distinct = len(set(texts))
     print(f"[{task}] {distinct} distinct outputs over {b} rows", flush=True)
-    assert b == 1 or distinct > 1, f"{task}: {b} seeds produced one identical output"
+    # The seeds have to reach the draws. "The rows differ" was the proxy for that, and it is a property of the PROMPT,
+    # not of the sampler: at temperature 0.15 the image prompt's answer differs between seeds at ONE near-tie step
+    # (the HF golden draws ' called' or ' named' on a 0.125-logit margin, 9 of its 32 seeds), which a TT logit row
+    # within 0.5% of the reference may or may not reproduce. The sampling rule is checked directly instead: every
+    # draw must be the rule's choice on TT's OWN logits with that row's noise (an exact tie excepted: either
+    # candidate is the rule's choice there). A noise table that did not reach the draws fails this at the first
+    # noised near-tie, whatever the prompt.
+    from models.demos.devstral_small_2_24b_instruct_2512.tests.e2e.hf_reference import GumbelTopKSampler
+
+    rule = GumbelTopKSampler(P.gumbel_table(req["seeds"], req["max_new_tokens"] + 1), pipe.temperature, pipe.top_k, 0)
+    off = []
+    for t in range(res["steps"]):
+        pick, margin = rule.choose(tt_logits[t].float(), t)
+        for r in range(b):
+            if alive[r, t] and int(pick[r]) != int(res["drawn"][r, t]) and float(margin[r]) > 1e-4:
+                off.append((r, t, int(res["drawn"][r, t]), int(pick[r]), round(float(margin[r]), 4)))
+    print(f"[{task}] sampler rule replayed on TT logits: {len(off)} draws off the rule's choice", flush=True)
+    assert not off, f"{task}: on-device draws that the sampling rule does not choose on TT's own logits: {off[:8]}"
 
     ref = _hf_reference_teacher_forced(hf_model, req, tokens, pipe.top_k, pipe.temperature)
     stats = StreamingPCC(b)
