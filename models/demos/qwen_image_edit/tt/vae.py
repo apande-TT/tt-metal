@@ -76,6 +76,7 @@ class PointwiseConv32:
 
 # C_in_block of the float32 encoder's convs by in_channels (see TtQwenVAE.__init__; missing: tt_dit's default 32)
 ENCODER_C_IN_BLOCK = {384: 64}
+DECODER_C_IN_BLOCK = {384: 64}
 
 
 def _block_fp32_convs(stack, h_block=8, w_block=8):
@@ -114,7 +115,11 @@ class TtQwenVAE:
             self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel="full", dtype=ttnn.float32)
         finally:
             _conv3d_utils.FP32_C_IN_BLOCK = None
-        self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel="full")
+        _conv3d_utils.FP32_C_IN_BLOCK = DECODER_C_IN_BLOCK
+        try:
+            self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel="full")
+        finally:
+            _conv3d_utils.FP32_C_IN_BLOCK = None
         _block_fp32_convs(self.encoder.encoder)
         _block_fp32_convs(self.decoder.decoder)
         self.quant_conv = PointwiseConv32(device, hf_vae.quant_conv)
