@@ -229,6 +229,8 @@ class MiniCPM5Pipeline:
         self.pos_buf = self._tt(torch.zeros(B, 1), ttnn.float32)
         # The same positions as int32 [1, B]: the in-place KV-cache write slot of each row.
         self.pos_i32 = self._tt(torch.zeros(1, B, dtype=torch.int32), ttnn.int32)
+        # ... and as the row-major [B] page the fused decode attention reads (cur_pos), stepped by the same kernel.
+        self.pos_rm = self._tt(torch.zeros(B, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         # Sampling noise lives as [1, S, B, V/S]: S vocab segments of _NOISE_SEG_W columns, so the per-step
         # gather of the top-k candidates' noise reads one short segment row per core instead of one core
         # streaming the whole vocab row.
@@ -251,6 +253,7 @@ class MiniCPM5Pipeline:
         ttnn.copy(self._tt(ids, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT), self.ids_buf)
         ttnn.copy(self._tt(torch.full((B, 1), float(S)), ttnn.float32), self.pos_buf)
         ttnn.copy(self._tt(torch.full((1, B), S, dtype=torch.int32), ttnn.int32), self.pos_i32)
+        ttnn.copy(self._tt(torch.full((B,), S, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT), self.pos_rm)
         self.real_len = S
         for t in self.noise_steps:
             ttnn.deallocate(t)
@@ -512,7 +515,7 @@ class MiniCPM5Pipeline:
             table_pos=self.pos_i32 if table else None,
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
-        cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
+        cur_pos = self.pos_rm  # [B] int32, one contiguous page (pos_i32 row-major, kept in step by _pos_step)
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         # The one-hot cache-slot selector is read only by the non-kernel KV write.
         write = None
@@ -577,7 +580,7 @@ class MiniCPM5Pipeline:
         return logits
 
     def _pos_step(self):
-        """pos_buf += 1 and pos_i32 += 1 in place as one 1-core data-movement generic_op (kernels/pos_step)."""
+        """pos_buf, pos_i32 and pos_rm += 1 in place as one 1-core data-movement generic_op (kernels/pos_step)."""
         core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
         tile = 4 * 32 * 32
         reader = ttnn.KernelDescriptor(
@@ -586,9 +589,15 @@ class MiniCPM5Pipeline:
             core_ranges=core,
             compile_time_args=[0, 1, tile]
             + list(ttnn.TensorAccessorArgs(self.pos_buf).get_compile_time_args())
-            + list(ttnn.TensorAccessorArgs(self.pos_i32).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(self.pos_i32).get_compile_time_args())
+            + [2, 4 * self.batch]
+            + list(ttnn.TensorAccessorArgs(self.pos_rm).get_compile_time_args()),
             runtime_args=ttnn.RuntimeArgs(),
-            common_runtime_args=[self.pos_buf.buffer_address(), self.pos_i32.buffer_address()],
+            common_runtime_args=[
+                self.pos_buf.buffer_address(),
+                self.pos_i32.buffer_address(),
+                self.pos_rm.buffer_address(),
+            ],
             config=ttnn.ReaderConfigDescriptor(),
         )
         cbs = [
@@ -602,9 +611,14 @@ class MiniCPM5Pipeline:
                 core_ranges=core,
                 format_descriptors=[ttnn.CBFormatDescriptor(1, ttnn.int32, tile)],
             ),
+            ttnn.CBDescriptor(
+                total_size=4 * self.batch,
+                core_ranges=core,
+                format_descriptors=[ttnn.CBFormatDescriptor(2, ttnn.int32, 4 * self.batch)],
+            ),
         ]
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
-        ttnn.generic_op([self.pos_buf, self.pos_i32], program)
+        ttnn.generic_op([self.pos_buf, self.pos_i32, self.pos_rm], program)
 
     def _logit_segments(self):
         ok = self.vocab % (_LOGIT_SEGMENTS * _TILE) == 0 and self.temperature == 1.0 and self.top_k <= _SEG_K
