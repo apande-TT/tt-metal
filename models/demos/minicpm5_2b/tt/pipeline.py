@@ -63,6 +63,9 @@ _NEG = -1e9
 # Decode: the fused attention picks its key-mask tiles from a fixed 32-tile table (mask_table) instead of the
 # [B, 1, 32, C] mask built every step (three ops).
 _MASK_TABLE = True
+# Decode: cos / signed sin rows gathered per step from tables of every cache position (one 4-core data-movement
+# program) instead of the position * inv_freq, cos, sin, typecasts, L1 copy and * rot_sign ops.
+_ROPE_TABLE = True
 _POS_STEP_KERNEL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_stubs", "kernels", "pos_step"
 )
@@ -215,6 +218,9 @@ class MiniCPM5Pipeline:
         d = self.head_dim
         sign = torch.cat([-torch.ones(d // 2), torch.ones(d // 2)]).reshape(1, 1, 1, d)
         self.rot_sign = self._tt(sign, ttnn.bfloat16)
+        if _ROPE_TABLE and attention_stub._USE_QKV_ROPE and B == 32:
+            # Decode cos / signed sin of every cache position, made once by the per-step rows ops themselves.
+            self.rotary_embedding.build_rows_table(C, self.rot_sign)
         k = self.top_k
         self.cumsum_upper = self._tt(torch.triu(torch.ones(k, k)), ttnn.float32)  # p @ U = inclusive cumsum
         self.ids_buf = self._tt(torch.full((B, Sp), self.pad_id, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
@@ -498,7 +504,14 @@ class MiniCPM5Pipeline:
         x = self.token_embed(self.tok_buf)
         rows = attention_stub._USE_QKV_ROPE and B == 32
         # rows: cos / sin as one tile row (row b = batch b) for the rope on the QKV layout, the only rope decode runs.
-        cos_sin = self.rotary_embedding(x, position_ids=self.pos_buf, rows=rows)
+        table = rows and _ROPE_TABLE
+        cos_sin = self.rotary_embedding(
+            x,
+            position_ids=self.pos_buf,
+            rows=rows,
+            table_pos=self.pos_i32 if table else None,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
         cur_pos = ttnn.reshape(ttnn.to_layout(self.pos_i32, ttnn.ROW_MAJOR_LAYOUT), (B,))  # one contiguous page
         pos = ttnn.reshape(self.pos_buf, (B, 1, 1, 1))
         # The one-hot cache-slot selector is read only by the non-kernel KV write.
@@ -521,8 +534,11 @@ class MiniCPM5Pipeline:
         else:
             mask_full = ttnn.repeat(mask, ttnn.Shape([1, 1, 32, 1]), memory_config=l1)
         if rows:
-            cos_rows = ttnn.to_memory_config(cos_sin[0], l1)
-            sin_rows = ttnn.multiply(cos_sin[1], self.rot_sign, memory_config=l1)  # rotate_half's sign folded in
+            if table:
+                cos_rows, sin_rows = cos_sin  # gathered straight into L1, the sign already folded into sin
+            else:
+                cos_rows = ttnn.to_memory_config(cos_sin[0], l1)
+                sin_rows = ttnn.multiply(cos_sin[1], self.rot_sign, memory_config=l1)  # rotate_half's sign folded in
             ctx = attention_stub.AttnContext(
                 "decode", mask, write, cur_pos, mask_full=mask_full, rope_rows=(cos_rows, sin_rows)
             )
