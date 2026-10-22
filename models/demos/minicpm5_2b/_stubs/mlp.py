@@ -22,6 +22,8 @@ _USE_DRAM_MM_NORM = True
 _NORM_AS_PROLOGUE = True
 # silu(gate) * up as a prologue of the down + residual program (helper cores; DramMatmul silu_prologue).
 _USE_SILU_PROLOGUE = True
+# Weight blocks in flight per decode MLP stream reader (DramMatmul read_depth).
+_MLP_READ_DEPTH = 3
 # Prefill gate/up + silu * up as one program (kernels/mm_swiglu: minimal_matmul over the tile-pair interleaved
 # [W_gate | W_up] with a SwiGLU epilogue bit-identical to the two minimal_matmuls + ttnn.multiply).
 _PREFILL_MM_SWIGLU = True
@@ -97,7 +99,8 @@ class TtMlp:
             # ... and also silu(gate) * up computed in that program by the same helper cores, ahead of the stream
             # (a deep weight CB keeps the stream going meanwhile).
             dmm = DramMatmul(
-                device, None, fid, prebuilt=self.dram_mm[1], residual_add=True, silu_prologue=True, cb_blocks=10
+                device, None, fid, prebuilt=self.dram_mm[1], residual_add=True, silu_prologue=True, cb_blocks=10,
+                read_depth=_MLP_READ_DEPTH,
             )
             self.down_res_silu = dmm if (dmm.ok and dmm.silu_pro and _USE_SILU_PROLOGUE) else None
 
@@ -134,7 +137,10 @@ class TtMlp:
             gu = self.dram_mm[0]
             # The norm on helper cores ahead of the projection (prologue), or on its own cores with an all-gather.
             how = dict(norm_prologue=norm) if _NORM_AS_PROLOGUE else dict(norm=norm)
-            dmm = DramMatmul(self.device, None, ttnn.MathFidelity.HiFi2, split_n=gu.split_n, prebuilt=gu, **how)
+            dmm = DramMatmul(
+                self.device, None, ttnn.MathFidelity.HiFi2, split_n=gu.split_n, prebuilt=gu, read_depth=_MLP_READ_DEPTH,
+                **how,
+            )
             self.dmm_gu_norm = dmm if dmm.ok else None
         return self.dmm_gu_norm is not None
 
