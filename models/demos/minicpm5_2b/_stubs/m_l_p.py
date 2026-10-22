@@ -27,7 +27,7 @@ _USE_SILU_PROLOGUE = True
 _PREFILL_MM_SWIGLU = True
 # Prefill down on the C++ matmul (mm_swiglu's program, plain KSPLIT mode) with this K block.
 _PREFILL_DOWN_CPP = True
-_DOWN_K_BLOCK = 16
+_DOWN_K_BLOCK = 24
 # Rows per M block: 13 rows per core as 7 + 6 (2 weight passes, not 4 + 4 + 4 + 1).
 _DOWN_M_BLOCK = 7
 

@@ -279,7 +279,16 @@ void matmul_blocks_ksplit(
     const uint32_t subblock_w) {
     const uint32_t dst_cb = last ? out_cb : interm_cb;
     uint32_t in0_index_offset = 0;
+#ifdef IN0_STRIP_ROWS
+    // in0 arrives as one CB slot of subblock_h rows per subblock row (the reader's strips).
+    CircularBuffer cb_in0(in0_cb);
+    const uint32_t strip_tiles = subblock_h * K_block_tiles;
+#endif
     for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
+#ifdef IN0_STRIP_ROWS
+        cb_in0.wait_front(strip_tiles);
+        in0_index_offset = 0;
+#endif
         // An odd M block ends in a 1-row subblock row (same per-tile arithmetic, only the tile grouping differs).
         const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
         if (sh != subblock_h) {
@@ -321,6 +330,9 @@ void matmul_blocks_ksplit(
         if (sh != subblock_h) {
             matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
         }
+#ifdef IN0_STRIP_ROWS
+        cb_in0.pop_front(strip_tiles);
+#endif
         in0_index_offset += sh * K_block_tiles;
     }
 }
@@ -397,7 +409,9 @@ void kernel_main() {
                     if (last) {
                         cb_out.reserve_back(out_block_num_tiles);  // single-buffered: only the last block packs to it
                     }
+#ifndef IN0_STRIP_ROWS
                     cb_in0.wait_front(in0_block_num_tiles);
+#endif
                     cb_in1.wait_front(in1_block_num_tiles);
                     // The partials CB holds one block and is updated in place: each subblock's partials are
                     // reloaded (unpacker) before the same positions are repacked (packer, through DEST).
@@ -429,7 +443,9 @@ void kernel_main() {
                         }
                         cb_interm.push_back(out_block_num_tiles);
                     }
+#ifndef IN0_STRIP_ROWS
                     cb_in0.pop_front(in0_block_num_tiles);
+#endif
                     cb_in1.pop_front(in1_block_num_tiles);
                 }
                 cb_out.push_back(out_block_num_tiles);

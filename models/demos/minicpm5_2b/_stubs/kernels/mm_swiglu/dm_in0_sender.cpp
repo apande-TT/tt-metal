@@ -211,9 +211,19 @@ void kernel_main() {
                     const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
                     constexpr uint32_t chunk_tiles = IN0_CHUNK_TILES;
                     constexpr uint32_t chunks_per_row = K_block_tiles / chunk_tiles;
-                    const uint32_t n_chunks = current_M_block_tiles * chunks_per_row;
                     const uint32_t chunk_bytes = chunk_tiles * in0_tile_size;
-                    cb_in0.reserve_back(in0_block_num_tiles);
+#ifdef IN0_STRIP_ROWS
+                    // KSPLIT strips: the block moves as subblock-row strips (one CB slot each, the compute consumes
+                    // them in order), so the CB holds two strips instead of two whole blocks.
+                    constexpr uint32_t strip_rows = IN0_STRIP_ROWS;
+#else
+                    constexpr uint32_t strip_rows = M_block_tiles;
+#endif
+                    constexpr uint32_t strip_tiles = strip_rows * K_block_tiles;
+                    for (uint32_t strip_m = 0; strip_m < current_M_block_tiles; strip_m += strip_rows) {
+                    const uint32_t strip_m_tiles = std::min(strip_rows, current_M_block_tiles - strip_m);
+                    const uint32_t n_chunks = strip_m_tiles * chunks_per_row;
+                    cb_in0.reserve_back(strip_tiles);
                     const uint32_t in0_base = cb_in0.get_write_ptr();
                     if constexpr (!is_injector_core) {
                         in0_receiver_semaphore.set(0);
@@ -225,7 +235,7 @@ void kernel_main() {
                         const uint32_t k0 = (c % chunks_per_row) * chunk_tiles;
                         const uint32_t chunk_addr = in0_base + (row * K_block_tiles + k0) * in0_tile_size;
                         if constexpr (is_injector_core) {
-                            const uint32_t m = m_tile + row;
+                            const uint32_t m = m_tile + strip_m + row;
                             if (m < in0_shape.logical_d0) {
                                 for (uint32_t t = 0; t < chunk_tiles; t++) {
                                     noc.async_read(
@@ -256,7 +266,8 @@ void kernel_main() {
                             in0_receiver_semaphore.up(noc, in0_dest_noc_x, in0_dest_noc_y, 1);
                         }
                     }
-                    cb_in0.push_back(in0_block_num_tiles);
+                    cb_in0.push_back(strip_tiles);
+                    }
                 }
 #else
                 {

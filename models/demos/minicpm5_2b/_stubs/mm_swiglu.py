@@ -56,7 +56,7 @@ def interleave_gate_up(wg_t: torch.Tensor, wu_t: torch.Tensor) -> torch.Tensor:
 
 def _in0_chunk(k_block):
     """DIRECT_OUT in0 forwarding chunk (tiles of one row's K block)."""
-    return 16 if k_block % 16 == 0 else k_block
+    return 16 if k_block % 16 == 0 else 8 if k_block % 8 == 0 else k_block
 
 
 def _in1_chunk(k_block):
@@ -203,6 +203,10 @@ def mm_swiglu(
     in1_block_num_tiles = K_block * N_block
     out_block_num_tiles = M_block * N_block
     in0_cb_num_tiles = in0_block_num_tiles if fuse_swiglu else 2 * in0_block_num_tiles
+    ksplit_strips = not fuse_swiglu and K_blocks > 1
+    if ksplit_strips:
+        # KSPLIT: in0 moves in subblock-row strips, two strips double-buffered (frees L1 for a deeper K block).
+        in0_cb_num_tiles = 2 * subblock_h * K_block
     in1_cb_num_tiles = 2 * in1_block_num_tiles
     # SwiGLU: half a block, double buffered; plain: a block, double buffered.
     out_cb_num_tiles = 2 * (out_block_num_tiles // 2) if fuse_swiglu else 2 * out_block_num_tiles
@@ -264,7 +268,7 @@ def mm_swiglu(
             ("IN0_CHUNK_TILES", str(_in0_chunk(K_block))),
             ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
         ]
-        + ([("KSPLIT", "1")] if K_blocks > 1 else [])
+        + ([("KSPLIT", "1"), ("IN0_STRIP_ROWS", str(subblock_h))] if K_blocks > 1 else [])
     )
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0
@@ -309,7 +313,10 @@ def mm_swiglu(
 
     # Deferred output writes: stride the K block each writer defers to by its core y.
     k_blocks_per_core = _div_up(K_blocks, in1_axis if transpose else in0_axis)
-    max_defer_write_k_block = max(min(y * k_blocks_per_core, K_blocks - 1) for y in range(gy))
+    # KSPLIT strips: the compute reserves the (single) output block before the last K block, and the writer reaches
+    # its deferred write only after that K block's strips are all consumed -- so defer at most to the one before.
+    last_defer_k_block = K_blocks - 2 if (ksplit_strips and K_blocks > 1) else K_blocks - 1
+    max_defer_write_k_block = max(min(y * k_blocks_per_core, last_defer_k_block) for y in range(gy))
 
     x_addr, w_addr, out_addr = x.buffer_address(), w_il.buffer_address(), out.buffer_address()
     rt_in0_sender, rt_in0_receiver = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -345,7 +352,7 @@ def mm_swiglu(
             M_end = M_tiles_per_core * (in0_idx + 1)
             N_start = N_tiles_per_core * in1_idx
             N_end = N_tiles_per_core * (in1_idx + 1)
-            defer_write_k_block = min(cy * k_blocks_per_core, K_blocks - 1)
+            defer_write_k_block = min(cy * k_blocks_per_core, last_defer_k_block)
             is_in0_sink = 1 if core == in0_order[-1] else 0
             is_in1_sink = 1 if core == in1_order[-1] else 0
 
