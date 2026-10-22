@@ -245,8 +245,9 @@ class StreamDownDecode:
         return out
 
     # ar_call: the two fabric-link workers (free cores of the spread grid: the stream cores fill rows 0.. row-major,
-    # the sender is the last core)
-    AR_WORKERS = ((8, 9), (9, 9))
+    # the sender is the last core) -- the first free cores of the last row, right after the stream cores (from (8, 9),
+    # (9, 9): trace decode ~12 us a token less, bit-identical)
+    AR_WORKERS = ((5, 9), (6, 9))
 
     def ar_ok(self, m, x, ar) -> bool:
         """Whether ar_call can take (m, x, ar): x the fp32 decode residual in ar's width shards (WT tiles a core, every

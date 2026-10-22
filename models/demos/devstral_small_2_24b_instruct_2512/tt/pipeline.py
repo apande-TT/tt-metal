@@ -280,6 +280,8 @@ PLANNED_TP = 4
 #                     851 -> 831 us a layer; prefill 929 -> 925 ms, bit-identical.
 #   decode SDPA on an 8 x 8 grid (ministral3_attention DECODE_SDPA_ROWS): its 64 (user, kv head) pairs take one core
 #                     each, so the 8 x 10 grid launched 16 idle cores; same kernel time, trace decode ~8 us a token less.
+#   decode down fold's fabric-link workers on (5, 9), (6, 9) (StreamDownDecode.AR_WORKERS, was (8, 9), (9, 9)): trace
+#                     decode ~12 us a token less, bit-identical.
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
