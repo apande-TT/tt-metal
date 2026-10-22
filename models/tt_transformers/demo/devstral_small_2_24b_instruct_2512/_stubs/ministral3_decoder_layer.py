@@ -29,6 +29,10 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.minis
     TtMinistral3RMSNorm,
 )
 
+# The prefill sharded norm writes its bf16 output (32 x 416 x 1280 a device: ~310 KB a core) to L1 for the hidden
+# all_gather, which reads it from there (the gathered row stays in DRAM): multiply 217 -> 160 us, gather 851 -> 831 us.
+PREFILL_AG_IN_L1 = True
+
 
 class TtMinistral3DecoderLayer:
     # The residual stream is carried in fp32: bf16 residual adds round with an upward bias (each layer's output
@@ -287,6 +291,11 @@ class TtMinistral3DecoderLayer:
                 ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
             ],
         )
+        if PREFILL_AG_IN_L1 and int(x.shape[-2]) > ttnn.TILE_SIZE:
+            y = ttnn.multiply(x, r, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+            ttnn.deallocate(y)
+            return out
         return ttnn.all_gather(ttnn.multiply(x, r, dtype=ttnn.bfloat16), dim=3, **ccl)
 
     @staticmethod

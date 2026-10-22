@@ -284,11 +284,102 @@ void swiglu_block(
         cb_out.push_back(out_N_block_tiles);
     }
 }
+
+#if defined(SWIGLU_OVERLAP) && defined(SWIGLU_PACK_SFPU)
+// SWIGLU_OVERLAP: a finished block's SwiGLU epilogue runs while the NEXT block accumulates -- one gate/up pair at a
+// time between that block's matmul subblocks (`stride` subblocks apart), so the PACK thread's SFPU pass overlaps the
+// FPU's matmul instead of following it. The finished block's fp32 partials stay at the front of the intermediate CB
+// (it holds two blocks; the next block accumulates behind them) until its last pair; pairs still left at K step
+// `epi_done_k` of the next block are drained there, before the writer reads the output block (its deferred write runs
+// at that K step or later, injectors included -- the model's dm kernel copies, DEFER_INJECTOR). Each pair goes through
+// swiglu_block's copy, SFPU pass and pack, so the output is bit-identical.
+struct PendingEpilogue {
+    uint32_t left = 0;  // pairs still to run (0: nothing pending)
+    uint32_t real_M = 0, real_pairs = 0, M_block_tiles = 0;
+    uint32_t m = 0, p = 0;  // the next pair
+    uint32_t stride = 1, tick = 0;
+};
+
+ALWI void epi_mode(uint32_t inter_cb, uint32_t out_cb) {
+    reconfig_data_format_srca(inter_cb);
+    pack_reconfig_data_format(out_cb);
+    PACK((llk_pack_reconfig_l1_acc(0)));
+    copy_init(inter_cb);
+    silu_tile_init_pack();
+#ifdef SWIGLU_HOIST
+    PACK((ckernel::sfpu::silu_mul_hoist_init()));
+#endif
+}
+
+ALWI void mm_mode(
+    uint32_t in0_cb, uint32_t in1_cb, uint32_t inter_cb, uint32_t ct, uint32_t rt, uint32_t kt, bool l1_acc) {
+    reconfig_data_format(in1_cb, in0_cb);
+    pack_reconfig_data_format(inter_cb);
+    PACK((llk_pack_reconfig_l1_acc(l1_acc ? 1 : 0)));
+    matmul_block_init(in0_cb, in1_cb, false /*transpose*/, ct, rt, kt);
+}
+
+// rows past real_M (range padding) are pushed whole without compute, then the partials leave
+ALWI void epi_finish(PendingEpilogue& pe, uint32_t inter_cb, uint32_t out_cb, uint32_t N_block_tiles) {
+    for (uint32_t m = pe.real_M; m < pe.M_block_tiles; m++) {
+        cb_push_back(out_cb, N_block_tiles >> 1);
+    }
+    cb_pop_front(inter_cb, pe.M_block_tiles * N_block_tiles);
+    pe.left = 0;
+}
+
+// the pending block at the front of inter_cb, its output block reserved; finishes at once when it has no pairs
+ALWI void epi_begin(
+    PendingEpilogue& pe,
+    uint32_t inter_cb,
+    uint32_t out_cb,
+    uint32_t M_block_tiles,
+    uint32_t N_block_tiles,
+    uint32_t real_M,
+    uint32_t real_pairs) {
+    cb_wait_front(inter_cb, M_block_tiles * N_block_tiles);
+    cb_reserve_back(out_cb, (M_block_tiles * N_block_tiles) >> 1);
+    pe.real_M = real_pairs ? real_M : 0;
+    pe.real_pairs = real_pairs;
+    pe.M_block_tiles = M_block_tiles;
+    pe.m = pe.p = pe.tick = 0;
+    pe.left = pe.real_M * real_pairs;
+    pe.stride = 1;
+    if (pe.left == 0) {
+        epi_finish(pe, inter_cb, out_cb, N_block_tiles);
+    }
+}
+
+ALWI void epi_pair(PendingEpilogue& pe, uint32_t inter_cb, uint32_t out_cb, uint32_t N_block_tiles) {
+    const uint32_t gate_tile_id = pe.m * N_block_tiles + (pe.p << 1);
+    tile_regs_acquire();
+    copy_tile(inter_cb, gate_tile_id, 0);
+    copy_tile(inter_cb, gate_tile_id + 1, 1);
+    tile_regs_commit();
+    PACK((TTI_SEMWAIT(
+        p_stall::STALL_TDMA | p_stall::STALL_CFG, semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO)));
+    PACK((TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset())));
+    PACK((pack_silu_mul(0, 1, 0)));
+    PACK((TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU)));
+    pack_tile(0, out_cb);
+    tile_regs_release();
+    pe.left--;
+    if (++pe.p == pe.real_pairs) {
+        pe.p = 0;
+        cb_push_back(out_cb, N_block_tiles >> 1);
+        if (++pe.m == pe.real_M) {
+            epi_finish(pe, inter_cb, out_cb, N_block_tiles);
+        }
+    }
+}
+#endif  // SWIGLU_OVERLAP
 #endif  // FUSE_SWIGLU
 
 // The stock kernel's matmul_blocks: subblocks of the M x N block, K_block_tiles deep, packed out of order into the
-// fp32 accumulation block (L1 accumulation after the first K block).
+// fp32 accumulation block (L1 accumulation after the first K block). `hook` runs after each subblock (SWIGLU_OVERLAP).
+template <typename Hook>
 void matmul_blocks(
+    Hook&& hook,
     const uint32_t in0_cb,
     const uint32_t in1_cb,
     const uint32_t out_cb,
@@ -334,6 +425,7 @@ void matmul_blocks(
                 }
             }
             tile_regs_release();
+            hook();
             in1_index_offset += subblock_w;
         }
         in0_index_offset += subblock_h * K_block_tiles;
@@ -360,6 +452,12 @@ void kernel_main() {
     // the real (unpadded) M / N extents: tiles past them are padding of the core's range, never stored
     const uint32_t M_real_end = get_arg_val<uint32_t>(argidx++);
     const uint32_t N_real_end = get_arg_val<uint32_t>(argidx++);
+#endif
+#if defined(FUSE_SWIGLU) && defined(SWIGLU_OVERLAP)
+    // the K step of the next block by which a pending epilogue is drained (<= the writer's deferred-write step)
+    const uint32_t epi_done_k = get_arg_val<uint32_t>(argidx++);
+    PendingEpilogue pe;
+    const uint32_t epi_drain_k = epi_done_k < K_num_blocks - 1 ? epi_done_k : K_num_blocks - 1;
 #endif
 
     constexpr uint32_t in0_cb = tt::CBIndex::c_0;
@@ -418,12 +516,43 @@ void kernel_main() {
                 current_subblock_h /*rt_dim*/,
                 K_block_tiles /*kt_dim*/);
             cb_intermediate.reserve_back(out_block_num_tiles);
+            [[maybe_unused]] bool l1_acc = false;
+#if defined(FUSE_SWIGLU) && defined(SWIGLU_OVERLAP)
+            if (pe.left) {
+                // the pending pairs spread over this block's subblocks before the drain step
+                const uint32_t per_k =
+                    (mm_M > 0 && mm_N > 0) ? (mm_M / current_subblock_h) * (mm_N / current_subblock_w) : 0;
+                const uint32_t slots = epi_drain_k * per_k;
+                pe.stride = slots / pe.left > 0 ? slots / pe.left : 1;
+                pe.tick = 0;
+            }
+            auto hook = [&]() {
+                if (pe.left && ++pe.tick >= pe.stride) {
+                    pe.tick = 0;
+                    epi_mode(intermediate_cb, out_cb);
+                    epi_pair(pe, intermediate_cb, out_cb, N_block_tiles);
+                    mm_mode(in0_cb, in1_cb, intermediate_cb, current_subblock_w, current_subblock_h, K_block_tiles, l1_acc);
+                }
+            };
+#else
+            auto hook = []() {};
+#endif
             for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
+#if defined(FUSE_SWIGLU) && defined(SWIGLU_OVERLAP)
+                if (pe.left && k_block == epi_drain_k) {
+                    epi_mode(intermediate_cb, out_cb);
+                    while (pe.left) {
+                        epi_pair(pe, intermediate_cb, out_cb, N_block_tiles);
+                    }
+                    mm_mode(in0_cb, in1_cb, intermediate_cb, current_subblock_w, current_subblock_h, K_block_tiles, l1_acc);
+                }
+#endif
                 cb_in0.wait_front(in0_block_num_tiles);
                 cb_in1.wait_front(in1_block_num_tiles);
 
                 if (mm_M > 0 && mm_N > 0) {
                     matmul_blocks(
+                        hook,
                         in0_cb,
                         in1_cb,
                         intermediate_cb,
@@ -447,6 +576,7 @@ void kernel_main() {
                 reuse_in0_block = false;
                 if (k_block == 0) {
                     PACK((llk_pack_reconfig_l1_acc(1)));
+                    l1_acc = true;
                 }
             }
 
@@ -454,13 +584,27 @@ void kernel_main() {
             PACK((llk_pack_reconfig_l1_acc(0)));
 
 #ifdef FUSE_SWIGLU
+#ifdef SKIP_PADDING
+            const uint32_t epi_M = mm_M, epi_pairs = mm_N >> 1;
+#else
+            const uint32_t epi_M = M_block_tiles, epi_pairs = N_block_tiles >> 1;
+#endif
+#ifdef SWIGLU_OVERLAP
+            if (pe.left) {  // (drained at epi_drain_k already; kept for safety)
+                epi_mode(intermediate_cb, out_cb);
+                while (pe.left) {
+                    epi_pair(pe, intermediate_cb, out_cb, N_block_tiles);
+                }
+            }
+            const bool core_last = m_block_iter == M_blocks_per_core - 1 && n_block_iter == N_blocks_per_core - 1;
+            if (!core_last) {
+                epi_begin(pe, intermediate_cb, out_cb, M_block_tiles, N_block_tiles, epi_M, epi_pairs);
+                continue;
+            }
+#endif
             cb_out.reserve_back(out_block_num_tiles >> 1);
             cb_intermediate.wait_front(out_block_num_tiles);
-#ifdef SKIP_PADDING
-            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, mm_M, mm_N >> 1);
-#else
-            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, M_block_tiles, N_block_tiles >> 1);
-#endif
+            swiglu_block(intermediate_cb, out_cb, M_block_tiles, N_block_tiles, epi_M, epi_pairs);
             cb_intermediate.pop_front(out_block_num_tiles);
 #elif defined(FUSE_RESIDUAL)
             cb_out.reserve_back(out_block_num_tiles);

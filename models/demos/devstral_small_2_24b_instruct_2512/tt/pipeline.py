@@ -259,6 +259,29 @@ PLANNED_TP = 4
 #                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
 #                     The long-prompt QKV / o_proj take N blocks of each core's narrow N range (QKV: 5 tiles, 4 x 1
 #                     subblocks) and the MLP down 1 x 4 subblocks.
+#   prefill fused gate/up (tt/minimal_mm.py SWIGLU_OVERLAP): each output block's SwiGLU epilogue runs during the next
+#                     block's matmul, one gate/up pair between its subblocks (the PACK thread's SFPU beside the FPU), with
+#                     a two-block fp32 intermediate and every writer (injectors too, kernels/mm_dm_in*.cpp) deferring
+#                     its block write to K step K_blocks / 2 or later: 416-row gate/up 9.57 -> 9.21 ms/layer,
+#                     bit-identical (DRAM in / out only: the vision MLP's L1 tensors leave no room for the second block).
+#   minimal_mm grid split by per-core work (tt/minimal_mm.py transposed): M along x / N along y or the other way round,
+#                     whichever hands each core >= 5% fewer output tiles (stock: M > N). Flips only the vision gate/up
+#                     (168 -> 156 tiles a core), o_proj and the patch projection (24 -> 21); the stubs size their blocks to
+#                     the chosen ranges and the MLP down keeps the stock split. Trace encode 21.30 -> 21.00 ms.
+#   decode vocab top-k (VocabTopK.FUSED): every level sorts packed [bf16 | u16] 32-bit keys (the stock topk's fused-key
+#                     mode) instead of value + index tiles: 67.9 -> 54.3 us a step; equal logits rank by position.
+#   ministral3_m_l_p prefill MLP down at LoFi on every text layer (PREFILL_DOWN_LOFI; the op is FPU-bound at 608 x 256
+#                     tile products a core): trace prefill 1028 -> 937 ms; PCC 0.995097 -> 0.995002 (threshold 0.995).
+#                     At LoFi its data movement shows (2.51 ms vs the 2.06 ms roof): M blocks of a third of each core's
+#                     M range (13 rows, not 8) re-read every weight block 3 times instead of 5 -- 2.51 -> 2.42 ms a
+#                     call, bit-identical (the per-tile K order depends only on the N block); prefill 937 -> 929 ms.
+#   ministral3_decoder_layer prefill sharded norm: its bf16 output (34 MB a device) goes to L1 for the hidden
+#                     all_gather (PREFILL_AG_IN_L1; the gathered row stays in DRAM): multiply 217 -> 160 us, gather
+#                     851 -> 831 us a layer; prefill 929 -> 925 ms, bit-identical.
+#   decode SDPA on an 8 x 8 grid (ministral3_attention DECODE_SDPA_ROWS): its 64 (user, kv head) pairs take one core
+#                     each, so the 8 x 10 grid launched 16 idle cores; same kernel time, trace decode ~8 us a token less.
+#   decode down fold's fabric-link workers on (5, 9), (6, 9) (StreamDownDecode.AR_WORKERS, was (8, 9), (9, 9)): trace
+#                     decode ~12 us a token less, bit-identical.
 #   decoder_head: the one-tile-row lm_head (decode; prefill's last prompt rows) streams bank-major copies of its
 #                     weight on both data-movement RISCs of 64 cores (tt/lm_head_decode.py), bit-identical to ttnn.linear.
 #                     The decode gate / up and the lm_head stream through 256 KB weight CBs (the down / o_proj: 112 KB);
@@ -493,6 +516,12 @@ class VocabTopK:
     LOCALS = 8  # local cores per middle core
     VAL, IDX = ttnn.bfloat16, ttnn.uint16
     TILE_BYTES = 2048  # bf16 and uint16 tiles
+    # The stock op's fused-key mode at every level (topk_local.cpp / topk_final.cpp ct arg 15, kernels/topk_mid.cpp
+    # ct arg 13): right after the local transposes each value and its position become one packed [bf16 | u16] 32-bit
+    # key that sorts, merges and travels as a single word (raw float32 tiles, 32-bit DEST); the final core splits them
+    # back into the value and position outputs. Equal values then rank by position (the stock stable order).
+    FUSED = True
+    PACKED, PACKED_BYTES = ttnn.float32, 4096
 
     def __init__(self, device, k):
         assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
@@ -509,13 +538,11 @@ class VocabTopK:
         self.all_set = self.local_set.merge(self.mid_final_set)
         self.phys = lambda x, y: device.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
 
-    def _cb(self, index, tiles, dtype, cores):
+    def _cb(self, index, tiles, dtype, cores, tile_bytes=TILE_BYTES):
         return ttnn.CBDescriptor(
-            total_size=tiles * self.TILE_BYTES,
+            total_size=tiles * tile_bytes,
             core_ranges=cores,
-            format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=self.TILE_BYTES)
-            ],
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
         )
 
     def __call__(self, x):
@@ -538,23 +565,48 @@ class VocabTopK:
         # address after its own gather wrapped the buffer, so the buffer holds exactly one gather (g == n).
         assert g == n
         IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
-        cbs = [
-            self._cb(G_VAL, n * kt, self.VAL, self.all_set),
-            self._cb(G_IDX, n * kt, self.IDX, self.all_set),
-            self._cb(OUT_VAL, 2, self.VAL, self.all_set),
-            self._cb(OUT_IDX, 2, self.IDX, self.all_set),
-            self._cb(IN, 4, self.VAL, self.local_set),
-            self._cb(IN_IDX, 4, self.IDX, self.local_set),
-            self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
-            self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
-            self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
-            self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
-        ]
+        fused = self.FUSED
+        P, PB = self.PACKED, self.PACKED_BYTES
+        if fused:
+            # G_IDX / M_IDX are the final core's staging for the split values (bf16) / positions (u16)
+            sending = self.local_set.merge(self.mid_set)
+            cbs = [
+                self._cb(G_VAL, n * kt, P, self.all_set, PB),
+                self._cb(G_IDX, n * kt, self.VAL, self.all_set),
+                self._cb(OUT_VAL, 2, P, sending, PB),
+                self._cb(OUT_VAL, 2, self.VAL, self.final_set),
+                self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+                self._cb(IN, 4, self.VAL, self.local_set),
+                self._cb(IN_IDX, 4, self.IDX, self.local_set),
+                self._cb(LT_VAL, wt_local, P, self.local_set, PB),
+                self._cb(M_VAL, g * kt, P, self.mid_final_set, PB),
+                self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+            ]
+        else:
+            cbs = [
+                self._cb(G_VAL, n * kt, self.VAL, self.all_set),
+                self._cb(G_IDX, n * kt, self.IDX, self.all_set),
+                self._cb(OUT_VAL, 2, self.VAL, self.all_set),
+                self._cb(OUT_IDX, 2, self.IDX, self.all_set),
+                self._cb(IN, 4, self.VAL, self.local_set),
+                self._cb(IN_IDX, 4, self.IDX, self.local_set),
+                self._cb(LT_VAL, wt_local, self.VAL, self.local_set),
+                self._cb(LT_IDX, wt_local, self.IDX, self.local_set),
+                self._cb(M_VAL, g * kt, self.VAL, self.mid_final_set),
+                self._cb(M_IDX, g * kt, self.IDX, self.mid_final_set),
+            ]
         # Semaphores 0/1: local -> middle hand-off; 2/3: middle -> final (a middle core runs both protocols).
         sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=self.all_set, initial_value=0) for i in range(4)]
 
         compute_cfg = ttnn.ComputeConfigDescriptor()
-        compute_cfg.fp32_dest_acc_en = False
+        compute_cfg.fp32_dest_acc_en = fused  # packed 32-bit keys need 32-bit DEST
+        if fused:
+            # packed keys unpack straight to DEST (the 16-bit source registers would truncate them)
+            modes = [ttnn.UnpackToDestMode.Default] * 64
+            for i in (LT_VAL, G_VAL, M_VAL):
+                modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+            compute_cfg.unpack_to_dest_mode = modes
+        fdefs = [("TOPK_FUSED_STABLE_KEYS", "1")] if fused else []
         logk = int(math.log2(k))
         sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
         kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
@@ -579,14 +631,14 @@ class VocabTopK:
             kern(
                 f"{_TOPK_KERNELS}/compute/topk_local.cpp",
                 self.local_set,
-                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 0, 0],
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, int(fused), int(fused)],
                 [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
                 compute_cfg,
             ),
             kern(
                 _TOPK_MID_KERNEL,
                 self.mid_set,
-                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1],
+                sort_ct(n * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(n * kt)), 1, int(fused)],
                 [((gx, n), [gx % 2]) for gx in range(g)],
                 compute_cfg,
                 compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
@@ -598,6 +650,7 @@ class VocabTopK:
                 + [OUT_VAL, OUT_IDX, G_VAL, G_IDX],
                 [((gx, n), [gx]) for gx in range(g)],
                 ttnn.WriterConfigDescriptor(),
+                defines=fdefs,
             ),
             kern(
                 f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
@@ -606,11 +659,12 @@ class VocabTopK:
                 + [ht, g * kt, g, G_VAL, G_IDX],
                 [],
                 ttnn.ReaderConfigDescriptor(),
+                defines=fdefs,
             ),
             kern(
                 f"{_TOPK_KERNELS}/compute/topk_final.cpp",
                 self.final_set,
-                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, 0, 0],
+                sort_ct(g * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [int(math.log2(g * kt)), 1, 1, int(fused), int(fused)],
                 [],
                 compute_cfg,
             ),
@@ -635,6 +689,7 @@ class VocabTopK:
                     [0, 1, mid.x, mid.y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
                     [((gx, ly), [ly]) for ly in range(n)],
                     ttnn.WriterConfigDescriptor(),
+                    defines=fdefs,
                 )
             )
             # ... which releases them (multicast over the column) and collects n * kt tiles.
@@ -645,6 +700,7 @@ class VocabTopK:
                     [0, 1, top.x, top.y, bottom.x, bottom.y, ht, n * kt, n, G_VAL, G_IDX],
                     [],
                     ttnn.ReaderConfigDescriptor(),
+                    defines=fdefs,
                 )
             )
         ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))

@@ -23,6 +23,9 @@ _DM_IN0 = _DM_DIR + "dm_in0_sender.cpp"
 # the stock in0 reader with its block read remapped to a heads-layout in0 (matmul(..., in0_heads=))
 _DM_IN0_HEADS = str(_KDIR / "mm_in0_heads.cpp")
 _DM_IN1 = _DM_DIR + "dm_in1_sender_out.cpp"
+# the stock data-movement kernels with deferred output writes on the injector cores too (SWIGLU_OVERLAP)
+_DM_IN0_DEFER = str(_KDIR / "mm_dm_in0.cpp")
+_DM_IN1_DEFER = str(_KDIR / "mm_dm_in1_out.cpp")
 
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 _INVALID, _VALID = 0, 1
@@ -41,6 +44,35 @@ SWIGLU_HOIST = True
 # N_tiles): no matmul subblocks or epilogue work for tiles the writer never stores (identical real tiles; less FPU /
 # SFPU energy, which is what the power-capped prefill and encode run on).
 SKIP_PADDING = True
+# The SwiGLU epilogue of each output block runs during the NEXT block's matmul, one gate/up pair between its subblocks
+# (mm_compute.cpp SWIGLU_OVERLAP: the PACK thread's SFPU pass beside the FPU), drained by K step EPI_DONE_FRAC * K blocks;
+# the intermediate CB holds two blocks and every writer defers its block write to that K step or later. Only where the
+# doubled intermediate fits L1 (SWIGLU_OVERLAP_L1_BYTES of circular buffers).
+SWIGLU_OVERLAP = True
+EPI_DONE_FRAC = 0.5
+SWIGLU_OVERLAP_L1_BYTES = 1_240_000
+
+
+# minimal_matmul splits M along the grid's x axis and N along y when M > N, else the other way round. ORIENT_MIN_WORK
+# takes the other orientation where it hands each core at least ORIENT_MIN_GAIN fewer output tiles (ceil splits,
+# SwiGLU pairs kept whole; the vision MLP / attention: 64 M tiles against 32-96 N tiles) -- the same tiles, each
+# accumulated over K in the same order. Callers that size blocks to the per-core ranges use transposed() too.
+ORIENT_MIN_WORK = True
+ORIENT_MIN_GAIN = 0.05
+
+
+def transposed(m_tiles, n_tiles, gx, gy, swiglu=False):
+    """Whether minimal_matmul (this module's program) splits M along the grid's x axis (and N along y)."""
+    stock = m_tiles > n_tiles
+    if not ORIENT_MIN_WORK:
+        return stock
+
+    def work(t):
+        mp, np_ = (gx, gy) if t else (gy, gx)
+        n = 2 * -(-(n_tiles // 2) // np_) if swiglu else -(-n_tiles // np_)
+        return -(-m_tiles // mp) * n
+
+    return (not stock) if work(not stock) <= (1 - ORIENT_MIN_GAIN) * work(stock) else stock
 
 
 def _round_up(a, b):
@@ -146,6 +178,7 @@ def matmul(
     fuse_swiglu=False,
     residual=None,
     in0_heads=None,
+    stock_orient=False,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
@@ -173,7 +206,8 @@ def matmul(
     M_block, K_block, N_block = int(config.M_block_size), int(config.K_block_size), int(config.N_block_size)
     sub_h, sub_w = int(config.subblock_h), int(config.subblock_w)
 
-    transpose = M > N
+    # stock_orient: the stock M > N split (the vision MLP down measured no better transposed)
+    transpose = M_tiles > N_tiles if stock_orient else transposed(M_tiles, N_tiles, gx, gy, fuse_swiglu)
     dram_read, dram_write = ttnn.NOC.NOC_0, ttnn.NOC.NOC_1  # Blackhole preferred NOCs
     small_noc, small_risc = dram_write, ttnn.DataMovementProcessor.RISCV_1
     large_noc, large_risc = dram_read, ttnn.DataMovementProcessor.RISCV_0
@@ -232,11 +266,25 @@ def matmul(
     # reads that K block, so compute -- which packs block i + 1 only after its last K block -- never waits on it. (The
     # vision MLP's 7 x 12-tile SwiGLU block: 86 KB less static L1, which the decode all_reduce's scratch needs.)
     out_bufs = 1
+    cb_bytes = (M_block * K_block * 2 * in0_tile + K_block * N_block * 2 * in1_tile + out_written * out_bufs * out_tile)
+    overlap = (
+        SWIGLU_OVERLAP
+        and fuse_swiglu
+        and SWIGLU_PACK_SFPU
+        and fp32_acc
+        and in0_heads is None
+        and K_blocks >= 2
+        and cb_bytes + 2 * out_block * interm_tile <= SWIGLU_OVERLAP_L1_BYTES
+        # an L1 input or product (the vision MLP) leaves no room for the second intermediate block
+        and x.memory_config().buffer_type == ttnn.BufferType.DRAM
+        and memory_config.buffer_type == ttnn.BufferType.DRAM
+    )
+    epi_done_k = min(max(1, int(K_blocks * EPI_DONE_FRAC)), K_blocks - 1) if overlap else 0
     cbs = [
         cb(0, M_block * K_block * 2, in0_tile, x.dtype),
         cb(1, K_block * N_block * 2, in1_tile, w.dtype),
         cb(2, out_written * out_bufs, out_tile, dtype),
-        cb(3, out_block, interm_tile, interm_dtype),
+        cb(3, out_block * (2 if overlap else 1), interm_tile, interm_dtype),
     ]
     if residual is not None:
         # the stock readers' FUSE_TERNARY CBs: the residual block ("a", unpacked to DEST unrounded) and the broadcast "b"
@@ -266,7 +314,7 @@ def matmul(
 
     skip_padding = SKIP_PADDING
     k_blocks_per_core = -(-K_blocks // (in1_par if transpose else in0_par))
-    max_defer = max(min(y * k_blocks_per_core, K_blocks - 1) for y in range(gy))
+    max_defer = max(max(min(y * k_blocks_per_core, K_blocks - 1), epi_done_k) for y in range(gy))
     phys = {}
 
     def pxy(c):
@@ -291,13 +339,15 @@ def matmul(
             prev1, next1 = o1[max(i1 - 1, 0)], o1[min(i1 + 1, len(o1) - 1)]
             m0, m1 = M_per_core * in0_idx, M_per_core * (in0_idx + 1)
             n0, n1 = N_per_core * in1_idx, N_per_core * (in1_idx + 1)
-            defer = min(cy * k_blocks_per_core, K_blocks - 1)
+            defer = max(min(cy * k_blocks_per_core, K_blocks - 1), epi_done_k)
             a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, *tern, o_addr]
             a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
             a1 += [o_addr]
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
-            rt_c.append((core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else [])))
+            rt_c.append(
+                (core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else []) + ([epi_done_k] if overlap else []))
+            )
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
     in0_src, in0_defines = _DM_IN0, []
@@ -315,6 +365,11 @@ def matmul(
             cdefines += [("SWIGLU_HOIST", "1")]
     if skip_padding:
         cdefines += [("SKIP_PADDING", "1")]
+    in1_src = _DM_IN1
+    if overlap:
+        cdefines += [("SWIGLU_OVERLAP", "1")]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)
+        defines = defines + [("DEFER_INJECTOR", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
 
@@ -341,8 +396,8 @@ def matmul(
     kernels = [
         kern(in0_src, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines + in0_defines),
         kern(in0_src, in0_receivers, in0_ct(0), rt_in0_r, dm(in0_risc, in0_noc), defines + in0_defines),
-        kern(_DM_IN1, in1_senders, in1_ct(1), rt_in1_s, dm(in1_risc, in1_noc), defines),
-        kern(_DM_IN1, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
+        kern(in1_src, in1_senders, in1_ct(1), rt_in1_s, dm(in1_risc, in1_noc), defines),
+        kern(in1_src, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
     ]
     ios = [x, w, out] if residual is None else [x, w, residual, out]

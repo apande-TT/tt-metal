@@ -37,6 +37,10 @@ DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
 # prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137; 16-24: 1134 ms, 0.995147;
 # 8-31: 1073 ms, PCC 0.99509 and 12-27: 1107 ms, PCC 0.995806 fail test_e2e_text_generation's token agreement).
 PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
+# The text layers' many-row (prefill) down projection at LoFi: it is FPU-bound (608 x 256 tile products a core on the
+# 416-row prompt), LoFi runs one fidelity phase instead of HiFi2's two -- trace prefill 1028 -> 937 ms; PCC 0.995097 ->
+# 0.995002 (threshold 0.995; layers 18-21 alone: 0.995039). The vision MLPs (subclasses) keep PREFILL_DOWN_FIDELITY.
+PREFILL_DOWN_LOFI = True
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # Math fidelity of the bf4 decode gate / up and down (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
@@ -271,10 +275,11 @@ class TtMinistral3MLP:
         )
         # The many-row down projection is compute-bound as well (fp32 accumulation kept).
         self.down_cfg = self.compute_cfg
-        if self.PREFILL_DOWN_FIDELITY is not None:
+        down_lofi = PREFILL_DOWN_LOFI and type(self) is TtMinistral3MLP and layer_idx is not None
+        if self.PREFILL_DOWN_FIDELITY is not None or down_lofi:
             self.down_cfg = ttnn.init_device_compute_kernel_config(
                 device.arch(),
-                math_fidelity=self.PREFILL_DOWN_FIDELITY,
+                math_fidelity=ttnn.MathFidelity.LoFi if down_lofi else self.PREFILL_DOWN_FIDELITY,
                 math_approx_mode=False,
                 fp32_dest_acc_en=True,
                 packer_l1_acc=False,
@@ -378,14 +383,18 @@ class TtMinistral3MLP:
         for d in shape[:-2]:
             mt *= d
         nt = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
-        n_cores = grid.y if mt > nt else grid.x
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        n_cores = grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y, swiglu=True) else grid.x
         n_core = 2 * -(-(nt // 2) // n_cores)
         return n_core if n_core < 12 else 12
 
     @staticmethod
-    def _m_range(mt, nt, grid):
-        """Each core's M tile range in minimal_matmul (M splits along the grid's x axis when M > N, else along y)."""
-        return -(-mt // (grid.x if mt > nt else grid.y))
+    def _m_range(mt, nt, grid, swiglu=False):
+        """Each core's M tile range in minimal_matmul (M along the grid's x axis when it splits transposed, else y)."""
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        return -(-mt // (grid.x if minimal_mm.transposed(mt, nt, grid.x, grid.y, swiglu) else grid.y))
 
     def _forward(self, x, residual=None):
         grid = self.device.compute_with_storage_grid_size()
@@ -400,7 +409,7 @@ class TtMinistral3MLP:
         # 1 x 4 subblocks: 9844 vs 10166 us at HiFi2 and 5947 vs 7310 us at LoFi on the 416-row prompt (8-tile M, 2 x 2).
         # The fp32 intermediate accumulates every output tile's K blocks in the same order whatever the blocking.
         nt_gu = int(self.w_gate_up.shape[-1]) // ttnn.TILE_SIZE
-        m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid)
+        m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid, swiglu=True)
         m_gu = min(range(min(8, m_rng), max(1, min(8, m_rng) // 2) - 1, -1), key=lambda b: -(-m_rng // b) * b - m_rng)
         n_gu = self._gate_up_n_block(x, grid)
         gu_cfg = ttnn.MinimalMatmulConfig(
@@ -437,6 +446,8 @@ class TtMinistral3MLP:
             mt *= d
         nt = int(self.w_down.shape[-1]) // ttnn.TILE_SIZE
         down_cfg = None
+        # the down keeps minimal_matmul's stock M > N split (stock_orient below): transposed it measured no better
+        n_rng_dn = -(-nt // (grid.y if mt > nt else grid.x))
         if mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
             down_cfg = ttnn.MinimalMatmulConfig(
                 M_block_size=8,
@@ -446,23 +457,26 @@ class TtMinistral3MLP:
                 subblock_w=2,
                 compute_with_storage_grid_size=ttnn.CoreCoord(nt // 16, mt // 16),
             )
-        elif -(-nt // (grid.y if mt > nt else grid.x)) in (2, 4, 6):
+        elif n_rng_dn in (2, 4, 6):
             # A narrow per-core N range (the vision MLP's 32 output tiles over 10 cores: 4) runs N blocks of exactly
             # that width; the default 8-tile block would be half padding.
-            m_dn = min(8, self._m_range(mt, nt, grid))
+            m_dn = min(8, -(-mt // (grid.x if mt > nt else grid.y)))
             down_cfg = ttnn.MinimalMatmulConfig(
                 M_block_size=m_dn if m_dn % 2 == 0 else 8,
                 K_block_size=8,
-                N_block_size=-(-nt // (grid.y if mt > nt else grid.x)),
+                N_block_size=n_rng_dn,
                 subblock_h=2,
                 subblock_w=2,
                 compute_with_storage_grid_size=grid,
             )
-        elif -(-nt // (grid.y if mt > nt else grid.x)) % 8 == 0:
+        elif n_rng_dn % 8 == 0:
             # A wide per-core N range (the 416-row prompt's 160 output tiles over 10 cores: 16) in 8-tile blocks of 1 x 4
-            # subblocks (4142 -> 4108 us; the default config runs 2 x 2).
+            # subblocks (4142 -> 4108 us; the default config runs 2 x 2), and M blocks of a third of each core's M range
+            # (38 rows: 13, 13, 12): the weight blocks are re-read once per M block, 3 times instead of 5 (LoFi: 2.51 ->
+            # 2.42 ms a call; the per-tile K order depends only on the N block, so bit-identical).
+            m_rng = -(-mt // (grid.x if mt > nt else grid.y))
             down_cfg = ttnn.MinimalMatmulConfig(
-                M_block_size=8,
+                M_block_size=-(-m_rng // 3),
                 K_block_size=8,
                 N_block_size=8,
                 subblock_h=1,
@@ -488,11 +502,11 @@ class TtMinistral3MLP:
             and minimal_mm.supports_residual(m, self.w_down, residual, down_dtype)
         ):
             # residual + down(m) in one program (tt/minimal_mm.py residual=), bit-identical to the add below
-            out = minimal_mm.matmul(m, self.w_down, residual=residual, **down_kw)
+            out = minimal_mm.matmul(m, self.w_down, residual=residual, stock_orient=True, **down_kw)
             residual = None
         elif down_cfg is not None and minimal_mm.supported(m, self.w_down, self.down_cfg):
             # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
-            out = minimal_mm.matmul(m, self.w_down, **down_kw)
+            out = minimal_mm.matmul(m, self.w_down, stock_orient=True, **down_kw)
         else:
             out = ttnn.experimental.minimal_matmul(m, self.w_down, **down_kw)
         if inter_l1:

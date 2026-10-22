@@ -25,6 +25,7 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
            column-parallel over the all_gathered heads (see self.wo).
   * rotary tables, the mask and the llama-4 scale are replicated; the KV cache holds the local heads.
 """
+
 from __future__ import annotations
 
 import math
@@ -98,6 +99,9 @@ class TtMinistral3Attention:
     DECODE_OPROJ_PUSH_ROWS = 4
     # Decode SDPA key chunk (0: sized per step by the kernel)
     DECODE_SDPA_K_CHUNK = 128
+    # Rows of the decode SDPA grid: its 32 users x 2 kv heads (TP=4) take one core each, so 8 x 8 runs the same
+    # kernel as 8 x 10 without launching 16 idle cores (trace decode ~8 us a token less).
+    DECODE_SDPA_ROWS = 8
     # False: prefill returns o_proj's reduce-scattered 1/TP hidden shard (the decoder keeps a hidden-sharded
     # residual in prefill and gathers only the normed activation).
     prefill_gather = True
@@ -361,7 +365,9 @@ class TtMinistral3Attention:
         # Its last chunk takes the causal mask as a separate add over the packed scores (the dynamic path adds it in
         # DEST): -0.00018 gate PCC, paid for by two fewer block-float4 down layers (ministral3_m_l_p).
         self.sdpa_decode_cfg = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=ttnn.CoreCoord(min(self.HEAD_GRID_X, grid.x), grid.y),
+            compute_with_storage_grid_size=ttnn.CoreCoord(
+                min(self.HEAD_GRID_X, grid.x), min(self.DECODE_SDPA_ROWS, grid.y)
+            ),
             q_chunk_size=0,
             k_chunk_size=self.DECODE_SDPA_K_CHUNK,
             exp_approx_mode=False,
@@ -520,7 +526,9 @@ class TtMinistral3Attention:
         if cfg is not None:
             return cfg
         grid = self.device.compute_with_storage_grid_size()
-        n = -(-nt // (grid.y if mt > nt else grid.x))  # minimal_matmul puts N along y when M > N
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        n = -(-nt // (grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y) else grid.x))  # the split minimal_mm runs
         if n > 8:
             return None
         sh, sw = (1, 4) if n % 4 == 0 else (4, 1) if n % 2 else (2, 2)
@@ -538,7 +546,9 @@ class TtMinistral3Attention:
         is small (short prompts): the default 8 x 8 blocks split e.g. the 128-row QKV's 12 x 5-tile range into an 8-
         and a 4-row block, streaming the weight columns twice. None (the default config) otherwise."""
         grid = self.device.compute_with_storage_grid_size()
-        gm, gn = (grid.x, grid.y) if mt > nt else (grid.y, grid.x)  # minimal_matmul puts M along x when M > N
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
+
+        gm, gn = (grid.x, grid.y) if minimal_mm.transposed(mt, nt, grid.x, grid.y) else (grid.y, grid.x)
         m, n = -(-mt // gm), -(-nt // gn)
         if m * n > 64 or m <= 8:
             return None
