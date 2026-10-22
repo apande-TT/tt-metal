@@ -158,6 +158,7 @@ class TtQwenTextEncoder:
         _te_layer.MLP_LIMBS_L1_BYTES = 16 * 1024 * 1024
         _te_layer.MLP_FUSED_SILU = True  # and its SiLU fused into the gate * up multiply
         _te_layer.FUSED_SCALE_MASK = True  # the LM attention's logit scale fused into its mask add
+        _te_layer.SOFTMAX_L1_BYTES = 8 * 1024 * 1024  # and its softmax intermediates in L1
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
         # faces), not slice + reshape [N, S, heads, 80] + permute (the reshape pads the 4 local heads to a tile dim)
