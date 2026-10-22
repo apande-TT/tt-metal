@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import math
 import os
 import struct
 import sys
@@ -66,6 +67,9 @@ _MASK_TABLE = True
 # Decode: cos / signed sin rows gathered per step from tables of every cache position (one 4-core data-movement
 # program) instead of the position * inv_freq, cos, sin, typecasts, L1 copy and * rot_sign ops.
 _ROPE_TABLE = True
+_L1_CONSTS_KERNEL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_stubs", "kernels", "l1_consts"
+)
 _POS_STEP_KERNEL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_stubs", "kernels", "pos_step"
 )
@@ -534,8 +538,10 @@ class MiniCPM5Pipeline:
         else:
             mask = ttnn.typecast(ttnn.multiply(ttnn.gt(self.key_index_row, pos), _NEG), ttnn.bfloat16)  # [B, 1, 1, C]
         l1 = ttnn.L1_MEMORY_CONFIG
+        sums_l1 = None
         if rows and _MASK_TABLE:
-            mask_full = ttnn.to_memory_config(self.mask_table, l1)  # read on the attention's critical path: L1
+            # Both per-step L1 constant copies (mask table + sum scalers) as one program.
+            mask_full, sums_l1 = self._attn_consts_l1()
         elif rows:
             mask_full = ttnn.typecast(
                 ttnn.multiply(ttnn.gt(self.key_index_full, pos), _NEG), ttnn.bfloat16, memory_config=l1
@@ -555,7 +561,7 @@ class MiniCPM5Pipeline:
             # The attention constants copied to L1 for this step (persistent L1 copies clash with prefill's CBs).
             att = self.encoder_stack.layers[0].self_attn
             if _MASK_TABLE:
-                ctx.consts = (mask_full, mask_full, mask_full, ttnn.to_memory_config(self.sum_scalers, l1))
+                ctx.consts = (mask_full, mask_full, mask_full, sums_l1)
             else:
                 ctx.consts = tuple(
                     ttnn.to_memory_config(t, l1)
@@ -584,6 +590,56 @@ class MiniCPM5Pipeline:
         self._emit(logits)
         self._pos_step()
         return logits
+
+    def _attn_consts_l1(self, n_cores=32):
+        """L1 copies of the mask table and the sum-scaler replicas (read on the fused attention's critical path)
+        by one data-movement generic_op (kernels/l1_consts) instead of two ttnn copies."""
+        srcs = (self.mask_table, self.sum_scalers)
+        dsts = [
+            ttnn.allocate_tensor_on_device(t.shape, t.dtype, ttnn.TILE_LAYOUT, self.device, ttnn.L1_MEMORY_CONFIG)
+            for t in srcs
+        ]
+        pages = [math.prod(list(t.padded_shape)) // (32 * 32) for t in srcs]
+        sizes = [32 * 32 * (4 if t.dtype == ttnn.float32 else 2) for t in srcs]
+        grid = self.device.compute_with_storage_grid_size()
+        per = [-(-n // n_cores) for n in pages]
+        rows, rem = divmod(n_cores, grid.x)
+        ranges = []
+        if rows:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, rows - 1)))
+        if rem:
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, rows), ttnn.CoreCoord(rem - 1, rows)))
+        cores = ttnn.CoreRangeSet(ranges)
+        rt = ttnn.RuntimeArgs()
+        for i in range(n_cores):
+            args = []
+            for n, q in zip(pages, per):
+                start = min(i * q, n)
+                args += [start, min(q, n - start)]
+            rt[i % grid.x][i // grid.x] = args
+        accessor_ct = []
+        for src, dst in zip(srcs, dsts):
+            accessor_ct += list(ttnn.TensorAccessorArgs(src).get_compile_time_args())
+            accessor_ct += list(ttnn.TensorAccessorArgs(dst).get_compile_time_args())
+        buf = per[0] * sizes[0] + per[1] * sizes[1]
+        reader = ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_L1_CONSTS_KERNEL_DIR, "copy_pages.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[0, sizes[0], sizes[1]] + accessor_ct,
+            runtime_args=rt,
+            common_runtime_args=[srcs[0].buffer_address(), dsts[0].buffer_address()]
+            + [srcs[1].buffer_address(), dsts[1].buffer_address()],
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=buf, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, buf)]
+            )
+        ]
+        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
+        ttnn.generic_op(list(srcs) + dsts, program)
+        return dsts[0], dsts[1]
 
     def _pos_step(self):
         """pos_buf, pos_i32 and pos_rm += 1 in place as one 1-core data-movement generic_op (kernels/pos_step)."""
