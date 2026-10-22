@@ -13,7 +13,6 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 
-#define NUM_SLOTS 3
 
 void kernel_main() {
     constexpr uint32_t cb_in1 = get_compile_time_arg_val(0);
@@ -26,6 +25,7 @@ void kernel_main() {
     // Relay (a partner core computes this worker's last groups): blocks from relay_from on are not pushed to this
     // core's compute; each one, once landed, bumps the partner's relay semaphore and the partner reads it from here.
     constexpr uint32_t relay_sem = get_compile_time_arg_val(7);  // ~0u: no relay on this program
+    constexpr uint32_t depth = get_compile_time_arg_val(8);  // weight blocks in flight (<= cb_blocks, <= 15)
 
     const uint32_t bank_id = get_arg_val<uint32_t>(0);
     const uint32_t vchannel = get_arg_val<uint32_t>(1);
@@ -82,49 +82,43 @@ void kernel_main() {
 
     noc_async_read_one_packet_set_state<true>(dram_noc_addr, txn_bytes, vchannel);
 
-    uint32_t trid_to_issue = 1, trid_to_wait = 1, slot = 0;
-    bool in_flight = false;
-    cb_reserve_back(cb_in1, block_tiles);
+    // depth blocks in flight (one transaction id each); a block is pushed (or relayed) once it has landed and the
+    // next one is issued only into a free slot (reserve through it: reserve_back is not incremental).
+    uint32_t slot = 0, landed = 0;
+    auto land = [&]() {
+        noc_async_read_barrier_with_trid(1 + landed % depth);
+        if (landed < relay_from) {
+            cb_push_back(cb_in1, block_tiles);
+        } else {
+            noc_semaphore_inc(relay_noc, 1);
+        }
+        ++landed;
+    };
     for (uint32_t b = 0; b < num_blocks; ++b) {
-        noc_async_read_set_trid(trid_to_issue);
+        if (b - landed == depth) {
+            land();
+        }
+        // Relayed blocks (num_blocks <= cb_blocks then, host-checked) sit in slots this core's compute never reaches.
+        if (b < relay_from) {
+            cb_reserve_back(cb_in1, (b - landed + 1) * block_tiles);
+        }
+        const uint32_t trid = 1 + b % depth;
+        noc_async_read_set_trid(trid);
         uint32_t l1 = cb_base + slot * block_bytes;
         for (uint32_t t = 0; t < txns_per_block; ++t) {
-            noc_async_read_one_packet_with_state_with_trid<false, true>(dram_noc_addr, w_offset, l1, trid_to_issue);
+            noc_async_read_one_packet_with_state_with_trid<false, true>(dram_noc_addr, w_offset, l1, trid);
             w_offset += txn_bytes;
             l1 += txn_bytes;
         }
         if (++slot == cb_blocks) {
             slot = 0;
         }
-        if (++trid_to_issue > NUM_SLOTS) {
-            trid_to_issue = 1;
-        }
-        if (in_flight) {
-            // Block b - 1 has landed.
-            noc_async_read_barrier_with_trid(trid_to_wait);
-            if (b - 1 < relay_from) {
-                cb_push_back(cb_in1, block_tiles);
-            } else {
-                noc_semaphore_inc(relay_noc, 1);
-            }
-            if (++trid_to_wait > NUM_SLOTS) {
-                trid_to_wait = 1;
-            }
-            // reserve_back is not incremental: one block is already reserved for the read in flight. Relayed
-            // blocks (num_blocks <= cb_blocks then, host-checked) sit in slots this core's compute never reaches.
-            if (b + 1 < relay_from) {
-                cb_reserve_back(cb_in1, 2 * block_tiles);
-            }
-        }
-        in_flight = true;
     }
-    noc_async_read_barrier_with_trid(trid_to_wait);
-    if (num_blocks - 1 < relay_from) {
-        cb_push_back(cb_in1, block_tiles);
-    } else {
-        noc_semaphore_inc(relay_noc, 1);
+    while (landed < num_blocks) {
+        land();
+    }
+    if (relay_from < num_blocks) {
         noc_async_atomic_barrier();
     }
 }
 
-#undef NUM_SLOTS

@@ -103,6 +103,7 @@ class DramMatmul:
         block_tiles=None,
         relay=False,
         ep_tpc=None,
+        read_depth=2,
     ):
         """split_n: write output columns [0, split_n) and [split_n, N) as two tensors (two projections sharing
         one activation row run as one program). norm: an r_m_s_norm.TtRMSNorm applied to x inside the program
@@ -331,6 +332,8 @@ class DramMatmul:
         else:
             self.reader_ct += [_NO_SEM, 0]
         self.reader_ct += [_SEM_RELAY if relaying else _NO_SEM]
+        # read_depth: weight blocks in flight per worker (short bf8 streams are latency-bound at 2).
+        self.reader_ct += [max(1, min(read_depth, cb_blocks, 15))]
         if relaying:
             self.semaphores.append(ttnn.SemaphoreDescriptor(id=_SEM_RELAY, core_ranges=cores, initial_value=0))
         if norm is None:
