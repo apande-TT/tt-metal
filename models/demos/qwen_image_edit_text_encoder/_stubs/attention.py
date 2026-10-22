@@ -558,6 +558,9 @@ BMM_SPLIT_M = False
 # split_matmul's plain two-limb products as one product over the limbs concatenated along K (False: three products
 # + two adds)
 BMM_CONCAT_K = False
+# fn(ah, al, bh, bl) -> (ah @ bh + ah @ bl) + al @ bh in float32 (b as [K, N]) or None; split_matmul's plain two-limb
+# products without transpose_b (P @ V) as one call (None: the stock matmuls)
+LIMB_BMM_FN = None
 
 
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
@@ -565,6 +568,14 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
     exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim)."""
     cfg = precise_config()
+    if not exact and limbs == 2 and LIMB_BMM_FN is not None and not transpose_b:
+        # the three limb terms in one C++ program (b as [K, N]: P @ V)
+        pa2, pb2 = split_bf16(a, 2), split_bf16(b, 2)
+        y = LIMB_BMM_FN(pa2[0], pa2[1], pb2[0], pb2[1])
+        for t in list(pa2) + list(pb2):
+            ttnn.deallocate(t)
+        if y is not None:
+            return y
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs)
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
