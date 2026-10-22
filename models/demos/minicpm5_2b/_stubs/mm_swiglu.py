@@ -132,6 +132,7 @@ def mm_swiglu(
     fuse_swiglu=True,
     transpose=None,
     blocks=None,
+    row_stream_m_block=None,
 ):
     """h[.., M, F] = silu(x @ W_il[:, gate tiles]) * (x @ W_il[:, up tiles]) for a [1, 1, K, 2F] tile-pair interleaved
     W_il (bf16 TILE). Output bf16 TILE in `memory_config`.
@@ -140,7 +141,8 @@ def mm_swiglu(
     bit-identical to ttnn's 2-D multicast matmul with fp32 DEST accumulation at the same fidelity. transpose: grid
     orientation (None = the factory's M > N rule). blocks: plain mode (M_block, N_block, K_block) -- K_block < K
     selects KSPLIT: fp32 partials between K blocks in an UnpackToDestFp32 CB (exact reload), which needs one N block
-    per core (K order stays ascending)."""
+    per core (K order stays ascending). row_stream_m_block: plain mode with one K block, in M blocks of this many rows
+    held in a single in0 CB that streams one row at a time (fewer weight passes; as SwiGLU)."""
     grid = device.compute_with_storage_grid_size()
     assert mm_swiglu_supported(
         x, w_il, grid, fuse_swiglu, k_block=blocks[2] if blocks is not None else None
@@ -156,6 +158,10 @@ def mm_swiglu(
     if blocks is not None:
         assert not fuse_swiglu
         M_block, N_block, K_block = blocks
+    row_stream = fuse_swiglu or row_stream_m_block is not None
+    if row_stream_m_block is not None:
+        assert not fuse_swiglu and blocks is None
+        M_block = row_stream_m_block
     subblock_h, subblock_w = _SUBBLOCK_H, _SUBBLOCK_W
     N_chunks = 1
     N_tiles_per_chunk = N_tiles // N_chunks
@@ -197,12 +203,12 @@ def mm_swiglu(
         assert K_blocks == 1 or N_blocks_per_core == 1, "KSPLIT needs one N block per core (ascending K order)"
         assert K_block % _in0_chunk(K_block) == 0
     # KSPLIT / SwiGLU compute handles an odd M block (a 1-row last subblock row); plain needs whole subblocks.
-    assert (M_block % subblock_h == 0 or K_blocks > 1 or fuse_swiglu) and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
+    assert (M_block % subblock_h == 0 or K_blocks > 1 or row_stream) and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
 
     in0_block_num_tiles = M_block * K_block
     in1_block_num_tiles = K_block * N_block
     out_block_num_tiles = M_block * N_block
-    in0_cb_num_tiles = in0_block_num_tiles if fuse_swiglu else 2 * in0_block_num_tiles
+    in0_cb_num_tiles = in0_block_num_tiles if row_stream else 2 * in0_block_num_tiles
     ksplit_strips = not fuse_swiglu and K_blocks > 1
     if ksplit_strips:
         # KSPLIT: in0 moves in subblock-row strips, two strips double-buffered (frees L1 for a deeper K block).
@@ -267,11 +273,14 @@ def mm_swiglu(
         ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
     ]
     defines = chunk_fwd + (
-        # SwiGLU: in0 streams through its M_block-row CB one row at a time (compute.cpp matmul_blocks_rows).
-        [("FUSE_SWIGLU", "1"), ("IN0_STRIP_ROWS", "1")]
+        [("FUSE_SWIGLU", "1")]
         if fuse_swiglu
         else [("DIRECT_OUT", "1")] + ([("KSPLIT", "1"), ("IN0_STRIP_ROWS", str(subblock_h))] if K_blocks > 1 else [])
     )
+    if row_stream:
+        # in0 streams through its M_block-row CB one row at a time (compute.cpp matmul_blocks_rows).
+        assert K_blocks == 1
+        defines += [("IN0_STRIP_ROWS", "1"), ("IN0_ROW_STREAM", "1")]
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0
     shape_ct = [

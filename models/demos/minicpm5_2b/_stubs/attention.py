@@ -77,6 +77,9 @@ _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kern
 _USE_FUSED_PREFILL_ATTN = True
 # Prefill Q and K|V as two full-grid 2-D multicast matmuls (Q on the o_proj config) instead of one 100-core fused QKV.
 _SPLIT_PREFILL_QKV = True
+# Prefill Q / o_proj C++ matmul: 4-row M blocks with in0 streamed row by row through one CB (a core's 13 rows =
+# 4 + 4 + 4 + 1: 4 weight passes instead of 2-row blocks' 7; same in0 L1 footprint as the double-buffered 2-row CB).
+_PREFILL_PROJ_M_BLOCK = 4
 _ATTN_PREFILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_prefill")
 
 
@@ -1006,6 +1009,7 @@ class TtAttention:
                 memory_config=memory_config,
                 fuse_swiglu=False,
                 transpose=False,
+                row_stream_m_block=_PREFILL_PROJ_M_BLOCK,
             )
         return ttnn.linear(
             x,

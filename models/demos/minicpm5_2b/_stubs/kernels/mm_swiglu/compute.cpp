@@ -271,9 +271,9 @@ void matmul_blocks(
     }
 }
 
-#if defined(FUSE_SWIGLU) && defined(IN0_STRIP_ROWS)
-// SwiGLU row streaming: matmul_blocks with the in0 block arriving / leaving one row slot at a time (the reader pushes
-// every row of the M_block-row CB, padding rows unread). The first N block of an M block waits only for the rows its
+#ifdef IN0_ROW_STREAM
+// Row streaming (IN0_ROW_STREAM: SwiGLU, and plain DIRECT_OUT with one K block): matmul_blocks with the in0 block
+// arriving / leaving one row slot at a time (the reader pushes every row of the M_block-row CB, padding rows unread). The first N block of an M block waits only for the rows its
 // next subblock row needs; the last N block pops each subblock row once done (then the padding rows), so the reader
 // loads the next M block's rows while this block's remaining rows and epilogue run. Same matmul calls per tile.
 void matmul_blocks_rows(
@@ -536,6 +536,26 @@ void kernel_main() {
             // whose cross-K-block partial reload is exact (UnpackToDestFp32), and whose last block packs DEST to bf16.
             matmul_block_init(
                 in0_cb, in1_cb, false /*transpose*/, current_subblock_w, current_subblock_h, K_block_tiles);
+#ifdef IN0_ROW_STREAM
+            cb_in1.wait_front(in1_block_num_tiles);
+            cb_out.reserve_back(out_block_num_tiles);
+            matmul_blocks_rows(
+                in0_cb,
+                in1_cb,
+                out_cb,
+                n_block_iter == 0,
+                n_block_iter == N_blocks_per_core - 1,
+                M_block_tiles,
+                current_M_block_tiles,
+                current_N_block_tiles,
+                N_block_tiles,
+                K_block_tiles,
+                current_subblock_h,
+                current_subblock_w);
+            cb_out.push_back(out_block_num_tiles);
+            cb_in1.pop_front(in1_block_num_tiles);
+            continue;
+#endif
             cb_in0.wait_front(in0_block_num_tiles);
             cb_in1.wait_front(in1_block_num_tiles);
             cb_out.reserve_back(out_block_num_tiles);
@@ -570,7 +590,7 @@ void kernel_main() {
             // Accumulation buffer
             cb_intermediate.reserve_back(out_block_num_tiles);
             for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
-#if defined(FUSE_SWIGLU) && defined(IN0_STRIP_ROWS)
+#ifdef IN0_ROW_STREAM
                 // Full K in one block (host-asserted): in0 rows stream in / out of the CB around this call.
                 cb_in1.wait_front(in1_block_num_tiles);
                 matmul_blocks_rows(
