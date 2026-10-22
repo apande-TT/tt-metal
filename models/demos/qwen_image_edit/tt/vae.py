@@ -76,7 +76,7 @@ class PointwiseConv32:
 
 # C_in_block of the float32 encoder's convs by in_channels (see TtQwenVAE.__init__; missing: tt_dit's default 32)
 ENCODER_C_IN_BLOCK = {384: 64}
-DECODER_C_IN_BLOCK = {384: 64}
+DECODER_C_IN_BLOCK = {384: 64, 192: 64}
 
 
 def _block_fp32_convs(stack, h_block=8, w_block=8):
