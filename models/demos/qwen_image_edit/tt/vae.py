@@ -23,6 +23,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import qwen_image_decoder3d, qwen_image_encoder3d
+from models.tt_dit.utils import conv3d as _conv3d_utils
 from models.tt_dit.utils.conv3d import _walk_conv3d_modules
 
 _PORT_NAMES = {
@@ -73,6 +74,10 @@ class PointwiseConv32:
         return ttnn.permute(ttnn.reshape(y, (B, H, W, self.cout)), (0, 3, 1, 2))
 
 
+# C_in_block of the float32 encoder's convs by in_channels (see TtQwenVAE.__init__; missing: tt_dit's default 32)
+ENCODER_C_IN_BLOCK = {384: 64}
+
+
 def _block_fp32_convs(stack, h_block=8, w_block=8):
     """Give a float32 Wan stack's conv3d layers a real output blocking.
 
@@ -87,7 +92,8 @@ def _block_fp32_convs(stack, h_block=8, w_block=8):
             continue
         cout = m.out_channels
         c.C_out_block = next(b for b in (96, 64, 32) if cout % b == 0) if cout % 32 == 0 else c.C_out_block
-        c.H_out_block, c.W_out_block = h_block, w_block
+        # (a wider C_in block's weight and vol2col blocks take the L1 a 64-row output block needs)
+        c.H_out_block, c.W_out_block = (h_block, w_block) if c.C_in_block <= 32 else (8, 4)
         n += 1
     return n
 
@@ -102,7 +108,12 @@ class TtQwenVAE:
         # float32 encoder: the image latents condition every denoising step, and the bf16 encoder's
         # error (image-latent PCC 0.99999) moved the final latents ~10x more than the denoiser's own
         # whole images per chip (batch over both mesh axes): no halo exchange / width masking at any conv
-        self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel="full", dtype=ttnn.float32)
+        # (the float32 encoder's convs read C_in_block input channels per vol2col block: wider than the default 32)
+        _conv3d_utils.FP32_C_IN_BLOCK = ENCODER_C_IN_BLOCK
+        try:
+            self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel="full", dtype=ttnn.float32)
+        finally:
+            _conv3d_utils.FP32_C_IN_BLOCK = None
         self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel="full")
         _block_fp32_convs(self.encoder.encoder)
         _block_fp32_convs(self.decoder.decoder)

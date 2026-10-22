@@ -530,6 +530,10 @@ _DEFAULT_BLOCKINGS = {
 
 # fp32 conv3d blockings (separate table; 2× L1 vs bf16).
 # Key: (in_channels, out_channels, kernel_size). Value: (C_in, C_out, T_out, 1, 1).
+# Optional C_in_block for float32 convs with no _FP32_BLOCKINGS entry, by in_channels (None / missing: the conservative
+# 32). A model that wants it sets it around building its convs (the prepared weights depend on it).
+FP32_C_IN_BLOCK = None
+
 _FP32_BLOCKINGS: dict = {
     # ups inner-conv
     (1536, 768, (11, 1, 1)): (128, 128, 32, 1, 1),  # ups[0]
@@ -641,6 +645,9 @@ def get_conv3d_config(
         else:
             # Conservative default — unchanged from the prior hardcoded fp32 path.
             C_in_block, C_out_block, T_out_block, H_out_block, W_out_block = 32, 32, 1, 1, 1
+            c_in = (FP32_C_IN_BLOCK or {}).get(in_channels)
+            if c_in and in_channels % c_in == 0:
+                C_in_block = c_in
         return ttnn.Conv3dConfig(
             weights_dtype=weights_dtype,
             output_layout=ttnn.ROW_MAJOR_LAYOUT,
