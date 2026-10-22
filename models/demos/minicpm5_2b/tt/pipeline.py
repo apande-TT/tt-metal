@@ -516,12 +516,15 @@ class MiniCPM5Pipeline:
         rows = attention_stub._USE_QKV_ROPE and B == 32
         # rows: cos / sin as one tile row (row b = batch b) for the rope on the QKV layout, the only rope decode runs.
         table = rows and _ROPE_TABLE
+        # The attention's L1 constants copy rides in the rope gather's program (one launch for both).
+        consts = self._attn_consts_parts() if (table and _MASK_TABLE) else None
         cos_sin = self.rotary_embedding(
             x,
             position_ids=self.pos_buf,
             rows=rows,
             table_pos=self.pos_i32 if table else None,
             memory_config=ttnn.L1_MEMORY_CONFIG,
+            extra=consts[:3] if consts else None,
         )
         cur_pos = self.pos_rm  # [B] int32, one contiguous page (pos_i32 row-major, kept in step by _pos_step)
         # [B, 1, 1, 1] positions: only the non-kernel KV write and the non-table masks read them.
@@ -541,7 +544,7 @@ class MiniCPM5Pipeline:
         sums_l1 = None
         if rows and _MASK_TABLE:
             # Both per-step L1 constant copies (mask table + sum scalers) as one program.
-            mask_full, sums_l1 = self._attn_consts_l1()
+            mask_full, sums_l1 = consts[3] if consts else self._attn_consts_l1()
         elif rows:
             mask_full = ttnn.typecast(
                 ttnn.multiply(ttnn.gt(self.key_index_full, pos), _NEG), ttnn.bfloat16, memory_config=l1
@@ -591,9 +594,10 @@ class MiniCPM5Pipeline:
         self._pos_step()
         return logits
 
-    def _attn_consts_l1(self, n_cores=32):
+    def _attn_consts_parts(self, n_cores=32):
         """L1 copies of the mask table and the sum-scaler replicas (read on the fused attention's critical path)
-        by one data-movement generic_op (kernels/l1_consts) instead of two ttnn copies."""
+        by one data-movement kernel (kernels/l1_consts) on the first n_cores of the grid (row-major) instead of two
+        ttnn copies: (kernel, cbs, io tensors, [mask_l1, sums_l1]) for a program to run it in."""
         srcs = (self.mask_table, self.sum_scalers)
         dsts = [
             ttnn.allocate_tensor_on_device(t.shape, t.dtype, ttnn.TILE_LAYOUT, self.device, ttnn.L1_MEMORY_CONFIG)
@@ -637,8 +641,13 @@ class MiniCPM5Pipeline:
                 total_size=buf, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(0, ttnn.bfloat16, buf)]
             )
         ]
+        return reader, cbs, list(srcs) + dsts, dsts
+
+    def _attn_consts_l1(self, n_cores=32):
+        """The constants copy as its own program."""
+        reader, cbs, tensors, dsts = self._attn_consts_parts(n_cores)
         program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
-        ttnn.generic_op(list(srcs) + dsts, program)
+        ttnn.generic_op(tensors, program)
         return dsts[0], dsts[1]
 
     def _pos_step(self):

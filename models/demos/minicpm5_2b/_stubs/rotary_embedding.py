@@ -16,6 +16,7 @@ import ttnn
 
 _ROPE_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "rope_table")
 _GATHER_CORES = 4  # batch rows split over this many cores (fewer cores: less per-program launch cost in trace)
+_GATHER_ROW = 3  # grid row of the gather cores (rows above it are free for an extra kernel sharing the program)
 
 
 class TtRotaryEmbedding:
@@ -54,7 +55,7 @@ class TtRotaryEmbedding:
             sin = ttnn.multiply(sin, self.scaling)
         return ttnn.typecast(cos, ttnn.bfloat16), ttnn.typecast(sin, ttnn.bfloat16)
 
-    def _gather_rows(self, pos_i32, memory_config):
+    def _gather_rows(self, pos_i32, memory_config, extra=None):
         """(cos, signed sin) rows [1, 1, B, D] for the int32 [1, B] positions, gathered from the tables by one
         data-movement generic_op (kernels/rope_table)."""
         table = self.rows_table
@@ -68,10 +69,11 @@ class TtRotaryEmbedding:
             for _ in range(2)
         ]
         users = b // _GATHER_CORES
-        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_GATHER_CORES - 1, 0))])
+        y = _GATHER_ROW
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, y), ttnn.CoreCoord(_GATHER_CORES - 1, y))])
         rt = ttnn.RuntimeArgs()
         for i in range(_GATHER_CORES):
-            rt[i][0] = [i * users]
+            rt[i][y] = [i * users]
         reader = ttnn.KernelDescriptor(
             kernel_source=os.path.join(_ROPE_TABLE_DIR, "gather_rows.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -96,17 +98,26 @@ class TtRotaryEmbedding:
                 format_descriptors=[ttnn.CBFormatDescriptor(1, ttnn.bfloat16, users * 4 * self.head_dim + 64)],
             ),
         ]
-        program = ttnn.ProgramDescriptor(kernels=[reader], semaphores=[], cbs=cbs)
-        ttnn.generic_op([pos_i32, table] + outs, program)
+        kernels, io = [reader], [pos_i32, table]
+        if extra is not None:
+            # Another data-movement kernel (on cores of rows above _GATHER_ROW) sharing this program's launch.
+            x_kernel, x_cbs, x_tensors = extra
+            kernels.append(x_kernel)
+            cbs += x_cbs
+            io += x_tensors
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        ttnn.generic_op(io + outs, program)
         return outs[0], outs[1]
 
-    def __call__(self, x, position_ids=None, *args, rows=False, table_pos=None, memory_config=None, **kwargs):
+    def __call__(
+        self, x, position_ids=None, *args, rows=False, table_pos=None, memory_config=None, extra=None, **kwargs
+    ):
         """rows: one position per batch row (s = 1), returned as [1, 1, B, head_dim] (row b = batch b, one tile
         row) instead of [B, 1, head_dim]; the same elementwise arithmetic on the same values.
         table_pos (rows only, with build_rows_table done): the int32 [1, B] positions; returns (cos, rot_sign-signed
         sin) gathered from the tables in `memory_config` -- the values the rows path and its * rot_sign produce."""
         if rows and table_pos is not None and self.rows_table is not None:
-            return self._gather_rows(table_pos, memory_config or ttnn.DRAM_MEMORY_CONFIG)
+            return self._gather_rows(table_pos, memory_config or ttnn.DRAM_MEMORY_CONFIG, extra=extra)
         if position_ids is None:
             raise ValueError("TtRotaryEmbedding requires position_ids")
         if not isinstance(position_ids, ttnn.Tensor):
