@@ -33,14 +33,18 @@ DECODE_WEIGHT_DTYPE = ttnn.bfloat8_b
 # step streams); the other layers keep DECODE_WEIGHT_DTYPE.
 DECODE_GATE_UP_BF4_DTYPE = ttnn.bfloat4_b
 DECODE_GATE_UP_BF4_LAYERS = frozenset(range(5, 36))
-# Layers whose many-row (prefill) fused gate/up computes at LoFi instead of GATE_UP_FIDELITY (LoFi on every layer:
-# prefill 1173 -> 1006 ms but PCC 0.99334 < 0.995; layers 18-22: 1153 ms, PCC 0.995137; 16-24: 1134 ms, 0.995147;
-# 8-31: 1073 ms, PCC 0.99509 and 12-27: 1107 ms, PCC 0.995806 fail test_e2e_text_generation's token agreement).
-PREFILL_GATE_UP_LOFI_LAYERS = frozenset(range(14, 26))
-# The text layers' many-row (prefill) down projection at LoFi: it is FPU-bound (608 x 256 tile products a core on the
-# 416-row prompt), LoFi runs one fidelity phase instead of HiFi2's two -- trace prefill 1028 -> 937 ms; PCC 0.995097 ->
-# 0.995002 (threshold 0.995; layers 18-21 alone: 0.995039). The vision MLPs (subclasses) keep PREFILL_DOWN_FIDELITY.
-PREFILL_DOWN_LOFI = True
+# Layers whose many-row (prefill) fused gate/up computes at LoFi instead of GATE_UP_FIDELITY. None: LoFi on layers
+# 14-25 (optimize run 6, ~47 ms of trace prefill) tripled those layers' per-layer error (teacher-forced 1-PCC 1.1e-4 ->
+# 3e-4), and the image prompt's 64 image-token rows amplify every layer's error ~10x more than text rows do, so
+# test_e2e_image_text_to_text's prefill hidden PCC (floor 0.995) fell to 0.9922 with it. With HiFi2 gate/up on every
+# layer, the HiFi4 down and prefill SDPA and the HiFi2 vision gate/up it reads 0.995511 (text rows 0.9985, image rows
+# 0.9742); the LoFi layers kept on top of those 0.994102. Earlier text-only readings: LoFi on every layer 0.99334;
+# 18-22 0.995137; 16-24 0.995147; 8-31 0.99509; 12-27 0.995806 fail test_e2e_text_generation's token agreement.
+PREFILL_GATE_UP_LOFI_LAYERS = frozenset()
+# The text layers' many-row (prefill) down projection at LoFi (optimize run 7: trace prefill 1028 -> 937 ms, text PCC
+# 0.995097 -> 0.995002) halved the per-layer error budget the image-token rows cannot afford (see above): off, the down
+# computes at PREFILL_DOWN_FIDELITY (HiFi4). The vision MLPs (subclasses) keep their own PREFILL_DOWN_FIDELITY.
+PREFILL_DOWN_LOFI = False
 # K tiles per activation multicast block of the bf4 decode gate / up projections (divides K = 160 tiles).
 DECODE_GATE_UP_K_BLOCK = 8
 # Math fidelity of the bf4 decode gate / up and down (HiFi3 == HiFi4 bit for bit on a block-float4 weight, see __init__).
@@ -90,8 +94,11 @@ class TtMinistral3MLP:
     PREFILL_REDUCE_DTYPE = ttnn.bfloat16
     # dtype of the single-row (decode) down projection's partials and their reduce-scatter (None: OUT_DTYPE).
     DECODE_REDUCE_DTYPE = ttnn.bfloat16
-    # Math fidelity of the many-row (prefill) down projection (None: the HiFi4 compute_cfg decode uses too).
-    PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
+    # Math fidelity of the many-row (prefill) down projection (None: the HiFi4 compute_cfg decode uses too). HiFi4:
+    # with the HiFi2 gate/up, the HiFi4 prefill SDPA and the HiFi2 vision gate/up, test_e2e_image_text_to_text's
+    # prefill hidden PCC reads 0.995511 (floor 0.995); HiFi2 here 0.994830, HiFi3 0.994959 (not bit-exact with HiFi4
+    # on this block-float8 weight), LoFi (run 7) 0.9904. The vision MLPs (subclasses) override it.
+    PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi4
     # dtype of the down weight the many-row (prefill) path multiplies with.
     DOWN_DTYPE = ttnn.bfloat8_b
     # False: prefill returns the down projection's reduce-scattered 1/TP hidden shard (see the decoder layer).

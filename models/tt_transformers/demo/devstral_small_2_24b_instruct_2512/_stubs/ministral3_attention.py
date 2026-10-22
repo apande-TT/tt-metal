@@ -332,10 +332,14 @@ class TtMinistral3Attention:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
-        # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi2 matmuls, fp32 DEST kept.
+        # Prefill SDPA is bound by its per-tile work (QK^T, softmax, PV per q chunk): HiFi4 matmuls, fp32 DEST kept.
+        # HiFi2 (optimize run 2, ~12 ms of trace prefill) cost text logits PCC 0.998839 -> 0.997511 and, with the rest
+        # of the reduced-precision prefill, test_e2e_image_text_to_text's prefill hidden PCC (floor 0.995): its image-
+        # token rows amplify every layer's error ~10x more than text rows (0.995511 at HiFi4 vs 0.992736 at HiFi2 with
+        # the HiFi4 down, HiFi2 gate/up and HiFi2 vision gate/up; see ministral3_m_l_p PREFILL_GATE_UP_LOFI_LAYERS).
         self.prefill_sdpa_cfg = ttnn.init_device_compute_kernel_config(
             device.arch(),
-            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_fidelity=ttnn.MathFidelity.HiFi4,
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,

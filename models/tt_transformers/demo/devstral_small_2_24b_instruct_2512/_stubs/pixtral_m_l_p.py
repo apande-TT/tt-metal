@@ -23,7 +23,13 @@ class TtPixtralMLP(TtMinistral3MLP):
     # Block-float8 fused gate/up weight (the many-row SwiGLU). Not bf4: a bf4 SwiGLU weight attenuated the hidden
     # state around its massive activations in another model, and here it would save only 7.6 us a layer.
     GATE_UP_DTYPE = ttnn.bfloat8_b
-    GATE_UP_FIDELITY = ttnn.MathFidelity.LoFi
+    # HiFi2, not LoFi (optimize run 2): LoFi took the image features' PCC (tests/e2e, vs the fp32 HF vision tower) from
+    # 0.999906 to 0.999268 (norm ratio 1.0009), and the language model amplifies that input error ~60x on its image-
+    # token rows (test_e2e_image_text_to_text's prefill hidden PCC 0.9926 -> 0.9904 under a 0.995 floor). HiFi2 reads
+    # 0.999866 (ratio 1.00006); HiFi4 gate/up + HiFi4 down 0.999903 for twice the passes. A bf16 weight does not help:
+    # at LoFi 0.998266 with a 0.8% norm deficit, at HiFi4 0.999922 with a 0.1% deficit. The encoder stack alternates
+    # this class with mlp.TtMLP: both carry the same settings.
+    GATE_UP_FIDELITY = ttnn.MathFidelity.HiFi2
     PREFILL_REDUCE_DTYPE = None
     PREFILL_DOWN_FIDELITY = ttnn.MathFidelity.HiFi2
     DOWN_DTYPE = ttnn.bfloat16

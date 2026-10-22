@@ -128,9 +128,14 @@ PLANNED_TP = 4
 #                     matmul); layers 16-24 read a block-float4 down copy at HiFi3 (bf4 down everywhere: PCC 0.989).
 #                     Prefill MLP chunk 4096 -> 16384 rows (one call).
 #                     Prefill/encode down projection on minimal_matmul too (full grid); the text prefill down
-#                     computes at HiFi2 (fp32 accumulation) on a bfloat8_b weight.
-#                     Fused gate/up computes at HiFi2 (LoFi on layers 14-25) (fp32 accumulation), 8 x 8 x 12-tile blocks; the text
-#                     decoder's fused gate/up weight is bfloat8_b (the vision MLPs keep bf16).
+#                     computes at HiFi4 (fp32 accumulation) on a bfloat8_b weight (HiFi2, run 2, LoFi, run 7, and the
+#                     LoFi gate/up of layers 14-25, run 6, failed test_e2e_image_text_to_text: the image-token rows
+#                     amplify every layer's error ~10x more than text rows; HiFi3 is not bit-exact with HiFi4 on the
+#                     bf8 weight and fails too; see ministral3_m_l_p PREFILL_GATE_UP_LOFI_LAYERS).
+#                     Fused gate/up computes at HiFi2 (fp32 accumulation), 8 x 8 x 12-tile blocks; the text decoder's
+#                     and the vision MLPs' fused gate/up weights are bfloat8_b (the vision gate/up at HiFi2, not run 2's
+#                     LoFi, which took the image features' PCC 0.999906 -> 0.999268, an input error the language model
+#                     amplified ~60x on the image-token rows; the vision down stays at HiFi2).
 #   ministral3_model decode embedding: ONE program (tt/embed_decode.py) gathers each core's column slice of the token
 #                     rows, tilizes them to fp32 and writes the first layer's width-sharded residual directly (no
 #                     one-core tiled ttnn.embedding, typecast or reshard).
@@ -187,7 +192,7 @@ PLANNED_TP = 4
 #                     vision MLP's SwiGLU product reaches the down projection through L1, which runs 4-tile N blocks.
 #   ministral3_attention short-prompt QKV and o_proj: one output block per core (its whole M x N range, e.g. 12 x 5 tiles).
 #   ministral3_attention prefill SDPA: one key chunk of the prompt (even tiles), 160-row q chunks (7 even rounds), no pad,
-#                     HiFi2 matmuls.
+#                     HiFi4 matmuls (HiFi2, run 2, was part of the image e2e failure above).
 #   ministral3_attention prefill RoPE: runs on a (batch, heads) regrouping of the heads (an outer-dim view) that balances
 #                     rotary_embedding_llama's batch x sequence split over the grid (416 rows: 8 x 32, 128 rows: 256 x 1);
 #                     cos / sin / the pair-swap tile are height-sharded into L1 around each op (one sequence tile per
@@ -631,7 +636,8 @@ class VocabTopK:
             kern(
                 f"{_TOPK_KERNELS}/compute/topk_local.cpp",
                 self.local_set,
-                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, int(fused), int(fused)],
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX)
+                + [int(math.log2(wt_local)), 1, 1, int(fused), int(fused)],
                 [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
                 compute_cfg,
             ),
