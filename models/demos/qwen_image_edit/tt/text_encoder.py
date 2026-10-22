@@ -25,6 +25,7 @@ import ttnn
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
+from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
@@ -116,6 +117,8 @@ class TtQwenTextEncoder:
         _te_attention.BMM_SPLIT_M = True
         # as one product over the limbs concatenated along K ([ah | ah | al] @ [bh ; bl ; bh]), not three + two adds
         _te_attention.BMM_CONCAT_K = True
+        # and P @ V rather as one C++ limb_bmm program (limb_bmm.fused_limb_bmm, full grid) where it fits
+        _te_attention.LIMB_BMM_FN = lambda ah, al, bh, bl: fused_limb_bmm(ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG)
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # with their weight and activation limbs (vision qkv / proj / MLP: <= 4 MB per chip) staged in L1 once
