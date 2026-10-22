@@ -28,7 +28,7 @@ import ttnn
 from models.demos.minicpm5_2b._stubs.decode_mm import decode_linear_config
 from models.demos.minicpm5_2b._stubs.dram_mm import DramMatmul, _core_rects
 from models.demos.minicpm5_2b._stubs.mm_swiglu import mm_swiglu, mm_swiglu_supported
-from models.demos.minicpm5_2b._stubs.ttl_rope import ttl_rope_qkv, ttl_rope_supported
+from models.demos.minicpm5_2b._stubs.ttl_rope import _USE_CPP_TWIN, cpp_rope_qkv, ttl_rope_qkv, ttl_rope_supported
 
 # Decode KV-cache write as one C++ kernel via ttnn.generic_op (else: slot-read matmuls + sub/add + paged_update_cache).
 _USE_KV_WRITE_KERNEL = True
@@ -481,7 +481,8 @@ class TtAttention:
         as _rope_kernel's program with reader_rope_qkv.cpp: tile c (head c / Dt, column tile c % Dt) with the
         step's cos / signed sin tile c % Dt ([1, 1, B, D], row b = batch b) and its rotate-half partner tile."""
         if ttl_rope_supported(qkv, width):
-            return ttl_rope_qkv(self.device, qkv, cos_rows, sin_rows, width, self.head_dim // 32, memory_config)
+            rope = cpp_rope_qkv if _USE_CPP_TWIN else ttl_rope_qkv
+            return rope(self.device, qkv, cos_rows, sin_rows, width, self.head_dim // 32, memory_config)
         b = qkv.shape[-2]
         out = ttnn.allocate_tensor_on_device(ttnn.Shape([1, b, width]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config)
         n_tiles = width // 32
