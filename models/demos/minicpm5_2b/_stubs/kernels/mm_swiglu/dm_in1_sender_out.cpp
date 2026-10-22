@@ -220,6 +220,9 @@ void kernel_main() {
                         } else {
                             in1_receiver_semaphore.wait_min(c + 1);
                         }
+                        // Each chunk goes to compute as soon as it lands (row-streamed compute waits per chunk); the
+                        // forward below only reads it, and this core's CB space is not reused before the block ends.
+                        cb_in1.push_back(chunk_rows * N_block_tiles);
                         if (!is_sink_core) {
                             if (!downstream_ready) {
                                 in1_sender_semaphore.wait(1);
@@ -236,7 +239,6 @@ void kernel_main() {
                             in1_receiver_semaphore.up(noc, in1_dest_noc_x, in1_dest_noc_y, 1);
                         }
                     }
-                    cb_in1.push_back(in1_block_num_tiles);
                 }
 #else
                 uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;

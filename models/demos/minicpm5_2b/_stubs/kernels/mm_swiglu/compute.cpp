@@ -273,9 +273,10 @@ void matmul_blocks(
 
 #ifdef IN0_ROW_STREAM
 // Row streaming (IN0_ROW_STREAM: SwiGLU, and plain DIRECT_OUT with one K block): matmul_blocks with the in0 block
-// arriving / leaving one row slot at a time (the reader pushes every row of the M_block-row CB, padding rows unread). The first N block of an M block waits only for the rows its
-// next subblock row needs; the last N block pops each subblock row once done (then the padding rows), so the reader
-// loads the next M block's rows while this block's remaining rows and epilogue run. Same matmul calls per tile.
+// arriving / leaving one row slot at a time (the reader pushes every row of the M_block-row CB, padding rows unread).
+// The first N block of an M block waits only for the rows its next subblock row needs; the last N block pops each
+// subblock row once done (then the padding rows), so the reader loads the next M block's rows while this block's
+// remaining rows and epilogue run. Same matmul calls per tile.
 void matmul_blocks_rows(
     const uint32_t in0_cb,
     const uint32_t in1_cb,
@@ -290,9 +291,15 @@ void matmul_blocks_rows(
     const uint32_t subblock_h,
     const uint32_t subblock_w) {
     CircularBuffer cb_in0(in0_cb);
+    CircularBuffer cb_in1(in1_cb);
+    // in1 arrives in IN1_CHUNK_K-row chunks (the reader pushes each as it lands): the first subblock row waits per
+    // chunk, so the block's matmul starts on its first chunk.
+    constexpr uint32_t in1_chunk_k = IN1_CHUNK_K;
+    const uint32_t in1_chunk_tiles = in1_chunk_k * full_N_block_tiles;
     uint32_t in0_index_offset = 0;
     for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
         const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
+        const bool wait_in1 = M_start == 0;
         if (wait_rows) {
             cb_in0.wait_front((pop_rows ? sh : M_start + sh) * K_block_tiles);
         }
@@ -305,6 +312,9 @@ void matmul_blocks_rows(
             uint32_t in0_index = in0_index_offset;
             uint32_t in1_index = in1_index_offset;
             for (uint32_t inner_dim = 0; inner_dim < K_block_tiles; inner_dim++) {
+                if (wait_in1 && N_start == 0 && inner_dim % in1_chunk_k == 0) {
+                    cb_in1.wait_front((inner_dim / in1_chunk_k + 1) * in1_chunk_tiles);
+                }
                 matmul_block(in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, sh, K_block_tiles);
                 in0_index++;
                 in1_index += full_N_block_tiles;
@@ -537,7 +547,6 @@ void kernel_main() {
             matmul_block_init(
                 in0_cb, in1_cb, false /*transpose*/, current_subblock_w, current_subblock_h, K_block_tiles);
 #ifdef IN0_ROW_STREAM
-            cb_in1.wait_front(in1_block_num_tiles);
             cb_out.reserve_back(out_block_num_tiles);
             matmul_blocks_rows(
                 in0_cb,
@@ -591,8 +600,7 @@ void kernel_main() {
             cb_intermediate.reserve_back(out_block_num_tiles);
             for (uint32_t k_block = 0; k_block < K_num_blocks; k_block++) {
 #ifdef IN0_ROW_STREAM
-                // Full K in one block (host-asserted): in0 rows stream in / out of the CB around this call.
-                cb_in1.wait_front(in1_block_num_tiles);
+                // Full K in one block (host-asserted): in0 rows / in1 chunks stream in / out of the CBs in this call.
                 matmul_blocks_rows(
                     in0_cb,
                     in1_cb,
