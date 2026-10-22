@@ -300,6 +300,13 @@ void matmul_blocks_rows(
     for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
         const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
         const bool wait_in1 = M_start == 0;
+#ifdef IN1_CHUNK_POP
+        // The in1 CB holds one block: the last subblock row pops each chunk once done, so the reader streams the next
+        // block's chunks into the freed space (needs one N subblock per block: host-asserted).
+        const bool pop_in1 = M_start + sh >= M_block_tiles;
+#else
+        constexpr bool pop_in1 = false;
+#endif
         if (wait_rows) {
             cb_in0.wait_front((pop_rows ? sh : M_start + sh) * K_block_tiles);
         }
@@ -313,11 +320,16 @@ void matmul_blocks_rows(
             uint32_t in1_index = in1_index_offset;
             for (uint32_t inner_dim = 0; inner_dim < K_block_tiles; inner_dim++) {
                 if (wait_in1 && N_start == 0 && inner_dim % in1_chunk_k == 0) {
-                    cb_in1.wait_front((inner_dim / in1_chunk_k + 1) * in1_chunk_tiles);
+                    // After pops (a block of one subblock row) the chunk is the only one left at the read pointer.
+                    cb_in1.wait_front((pop_in1 ? 1 : inner_dim / in1_chunk_k + 1) * in1_chunk_tiles);
                 }
                 matmul_block(in0_cb, in1_cb, in0_index, in1_index, 0, false /*transpose*/, subblock_w, sh, K_block_tiles);
                 in0_index++;
                 in1_index += full_N_block_tiles;
+                if (pop_in1 && (inner_dim + 1) % in1_chunk_k == 0) {
+                    cb_in1.pop_front(in1_chunk_tiles);
+                    in1_index -= in1_chunk_tiles;
+                }
             }
             tile_regs_commit();
             tile_regs_wait();
@@ -562,7 +574,9 @@ void kernel_main() {
                 current_subblock_h,
                 current_subblock_w);
             cb_out.push_back(out_block_num_tiles);
+#ifndef IN1_CHUNK_POP
             cb_in1.pop_front(in1_block_num_tiles);
+#endif
             continue;
 #endif
             cb_in0.wait_front(in0_block_num_tiles);

@@ -104,6 +104,10 @@ void kernel_main() {
     constexpr uint32_t full_N_tiles_bytes = N_block_tiles * in1_tile_size;
 
     bool k_forward = true;
+#ifdef IN1_CHUNK_POP
+    uint32_t in1_chunks_received = 0;
+    uint32_t in1_chunks_sent = 0;
+#endif
 
     uint32_t defer_write_m_tile = 0;
     uint32_t defer_write_m_tile_end = 0;
@@ -183,7 +187,54 @@ void kernel_main() {
                     }
                 }
 
-#ifdef CHUNK_FWD
+#ifdef IN1_CHUNK_POP
+                {
+                    // IN1_CHUNK_POP: the in1 CB holds ONE block and the compute frees it chunk by chunk, so each chunk is
+                    // reserved, filled and forwarded on its own: the next core signals readiness per chunk (after its
+                    // own reserve) and is told of data per chunk. Both semaphores count cumulatively (never reset).
+                    const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
+                    constexpr uint32_t chunk_rows = IN1_CHUNK_K;
+                    constexpr uint32_t n_chunks = K_block_tiles / chunk_rows;
+                    constexpr uint32_t chunk_tiles = chunk_rows * N_block_tiles;
+                    for (uint32_t c = 0; c < n_chunks; c++) {
+                        cb_in1.reserve_back(chunk_tiles);
+                        const uint32_t chunk_addr = cb_in1.get_write_ptr();
+                        if constexpr (is_injector_core) {
+                            uint32_t addr = chunk_addr;
+                            for (uint32_t r = 0; r < chunk_rows; r++) {
+                                const uint32_t k = k_block * K_block_tiles + c * chunk_rows + r;
+                                for (uint32_t n = n_tile; n < n_tile + N_block_tiles; n++) {
+                                    if (n < in1_shape.logical_d1) {
+                                        noc.async_read(
+                                            in1_reader,
+                                            CoreLocalMem<uint32_t>(addr),
+                                            in1_tile_size,
+                                            {.page_id = k * in1_shape.logical_d1 + n},
+                                            {});
+                                    }
+                                    addr += in1_tile_size;
+                                }
+                            }
+                            noc.async_read_barrier();
+                        } else {
+                            in1_sender_semaphore.up(noc, in1_sender_noc_x, in1_sender_noc_y, 1);
+                            in1_receiver_semaphore.wait_min(++in1_chunks_received);
+                        }
+                        cb_in1.push_back(chunk_tiles);
+                        if (!is_sink_core) {
+                            in1_sender_semaphore.wait_min(++in1_chunks_sent);
+                            noc.async_write(
+                                CoreLocalMem<uint32_t>(chunk_addr),
+                                UnicastEndpoint{},
+                                chunk_tiles * in1_tile_size,
+                                {},
+                                {.noc_x = in1_dest_noc_x, .noc_y = in1_dest_noc_y, .addr = chunk_addr});
+                            noc.async_writes_flushed();
+                            in1_receiver_semaphore.up(noc, in1_dest_noc_x, in1_dest_noc_y, 1);
+                        }
+                    }
+                }
+#elif defined(CHUNK_FWD)
                 {
                     // CHUNK_FWD: the in1 block moves down the column's forwarding chain in IN1_CHUNK_K-row chunks
                     // (K_block x N_block row-major, so a chunk is contiguous), each forwarded as soon as it lands and

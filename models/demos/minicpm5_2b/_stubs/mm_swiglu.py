@@ -142,7 +142,8 @@ def mm_swiglu(
     orientation (None = the factory's M > N rule). blocks: plain mode (M_block, N_block, K_block) -- K_block < K
     selects KSPLIT: fp32 partials between K blocks in an UnpackToDestFp32 CB (exact reload), which needs one N block
     per core (K order stays ascending). row_stream_m_block: plain mode with one K block, in M blocks of this many rows
-    held in a single in0 CB that streams one row at a time (fewer weight passes; as SwiGLU)."""
+    held in a single in0 CB that streams one row at a time (fewer weight passes; as SwiGLU), with a single-block in1
+    CB freed chunk by chunk."""
     grid = device.compute_with_storage_grid_size()
     assert mm_swiglu_supported(
         x, w_il, grid, fuse_swiglu, k_block=blocks[2] if blocks is not None else None
@@ -214,6 +215,12 @@ def mm_swiglu(
         # KSPLIT: in0 moves in subblock-row strips, two strips double-buffered (frees L1 for a deeper K block).
         in0_cb_num_tiles = 2 * subblock_h * K_block
     in1_cb_num_tiles = 2 * in1_block_num_tiles
+    # Plain row streaming: the in1 CB holds ONE block, freed chunk by chunk by the compute's last subblock row
+    # (IN1_CHUNK_POP), which leaves L1 for a taller in0 block.
+    in1_chunk_pop = row_stream_m_block is not None
+    if in1_chunk_pop:
+        assert N_block == subblock_w and K_block % _in1_chunk(K_block) == 0
+        in1_cb_num_tiles = in1_block_num_tiles
     # SwiGLU: half a block, double buffered; plain: a block, double buffered.
     out_cb_num_tiles = 2 * (out_block_num_tiles // 2) if fuse_swiglu else 2 * out_block_num_tiles
     if not fuse_swiglu and K_blocks > 1:
@@ -281,6 +288,8 @@ def mm_swiglu(
         # in0 streams through its M_block-row CB one row at a time (compute.cpp matmul_blocks_rows).
         assert K_blocks == 1
         defines += [("IN0_STRIP_ROWS", "1"), ("IN0_ROW_STREAM", "1")]
+    if in1_chunk_pop:
+        defines += [("IN1_CHUNK_POP", "1")]
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0
     shape_ct = [
