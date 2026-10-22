@@ -157,11 +157,16 @@ void swiglu_block_exact(
     uint32_t N_block_tiles) {
     CircularBuffer cb_scratch(scratch_cb);
     CircularBuffer cb_out(out_cb);
-    const uint32_t block_tiles = valid_M_tiles * N_block_tiles;
+    // The scratch CB holds exactly one full block: it always moves in whole blocks (padding rows pushed unwritten),
+    // so a block of valid rows never wraps around its end.
+    const uint32_t block_tiles = M_block_tiles * N_block_tiles;
 
     // Step 1: G / U tiles through the reference output stage, into the bf16 scratch CB.
     cb_scratch.reserve_back(block_tiles);
     copy_and_pack_block(in_cb, scratch_cb, valid_M_tiles, N_block_tiles);
+    if (valid_M_tiles < M_block_tiles) {
+        cb_scratch.push_back((M_block_tiles - valid_M_tiles) * N_block_tiles);
+    }
     cb_scratch.wait_front(block_tiles);
 
     // Step 2: silu16(G) * U per pair.
@@ -215,6 +220,11 @@ void matmul_blocks(
     uint32_t in0_index_offset = 0;
 
     for (uint32_t M_start = 0; M_start < M_block_tiles; M_start += subblock_h) {
+        // An odd M block ends in a 1-row subblock row (same per-tile arithmetic, only the tile grouping differs).
+        const uint32_t sh = std::min(subblock_h, M_block_tiles - M_start);
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, sh, K_block_tiles);
+        }
         uint32_t in1_index_offset = 0;
         for (uint32_t N_start = 0; N_start < N_block_tiles; N_start += subblock_w) {
             tile_regs_acquire();
@@ -232,7 +242,7 @@ void matmul_blocks(
                     dst_index,
                     false /*transpose*/,
                     subblock_w,
-                    subblock_h,
+                    sh,
                     K_block_tiles);
                 in0_index++;
                 in1_index += full_N_block_tiles;
@@ -240,7 +250,7 @@ void matmul_blocks(
             tile_regs_commit();
             tile_regs_wait();
             uint32_t write_dst_index = 0;
-            for (uint32_t h = 0; h < subblock_h; h++) {
+            for (uint32_t h = 0; h < sh; h++) {
                 uint32_t h_tile_id = M_start + h;
                 for (uint32_t w = 0; w < subblock_w; w++) {
                     uint32_t w_tile_id = N_start + w;
@@ -254,7 +264,10 @@ void matmul_blocks(
 
             in1_index_offset += subblock_w;
         }
-        in0_index_offset += subblock_h * K_block_tiles;
+        if (sh != subblock_h) {
+            matmul_block_init(in0_cb, in1_cb, false /*transpose*/, subblock_w, subblock_h, K_block_tiles);
+        }
+        in0_index_offset += sh * K_block_tiles;
     }
 }
 

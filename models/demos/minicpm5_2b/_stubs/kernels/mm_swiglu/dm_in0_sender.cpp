@@ -133,7 +133,7 @@ void kernel_main() {
             bool is_last_block = (m_block_iter == M_blocks_per_core - 1) && (n_block_iter == (N_blocks_per_core - 1));
 
             for (uint32_t k_block_iter = 0; k_block_iter < K_num_blocks; k_block_iter++) {
-#ifndef DIRECT_OUT
+#ifndef CHUNK_FWD
                 if (defer_write && k_block_iter == defer_write_k_block) {
                     if constexpr (is_output_writer) {
 #ifdef FUSE_SWIGLU
@@ -193,19 +193,19 @@ void kernel_main() {
                     }
                 }
 
-#endif  // !DIRECT_OUT
+#endif  // !CHUNK_FWD
                 if (reuse_block && k_block_iter == 0) {
                     // We strided an N block and this is the first k block, so we get reuse and do not need to read in0
                     reuse_block = false;
-#ifdef DIRECT_OUT
+#ifdef CHUNK_FWD
                     goto deferred_write;
 #else
                     continue;
 #endif
                 }
-#ifdef DIRECT_OUT
+#ifdef CHUNK_FWD
                 {
-                    // DIRECT_OUT: the in0 block moves down the row's forwarding chain in IN0_CHUNK_TILES-tile chunks
+                    // CHUNK_FWD (DIRECT_OUT and SwiGLU): the in0 block moves down the row's forwarding chain in IN0_CHUNK_TILES-tile chunks
                     // (row-major within the block), each forwarded as soon as it lands and counted on the next
                     // core's receiver semaphore, instead of store-and-forward of the whole block per hop.
                     const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
@@ -318,9 +318,9 @@ void kernel_main() {
                     in0_valid_semaphore.relay_unicast(noc, in0_receiver_semaphore, in0_dest_noc_x, in0_dest_noc_y);
                 }
                 }
-#endif  // DIRECT_OUT
-#ifdef DIRECT_OUT
-            // DIRECT_OUT: the previous block's deferred output write comes AFTER this block's in0 read / forward, so
+#endif  // CHUNK_FWD
+#ifdef CHUNK_FWD
+            // CHUNK_FWD: the previous block's deferred output write comes AFTER this block's in0 read / forward, so
             // a new M block's in0 streams in while compute is still finishing the previous block (writing first
             // blocked the read -- and the row's forwarding chain behind it -- on that block's compute).
             deferred_write:
@@ -383,7 +383,7 @@ void kernel_main() {
                     }
                 }
 
-#endif  // DIRECT_OUT
+#endif  // CHUNK_FWD
             }
 
             k_forward = !k_forward;
@@ -399,7 +399,7 @@ void kernel_main() {
              * of the next output block.
              */
             defer_write = !is_last_block;
-#ifndef DIRECT_OUT
+#ifndef CHUNK_FWD
             defer_write = defer_write && !is_injector_core;
 #endif
 

@@ -30,9 +30,9 @@ _TILE = 32
 # Block config of the reference prefill minimal_matmul (mlp.py _mm): K block = all of K.
 _M_BLOCK = 2
 _N_BLOCK = 2
-# SwiGLU: 4-row M blocks with in0 single-buffered (reused across all N blocks of an M block): the weight is re-read
-# 4x per core instead of 7x.
-_SWIGLU_M_BLOCK = 4
+# SwiGLU: 5-row M blocks with in0 single-buffered (reused across all N blocks of an M block): a core's 13 rows are
+# 5 + 5 + 3, so the weight is re-read 3x per core (4-row blocks: 4 + 4 + 4 + 1 = 4x, the last pass for one row).
+_SWIGLU_M_BLOCK = 5
 _SUBBLOCK_H = 2
 _SUBBLOCK_W = 2
 
@@ -196,8 +196,8 @@ def mm_swiglu(
     else:
         assert K_blocks == 1 or N_blocks_per_core == 1, "KSPLIT needs one N block per core (ascending K order)"
         assert K_block % _in0_chunk(K_block) == 0
-    # KSPLIT's compute handles an odd M block (a 1-row last subblock row); the other modes need whole subblocks.
-    assert (M_block % subblock_h == 0 or K_blocks > 1) and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
+    # KSPLIT / SwiGLU compute handles an odd M block (a 1-row last subblock row); plain needs whole subblocks.
+    assert (M_block % subblock_h == 0 or K_blocks > 1 or fuse_swiglu) and N_block % subblock_w == 0 and subblock_h * subblock_w <= 4
 
     in0_block_num_tiles = M_block * K_block
     in1_block_num_tiles = K_block * N_block
@@ -259,16 +259,17 @@ def mm_swiglu(
             cb(_CB_SCRATCH, out_block_num_tiles, ttnn.bfloat16, out_tile_size),  # mm_swiglu epilogue: G / U tiles
         ]
 
-    # DIRECT_OUT: in0 forwarded down the chain in 16-tile chunks (dm_in0_sender.cpp).
-    defines = (
+    # CHUNK_FWD (both modes): in0 / in1 forwarded down their chains in chunks, the in0 read ahead of the deferred
+    # output write (dm_in0_sender.cpp, dm_in1_sender_out.cpp).
+    chunk_fwd = [
+        ("CHUNK_FWD", "1"),
+        ("IN0_CHUNK_TILES", str(_in0_chunk(K_block))),
+        ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
+    ]
+    defines = chunk_fwd + (
         [("FUSE_SWIGLU", "1")]
         if fuse_swiglu
-        else [
-            ("DIRECT_OUT", "1"),
-            ("IN0_CHUNK_TILES", str(_in0_chunk(K_block))),
-            ("IN1_CHUNK_K", str(_in1_chunk(K_block))),
-        ]
-        + ([("KSPLIT", "1"), ("IN0_STRIP_ROWS", str(subblock_h))] if K_blocks > 1 else [])
+        else [("DIRECT_OUT", "1")] + ([("KSPLIT", "1"), ("IN0_STRIP_ROWS", str(subblock_h))] if K_blocks > 1 else [])
     )
     in0_is_output_writer = 0 if transpose else 1
     in1_is_output_writer = 1 if transpose else 0

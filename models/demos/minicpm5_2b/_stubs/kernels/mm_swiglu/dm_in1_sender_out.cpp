@@ -183,9 +183,9 @@ void kernel_main() {
                     }
                 }
 
-#ifdef DIRECT_OUT
+#ifdef CHUNK_FWD
                 {
-                    // DIRECT_OUT: the in1 block moves down the column's forwarding chain in IN1_CHUNK_K-row chunks
+                    // CHUNK_FWD: the in1 block moves down the column's forwarding chain in IN1_CHUNK_K-row chunks
                     // (K_block x N_block row-major, so a chunk is contiguous), each forwarded as soon as it lands and
                     // counted on the next core's receiver semaphore, instead of store-and-forward of the whole block.
                     const uint32_t k_block = k_forward ? k_block_iter : (K_num_blocks - 1) - k_block_iter;
@@ -288,7 +288,7 @@ void kernel_main() {
 
                     in1_valid_semaphore.relay_unicast(noc, in1_receiver_semaphore, in1_dest_noc_x, in1_dest_noc_y);
                 }
-#endif  // DIRECT_OUT
+#endif  // CHUNK_FWD
             }
 
             k_forward = !k_forward;

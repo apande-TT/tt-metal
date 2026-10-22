@@ -158,7 +158,11 @@ class TtMlp:
             if bound and dmm.accepts(x) and prenorm._kernel_ok(x):
                 fused_norm = dmm
             else:
-                x = prenorm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
+                # Prefill: the norm output goes to DRAM, so mm_swiglu's 5-row in0 blocks fit beside the L1 residual.
+                rows = 1
+                for d in tuple(x.shape)[:-1]:
+                    rows *= d
+                x = prenorm(x, memory_config=ttnn.DRAM_MEMORY_CONFIG if rows > 32 else ttnn.L1_MEMORY_CONFIG)
         in_shape = tuple(x.shape)
         if len(in_shape) != 4:
             # Fold every leading dim (batch included) into the matmul's M rows.
