@@ -53,6 +53,8 @@ MLP_FUSED_SILU = False
 # the LM attention softmax's row-sized intermediates (scores - max, exp) kept in L1 when the scores take at most
 # this many bytes (0: in DRAM)
 SOFTMAX_L1_BYTES = 0
+# the LM attention softmax's exp applied as the scores - max subtract's output activation (one op, no exp round trip)
+SOFTMAX_FUSED_EXP = False
 
 
 def _t(lin):
@@ -240,7 +242,10 @@ class TtTextAttention:
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         nbytes = scores.volume() * (4 if scores.dtype == ttnn.float32 else 2)
         sm = ttnn.L1_MEMORY_CONFIG if SOFTMAX_L1_BYTES and nbytes <= SOFTMAX_L1_BYTES else None
-        e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=sm), memory_config=sm)
+        if SOFTMAX_FUSED_EXP:
+            e = ttnn.subtract(scores, mx, activations=[ttnn.UnaryOpType.EXP], memory_config=sm)
+        else:
+            e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=sm), memory_config=sm)
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
