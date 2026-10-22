@@ -114,12 +114,15 @@ void kernel_main() {
         cb_push_back(cb_q, Kt);
         const uint32_t s_t = t % Ct;
 #ifdef CAUSAL_SKIP
-        // Key tiles past the query tile's diagonal are fully masked (causal): compute skips them.
+        // Key tiles past the query tile's diagonal are fully masked (causal): compute skips them. Tiles before it are
+        // fully unmasked (all-zero mask tiles): compute skips their mask add, so only the diagonal tile is read.
         const uint32_t live = s_t + 1;
+        const uint32_t first_mask = s_t;
 #else
         const uint32_t live = Ct;
+        const uint32_t first_mask = 0;
 #endif
-        for (uint32_t n = 0; n < live; ++n) {
+        for (uint32_t n = first_mask; n < live; ++n) {
             cb_reserve_back(cb_mask, 1);
             noc_async_read_page(s_t * Ct + n, mask, get_write_ptr(cb_mask));
             noc_async_read_barrier();
