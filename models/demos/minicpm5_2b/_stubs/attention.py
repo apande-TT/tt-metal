@@ -71,7 +71,7 @@ _O_DMM = dict(block_tiles=8, ep_tpc=4, read_depth=4)
 _INLINE_KV_WRITE = True
 # Prefill fused attention skips the key tiles past each query tile's diagonal (fully masked by the causal mask:
 # exact zeros in the softmax sum and in probs @ V, never the row max), 2.5 of 4 key tiles on average at S = 128.
-_PREFILL_CAUSAL_SKIP = True
+_PREFILL_CAUSAL_SKIP = False
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
@@ -196,8 +196,12 @@ class TtAttention:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         # Decode (one tile row) projections: 1-D multicast with a wide K block (bit-identical to the default).
-        self.cfg_qkv = decode_linear_config(device, self.wqkv.shape[-2], self.wqkv.shape[-1], per_core_n=2)  # 80 tiles on 40 cores
-        self.cfg_o = decode_linear_config(device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2)  # 64 tiles on 32 cores
+        self.cfg_qkv = decode_linear_config(
+            device, self.wqkv.shape[-2], self.wqkv.shape[-1], per_core_n=2
+        )  # 80 tiles on 40 cores
+        self.cfg_o = decode_linear_config(
+            device, self.wo.shape[-2], self.wo.shape[-1], per_core_n=2
+        )  # 64 tiles on 32 cores
         # The same decode projections on the DRAM-bank-local generic_op (same arithmetic as the 1-D multicast).
         self.dmm_qkv = self.dmm_o = self.dmm_o_res = None
         if _USE_DRAM_MM:
@@ -263,7 +267,10 @@ class TtAttention:
                 # output tile is the same full-K accumulation as in the fused-QKV matmul, on all 110 cores.
                 q_lin = self._prefill_proj(x2, self.wq, l1 if rope_kernel else dram, 8, 3)
                 kv_lin = ttnn.linear(
-                    x2, self.wkv, memory_config=l1 if rope_kernel else dram, compute_kernel_config=self.compute_cfg,
+                    x2,
+                    self.wkv,
+                    memory_config=l1 if rope_kernel else dram,
+                    compute_kernel_config=self.compute_cfg,
                     program_config=self._prefill_2d_cfg(x2, self.wkv, 8, 2),
                 )
             else:
@@ -377,7 +384,11 @@ class TtAttention:
                 qkv = self.dmm_qkv(x, l1)
             else:
                 qkv = ttnn.linear(
-                    x, self.wqkv_dec, compute_kernel_config=self.compute_cfg, program_config=self.cfg_qkv, memory_config=l1
+                    x,
+                    self.wqkv_dec,
+                    compute_kernel_config=self.compute_cfg,
+                    program_config=self.cfg_qkv,
+                    memory_config=l1,
                 )
             nq, nkv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
             g, d = self.kv_groups, self.head_dim
@@ -427,9 +438,7 @@ class TtAttention:
                         compute_kernel_config=self.compute_cfg,
                     )
                     new_kv = ttnn.add(old, ttnn.subtract(new_kv, old))
-                    new_kv = ttnn.to_memory_config(
-                        ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard
-                    )
+                    new_kv = ttnn.to_memory_config(ttnn.reshape(new_kv, (1, b, self.n_kv_heads, self.head_dim)), shard)
                     ttnn.experimental.paged_update_cache(cache, new_kv, update_idxs_tensor=ctx.cur_pos)
             if fused_attn:
                 attn = self._attn_fused(qk, kv_cache, ctx, l1)
@@ -491,7 +500,9 @@ class TtAttention:
             rope = cpp_rope_qkv if _USE_CPP_TWIN else ttl_rope_qkv
             return rope(self.device, qkv, cos_rows, sin_rows, width, self.head_dim // 32, memory_config)
         b = qkv.shape[-2]
-        out = ttnn.allocate_tensor_on_device(ttnn.Shape([1, b, width]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config)
+        out = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, b, width]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device, memory_config
+        )
         n_tiles = width // 32
         cores, rt = self._spread(n_tiles)
         tile = 2 * 32 * 32
@@ -760,7 +771,18 @@ class TtAttention:
             kernel_source=os.path.join(_ATTN_BMM_DIR, "compute_attn_bmm.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[k_t, int(transpose_b), cb_in0, cb_in1, cb_out, int(fuse), cb_scale, cb_mask, cb_t, cb_t2],
+            compile_time_args=[
+                k_t,
+                int(transpose_b),
+                cb_in0,
+                cb_in1,
+                cb_out,
+                int(fuse),
+                cb_scale,
+                cb_mask,
+                cb_t,
+                cb_t2,
+            ],
             runtime_args=rt["cmp"],
             config=compute_cfg,
         )
@@ -772,8 +794,13 @@ class TtAttention:
         """Fuse `norm` (the layer's input RMSNorm, HiFi4 like the QKV projection) into the decode QKV program."""
         if _USE_DRAM_MM_NORM and self.dmm_qkv is not None and self.dmm_qkv.ok and hasattr(norm, "consts"):
             dmm = DramMatmul(
-                self.device, None, ttnn.MathFidelity.HiFi4, norm_prologue=norm, prebuilt=self.dmm_qkv,
-                dtype=ttnn.bfloat8_b, **_QKV_DMM
+                self.device,
+                None,
+                ttnn.MathFidelity.HiFi4,
+                norm_prologue=norm,
+                prebuilt=self.dmm_qkv,
+                dtype=ttnn.bfloat8_b,
+                **_QKV_DMM,
             )
             self.dmm_qkv_norm = dmm if dmm.ok else None
         return self.dmm_qkv_norm is not None
@@ -837,7 +864,14 @@ class TtAttention:
                 c = self.device.worker_core_from_logical_core(ttnn.CoreCoord(i % grid.x, i // grid.x))
                 coords += [c.x, c.y]
             kv_kernels, kv_cbs, kv_tensors = self._kv_write_parts(
-                qk, qkv, kv_cache, ctx.cur_pos, b, k_row, idle, signal=(sem_k, sem_v, coords),
+                qk,
+                qkv,
+                kv_cache,
+                ctx.cur_pos,
+                b,
+                k_row,
+                idle,
+                signal=(sem_k, sem_v, coords),
                 k_from_rows=q_rows is not None,
             )
         rd_rt, wr_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -846,7 +880,9 @@ class TtAttention:
             wr_rt[i % grid.x][i // grid.x] = [i * d_t, d_t]
         bf, f32 = ttnn.bfloat16, ttnn.float32
         tile, f32_tile = 2 * 32 * 32, 4 * 32 * 32
-        (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_pos, cb_zero, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(13)
+        (cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_pos, cb_zero, cb_sm_in, cb_mx, cb_sm, cb_v, cb_probs) = range(
+            13
+        )
         cb_cnt = 13  # the row's live key-tile count, reader -> compute
         cb_kv_old, cb_kv_new, cb_kv_scr, cb_kv_diff, cb_kv_out = 17, 18, 19, 20, 21  # inline_kv
         cb_wpos, kv_flag = 14, 0  # inline_kv: the writer's copy of the positions; staged tiles ready (reader -> writer)
@@ -886,7 +922,12 @@ class TtAttention:
                 total_size=64, core_ranges=cores, format_descriptors=[ttnn.CBFormatDescriptor(cb_cnt, ttnn.uint32, 64)]
             )
         )
-        scale_t, zero_t, max_s, sum_s = ctx.consts or (self.scale_tile, self.zero_tile, self.max_scaler, self.sum_scaler)
+        scale_t, zero_t, max_s, sum_s = ctx.consts or (
+            self.scale_tile,
+            self.zero_tile,
+            self.max_scaler,
+            self.sum_scaler,
+        )
         tensors = [qk, kv_cache.k, kv_cache.v, scale_t, ctx.mask_full, ctx.cur_pos, zero_t, max_s, sum_s]
         accessor_ct = []
         for t in tensors:
@@ -895,7 +936,21 @@ class TtAttention:
             kernel_source=os.path.join(_ATTN_FUSED_DIR, "reader_attn_fused.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[d_t, c_t, n_kv, cb_q, cb_k, cb_scale, cb_mask, cb_pos, cb_zero, cb_mx, cb_sm, cb_v, cb_cnt]
+            compile_time_args=[
+                d_t,
+                c_t,
+                n_kv,
+                cb_q,
+                cb_k,
+                cb_scale,
+                cb_mask,
+                cb_pos,
+                cb_zero,
+                cb_mx,
+                cb_sm,
+                cb_v,
+                cb_cnt,
+            ]
             + accessor_ct
             + [int(kv_write is not None and not inline_kv), sem_k, sem_v, int(q_rows is not None), g + 1]
             + [int(inline_kv), cb_kv_old, cb_kv_new, cb_kv_scr, cb_kv_out]
@@ -903,8 +958,7 @@ class TtAttention:
             + list(ttnn.TensorAccessorArgs(qkv_t if inline_kv else qk).get_compile_time_args())
             + [int(ctx.mask_table)],  # R: the table's per-core replicas (0: no table)
             runtime_args=rd_rt,
-            common_runtime_args=[t.buffer_address() for t in tensors]
-            + [(qkv_t if inline_kv else qk).buffer_address()],
+            common_runtime_args=[t.buffer_address() for t in tensors] + [(qkv_t if inline_kv else qk).buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
         )
         if inline_kv:
@@ -956,8 +1010,29 @@ class TtAttention:
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[
-                d_t, c_t, cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_max, cb_exps, cb_recip,
-                cb_probs, cb_v, cb_out, cb_cnt, int(inline_kv), cb_kv_old, cb_kv_new, cb_kv_diff, cb_kv_out,
+                d_t,
+                c_t,
+                cb_q,
+                cb_k,
+                cb_scale,
+                cb_mask,
+                cb_t,
+                cb_t2,
+                cb_sm_in,
+                cb_mx,
+                cb_sm,
+                cb_max,
+                cb_exps,
+                cb_recip,
+                cb_probs,
+                cb_v,
+                cb_out,
+                cb_cnt,
+                int(inline_kv),
+                cb_kv_old,
+                cb_kv_new,
+                cb_kv_diff,
+                cb_kv_out,
             ],
             runtime_args=ttnn.RuntimeArgs(),
             config=compute_cfg,
@@ -1040,7 +1115,10 @@ class TtAttention:
         d_t, s_t = self.head_dim // 32, seq // 32
         r_t = g * s_t
         out = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([1, b * seq, self.n_heads * self.head_dim]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device,
+            ttnn.Shape([1, b * seq, self.n_heads * self.head_dim]),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            self.device,
             memory_config,
         )
         if _PREFILL_CAUSAL_SKIP:
@@ -1101,7 +1179,8 @@ class TtAttention:
             kernel_source=os.path.join(_ATTN_PREFILL_DIR, "writer_attn_prefill.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[cb_out, d_t, s_t, r_t, n_kv, g] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=[cb_out, d_t, s_t, r_t, n_kv, g]
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
             runtime_args=rt["dm"],
             common_runtime_args=[out.buffer_address()],
             config=ttnn.WriterConfigDescriptor(),
@@ -1123,8 +1202,24 @@ class TtAttention:
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[
-                d_t, s_t, r_t, cb_q, cb_k, cb_scale, cb_mask, cb_t, cb_t2, cb_sm_in, cb_mx, cb_sm, cb_max, cb_exps,
-                cb_recip, cb_probs, cb_v, cb_out,
+                d_t,
+                s_t,
+                r_t,
+                cb_q,
+                cb_k,
+                cb_scale,
+                cb_mask,
+                cb_t,
+                cb_t2,
+                cb_sm_in,
+                cb_mx,
+                cb_sm,
+                cb_max,
+                cb_exps,
+                cb_recip,
+                cb_probs,
+                cb_v,
+                cb_out,
             ],
             runtime_args=rt["dm"],
             config=compute_cfg,
