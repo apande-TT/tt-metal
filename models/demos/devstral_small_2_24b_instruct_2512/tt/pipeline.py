@@ -31,6 +31,7 @@ Mesh: TP = 4 (1x4). The stubs shard their own weights (ShardTensorToMesh) and al
 internally; embeddings, norms and rotary tables are replicated. Batch B (default 32, $TT_PERF_BATCH) is a
 separate leading axis -- never sharded.
 """
+
 from __future__ import annotations
 
 import functools
@@ -329,6 +330,9 @@ PLANNED_TP = 4
 #   decode gate / up SwiGLU epilogue as ONE fused SFPU pass a pair (kernels/gate_up_compute.cpp gu_silu_mul, the
 #                     prefill's hoisted silu * up): the epilogue is the program's tail after the last weight push
 #                     (bf8 math - unpack 3.0 -> 2.5 us); trace decode 13.022 -> 12.990 ms, bit-identical.
+#   decode vocab top-k as a 4-ary tree (VocabTopK.TREE3): 64 locals -> 16 -> 4 -> final, 3 + 3 + 3 serial tile merges
+#                     instead of 7 + 7 (85 cores): 54.3 -> 51.2 us a call, trace decode 12.990 -> 12.988 ms; the exact
+#                     top-32 of [value | position] keys, bit-identical.
 
 
 def kv_capacity_for(tp):
@@ -530,6 +534,13 @@ class VocabTopK:
     # back into the value and position outputs. Equal values then rank by position (the stock stable order).
     FUSED = True
     PACKED, PACKED_BYTES = ttnn.float32, 4096
+    # TREE3 (fused keys): a 4-ary tree instead of 8 x 8 -- each column's 8 local cores report in two groups of 4 to
+    # 16 first-level middle cores (rows 8 and 9, columns 0..7), those in groups of 4 (a row's columns 0..3 / 4..7) to 4
+    # second-level middle cores (column 8, rows 0..3), and the final core (9, 0) merges those 4: 3 + 3 + 3 serial tile
+    # merges instead of 7 + 7, one more hand-off. Directions alternate across the siblings of every level, as the
+    # 8 x 8 tree's do, so each merge still sees bitonic pairs.
+    TREE3 = True
+    FANIN = 4
 
     def __init__(self, device, k):
         assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
@@ -553,6 +564,176 @@ class VocabTopK:
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
         )
 
+    def _tree3(self, x, vals, ids, ht, wt, wt_local):
+        """TREE3 (fused keys): locals (gx, ly) -> first-level middle (gx, 8 + h) for ly in 4h..4h+3 -> second-level
+        middle (8, j) for the first-level row 8 + j // 2, columns 4 (j % 2)..+3 -> final (9, 0) <- (8, 0..3). The same
+        stock local / final kernels and kernels/topk_mid.cpp, wired by the same gather protocol (semaphores 0/1, 2/3,
+        4/5 for the three hand-offs; a middle core receives on one pair and sends on the next)."""
+        g, n, k, kt, f = self.GROUPS, self.LOCALS, self.k, self.kt, self.FANIN
+        IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
+        P, PB = self.PACKED, self.PACKED_BYTES
+        rng = lambda x0, y0, x1, y1: ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1))
+        one = lambda c: ttnn.CoreRangeSet([rng(*c, *c)])
+        phys = self.phys
+        local_set = ttnn.CoreRangeSet([rng(0, 0, g - 1, n - 1)])
+        mid1_set = ttnn.CoreRangeSet([rng(0, n, g - 1, n + 1)])
+        mid2 = [(g, j) for j in range(4)]
+        mid2_set = ttnn.CoreRangeSet([rng(g, 0, g, 3)])
+        final = (g + 1, 0)
+        final_set = one(final)
+        mids = mid1_set.merge(mid2_set)
+        mid_final = mids.merge(final_set)
+        all_set = local_set.merge(mid_final)
+        sending = local_set.merge(mids)
+        # the gather buffers first on every core (written remotely at the sender's own address of them)
+        cbs = [
+            self._cb(G_VAL, f * kt, P, all_set, PB),
+            self._cb(G_IDX, f * kt, self.VAL, all_set),
+            self._cb(OUT_VAL, 2, P, sending, PB),
+            self._cb(OUT_VAL, 2, self.VAL, final_set),
+            self._cb(OUT_IDX, 2, self.IDX, all_set),
+            self._cb(IN, 4, self.VAL, local_set),
+            self._cb(IN_IDX, 4, self.IDX, local_set),
+            self._cb(LT_VAL, wt_local, P, local_set, PB),
+            self._cb(M_VAL, f * kt, P, mid_final, PB),
+            self._cb(M_IDX, f * kt, self.IDX, mid_final),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_set, initial_value=0) for i in range(6)]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for i in (LT_VAL, G_VAL, M_VAL):
+            modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        fdefs = [("TOPK_FUSED_STABLE_KEYS", "1")]
+        logk = int(math.log2(k))
+        sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
+        kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+            **kw,
+        )
+        locals_ = [(gx, ly) for gx in range(g) for ly in range(n)]  # global local index = gx * n + ly
+        logf = int(math.log2(f * kt))
+        mid_ct = sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1]
+        kernels = [
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_create_index_local_topk.cpp",
+                local_set,
+                [IN, IN_IDX, ht, wt_local, wt] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args()),
+                [((cx, cy), [x.buffer_address(), 0, i * wt_local, 0]) for i, (cx, cy) in enumerate(locals_)],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("GENERATE_INDICES", "1")],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_local.cpp",
+                local_set,
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 1, 1],
+                [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
+                compute_cfg,
+            ),
+            # both middle levels: a middle core's direction alternates across its siblings (column within its group of
+            # 4 for the first level, j for the second)
+            kern(
+                _TOPK_MID_KERNEL,
+                mids,
+                mid_ct,
+                [((gx, n + h), [gx % 2]) for h in range(2) for gx in range(g)] + [(c, [c[1] % 2]) for c in mid2],
+                compute_cfg,
+                compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+            ),
+            # the second level sends to the final core (semaphores 4/5) ...
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                mid2_set,
+                [4, 5, phys(*final).x, phys(*final).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                [(c, [c[1]]) for c in mid2],
+                ttnn.WriterConfigDescriptor(),
+                defines=fdefs,
+            ),
+            # ... which releases them and collects their 4 results
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                final_set,
+                [4, 5, phys(*mid2[0]).x, phys(*mid2[0]).y, phys(*mid2[-1]).x, phys(*mid2[-1]).y]
+                + [ht, f * kt, f, G_VAL, G_IDX],
+                [],
+                ttnn.ReaderConfigDescriptor(),
+                defines=fdefs,
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_final.cpp",
+                final_set,
+                sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
+                [],
+                compute_cfg,
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
+                final_set,
+                [OUT_VAL, OUT_IDX, ht, kt]
+                + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+                + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
+                [(final, [vals.buffer_address(), ids.buffer_address()])],
+                ttnn.WriterConfigDescriptor(),
+            ),
+        ]
+        for gx in range(g):
+            for h in range(2):
+                m1 = (gx, n + h)
+                top, bottom = phys(gx, f * h), phys(gx, f * h + f - 1)
+                group = ttnn.CoreRangeSet([rng(gx, f * h, gx, f * h + f - 1)])
+                # locals (gx, 4h..4h+3) -> first-level middle (gx, 8 + h), semaphores 0/1
+                kernels.append(
+                    kern(
+                        f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                        group,
+                        [0, 1, phys(*m1).x, phys(*m1).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                        [((gx, ly), [ly - f * h]) for ly in range(f * h, f * h + f)],
+                        ttnn.WriterConfigDescriptor(),
+                        defines=fdefs,
+                    )
+                )
+                kernels.append(
+                    kern(
+                        f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                        one(m1),
+                        [0, 1, top.x, top.y, bottom.x, bottom.y, ht, f * kt, f, G_VAL, G_IDX],
+                        [],
+                        ttnn.ReaderConfigDescriptor(),
+                        defines=fdefs,
+                    )
+                )
+        for j, m2 in enumerate(mid2):
+            row, c0 = n + j // 2, f * (j % 2)
+            # first-level middles (c0..c0+3, row) -> second-level middle (8, j), semaphores 2/3
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                    ttnn.CoreRangeSet([rng(c0, row, c0 + f - 1, row)]),
+                    [2, 3, phys(*m2).x, phys(*m2).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                    [((cx, row), [cx - c0]) for cx in range(c0, c0 + f)],
+                    ttnn.WriterConfigDescriptor(),
+                    defines=fdefs,
+                )
+            )
+            top, bottom = phys(c0, row), phys(c0 + f - 1, row)
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                    one(m2),
+                    [2, 3, top.x, top.y, bottom.x, bottom.y, ht, f * kt, f, G_VAL, G_IDX],
+                    [],
+                    ttnn.ReaderConfigDescriptor(),
+                    defines=fdefs,
+                )
+            )
+        ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+
     def __call__(self, x):
         g, n, k, kt = self.GROUPS, self.LOCALS, self.k, self.kt
         rows, width = int(x.shape[-2]), int(x.shape[-1])
@@ -567,6 +748,10 @@ class VocabTopK:
         ids = ttnn.allocate_tensor_on_device(
             out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
         )
+        grid = self.device.compute_with_storage_grid_size()
+        if self.TREE3 and self.FUSED and g == n == 8 and grid.x >= 10 and grid.y >= 10:
+            self._tree3(x, vals, ids, ht, wt, wt_local)
+            return vals, ids
 
         # CB ids as in the stock factory. The gather buffers (c_4/c_5) are written remotely at the sender's own
         # address of them, so they go first on every core (same L1 address everywhere). A middle core reads that
