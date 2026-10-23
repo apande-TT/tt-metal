@@ -10,6 +10,7 @@ output stage (see mm_compute.cpp): the fused SwiGLU runs silu and the up multipl
 a block (416-row text gate/up 9844 -> 9722 us, vision 245 -> 234 us), bit-identical to the stock op.
 
 Call matmul(x, w, config, compute_kernel_config, ...) exactly as ttnn.experimental.minimal_matmul (config required)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -179,14 +180,24 @@ def matmul(
     residual=None,
     in0_heads=None,
     stock_orient=False,
+    swapped=False,
+    orient=None,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
     does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output.
     in0_heads (True, supports_heads): x is an attention output (B, NH, S, HD) multiplied as its head concat
     (B, 1, S, NH * HD) -- the in0 reader (kernels/mm_in0_heads.cpp) fetches each tile where nlp_concat_heads would
-    have copied it from, so the concat program is not needed; same tiles, same matmul."""
+    have copied it from, so the concat program is not needed; same tiles, same matmul.
+    swapped (w = the (N x K) TRANSPOSED weight): x @ w^T computed as the program's (w @ x^T)^T -- in0 = w, in1 = x's
+    tiles read in transposed positions and unpacked transposed, each output tile transposed on its way out
+    (kernels/mm_dataflow_common.hpp IN1_TRANSPOSED / OUT_TRANSPOSED, mm_compute.cpp MM_IN1_TRANSPOSE). The weight
+    lands in srcB and the activation in srcA: a block-float8 weight's 7-bit significands fit srcB's one 7-bit
+    multiplier pass, so HiFi2 (srcA's two 5-bit passes x srcB's first) multiplies the full operands -- the products
+    HiFi4 forms with the weight in srcA, at half the multiplier passes.
+    orient (True / False): force the grid split (True: M along the grid's x axis)."""
     assert residual is None or not fuse_swiglu
+    assert not swapped or (residual is None and not fuse_swiglu and in0_heads is None)
     device = x.device()
     grid = config.compute_with_storage_grid_size
     gx, gy = int(grid.x), int(grid.y)
@@ -200,6 +211,11 @@ def matmul(
     for d in xs[:-1]:
         M *= d
     N = int(w.padded_shape[-1])
+    in0, in1 = x, w
+    if swapped:
+        assert int(w.padded_shape[-1]) == K
+        in0, in1 = w, x
+        M, N = int(w.padded_shape[-2]), M
     T = ttnn.TILE_SIZE
     M_tiles, K_tiles, N_tiles = M // T, K // T, N // T
 
@@ -208,6 +224,8 @@ def matmul(
 
     # stock_orient: the stock M > N split (the vision MLP down measured no better transposed)
     transpose = M_tiles > N_tiles if stock_orient else transposed(M_tiles, N_tiles, gx, gy, fuse_swiglu)
+    if orient is not None:
+        transpose = bool(orient)
     dram_read, dram_write = ttnn.NOC.NOC_0, ttnn.NOC.NOC_1  # Blackhole preferred NOCs
     small_noc, small_risc = dram_write, ttnn.DataMovementProcessor.RISCV_1
     large_noc, large_risc = dram_read, ttnn.DataMovementProcessor.RISCV_0
@@ -232,7 +250,7 @@ def matmul(
     M_blocks_per_core = -(-M_per_core // M_block)
     N_blocks_per_core = -(-N_per_core // N_block)
 
-    in0_tile, in1_tile = _TILE_BYTES[x.dtype], _TILE_BYTES[w.dtype]
+    in0_tile, in1_tile = _TILE_BYTES[in0.dtype], _TILE_BYTES[in1.dtype]
     out_tile = _TILE_BYTES[dtype]
     interm_dtype = ttnn.float32 if fp32_acc else ttnn.bfloat16
     interm_tile = _TILE_BYTES[interm_dtype]
@@ -240,7 +258,7 @@ def matmul(
     out_block = M_block * N_block
     out_written = out_block // 2 if fuse_swiglu else out_block
 
-    out_shape = xs[:-1] + [N // 2 if fuse_swiglu else N]
+    out_shape = xs[:-1] + [M if swapped else N // 2 if fuse_swiglu else N]
     out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)
 
     core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))])
@@ -266,7 +284,7 @@ def matmul(
     # reads that K block, so compute -- which packs block i + 1 only after its last K block -- never waits on it. (The
     # vision MLP's 7 x 12-tile SwiGLU block: 86 KB less static L1, which the decode all_reduce's scratch needs.)
     out_bufs = 1
-    cb_bytes = (M_block * K_block * 2 * in0_tile + K_block * N_block * 2 * in1_tile + out_written * out_bufs * out_tile)
+    cb_bytes = M_block * K_block * 2 * in0_tile + K_block * N_block * 2 * in1_tile + out_written * out_bufs * out_tile
     overlap = (
         SWIGLU_OVERLAP
         and fuse_swiglu
@@ -281,8 +299,8 @@ def matmul(
     )
     epi_done_k = min(max(1, int(K_blocks * EPI_DONE_FRAC)), K_blocks - 1) if overlap else 0
     cbs = [
-        cb(0, M_block * K_block * 2, in0_tile, x.dtype),
-        cb(1, K_block * N_block * 2, in1_tile, w.dtype),
+        cb(0, M_block * K_block * 2, in0_tile, in0.dtype),
+        cb(1, K_block * N_block * 2, in1_tile, in1.dtype),
         cb(2, out_written * out_bufs, out_tile, dtype),
         cb(3, out_block * (2 if overlap else 1), interm_tile, interm_dtype),
     ]
@@ -300,14 +318,14 @@ def matmul(
         head
         + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector, 1, N_tiles]
         + [in1_tile]
-        + acc(x)
+        + acc(in0)
         + acc(out)
         + res_ct
     )
     in1_ct = lambda injector: (
         head
         + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector, 1, N_tiles]
-        + acc(w)
+        + acc(in1)
         + acc(out)
         + res_ct
     )
@@ -323,7 +341,7 @@ def matmul(
             phys[c] = (int(p.x), int(p.y))
         return phys[c]
 
-    x_addr, w_addr, o_addr = x.buffer_address(), w.buffer_address(), out.buffer_address()
+    x_addr, w_addr, o_addr = in0.buffer_address(), in1.buffer_address(), out.buffer_address()
     # FUSE_TERNARY runtime args (before the output address): a, b (broadcast row), broadcast flag
     tern = [] if residual is None else [residual.buffer_address(), residual.buffer_address(), 1]
     rt_in0_s, rt_in0_r, rt_in1_s, rt_in1_r, rt_c = [], [], [], [], []
@@ -340,13 +358,31 @@ def matmul(
             m0, m1 = M_per_core * in0_idx, M_per_core * (in0_idx + 1)
             n0, n1 = N_per_core * in1_idx, N_per_core * (in1_idx + 1)
             defer = max(min(cy * k_blocks_per_core, K_blocks - 1), epi_done_k)
-            a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, *tern, o_addr]
+            a0 = [
+                x_addr,
+                0,
+                0,
+                int(core == o0[-1]),
+                *pxy(next0),
+                *pxy(prev0),
+                m0,
+                m1,
+                n0,
+                n1,
+                defer,
+                max_defer,
+                *tern,
+                o_addr,
+            ]
             a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
             a1 += [o_addr]
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
             rt_c.append(
-                (core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else []) + ([epi_done_k] if overlap else []))
+                (
+                    core,
+                    [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else []) + ([epi_done_k] if overlap else []),
+                )
             )
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
@@ -357,7 +393,9 @@ def matmul(
         in0_defines = [("IN0_NH", str(nh)), ("IN0_ST", str(sq // T)), ("IN0_HDT", str(hd // T))]
     if residual is not None:
         defines += [("FUSE_TERNARY", "1")]
-    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
+    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [
+        ("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))
+    ]
     cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
     if fuse_swiglu and SWIGLU_PACK_SFPU:
         cdefines += [("SWIGLU_PACK_SFPU", "1")]
@@ -372,6 +410,10 @@ def matmul(
         defines = defines + [("DEFER_INJECTOR", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
+    if swapped:
+        cdefines += [("MM_IN1_TRANSPOSE", "1")]
+        defines = defines + [("IN1_TRANSPOSED", "1"), ("OUT_TRANSPOSED", "1")]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
 
     dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
     kern = lambda src, cores, ct, rt, cfg, d: ttnn.KernelDescriptor(
@@ -400,6 +442,6 @@ def matmul(
         kern(in1_src, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
     ]
-    ios = [x, w, out] if residual is None else [x, w, residual, out]
+    ios = [in0, in1, out] if residual is None else [x, w, residual, out]
     ttnn.generic_op(ios, ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
     return out

@@ -19,9 +19,19 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/dataflow/circular_buffer.h"
+#ifdef MM_IN1_TRANSPOSE
+#include "api/compute/transpose.h"
+#endif
 
 #ifndef EPI_TILES
 #define EPI_TILES 1
+#endif
+// MM_IN1_TRANSPOSE (tt/minimal_mm.py matmul(..., swapped=True)): in1 tiles are unpacked transposed and every output
+// tile is transposed on its way out, so (in0 = w^T, in1 = x tiles) computes (x @ w)'s tiles: out^T = w^T @ x^T.
+#ifdef MM_IN1_TRANSPOSE
+constexpr bool MM_TRANSPOSE = true;
+#else
+constexpr bool MM_TRANSPOSE = false;
 #endif
 #ifndef SWIGLU_PAIRS
 #define SWIGLU_PAIRS 1
@@ -34,7 +44,11 @@ void copy_and_pack_block(
     CircularBuffer cb_out(out_cb);
     reconfig_data_format_srca(in_cb);
     pack_reconfig_data_format(out_cb);
+#ifdef MM_IN1_TRANSPOSE
+    transpose_init(in_cb);
+#else
     copy_init(in_cb);
+#endif
     for (uint32_t m = 0; m < M_block_tiles; m++) {
         const uint32_t row_n = m < real_M ? real_N : 0;
         const uint32_t row_base = m * N_block_tiles;
@@ -42,7 +56,11 @@ void copy_and_pack_block(
             const uint32_t nt = (row_n - n) < EPI_TILES ? (row_n - n) : EPI_TILES;
             tile_regs_acquire();
             for (uint32_t t = 0; t < nt; t++) {
+#ifdef MM_IN1_TRANSPOSE
+                transpose_tile(in_cb, row_base + n + t, t);  // the same srcA unpack as copy_tile, transposed
+#else
                 copy_tile(in_cb, row_base + n + t, t);
+#endif
             }
             tile_regs_commit();
             tile_regs_wait();
@@ -404,7 +422,7 @@ void matmul_blocks(
                     in0_index,
                     in1_index,
                     dst_index,
-                    false /*transpose*/,
+                    MM_TRANSPOSE,
                     subblock_w,
                     subblock_h,
                     K_block_tiles);
@@ -511,7 +529,7 @@ void kernel_main() {
             matmul_block_init(
                 in0_cb,
                 in1_cb,
-                false /*transpose*/,
+                MM_TRANSPOSE,
                 current_subblock_w /*ct_dim*/,
                 current_subblock_h /*rt_dim*/,
                 K_block_tiles /*kt_dim*/);

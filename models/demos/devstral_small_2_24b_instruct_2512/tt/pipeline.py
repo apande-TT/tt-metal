@@ -336,6 +336,13 @@ PLANNED_TP = 4
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
+#   short-prompt MLP down with its operands swapped (ministral3_m_l_p.SHORT_DOWN_SWAPPED, tt/minimal_mm.py swapped=):
+#                     (w^T @ x^T)^T on a bf16 copy of the bf8 weight, transposed on the host (exact), so the weight sits
+#                     in srcB, whose one 7-bit multiplier pass holds a bf8 significand: HiFi2 forms HiFi4's products
+#                     (srcA's two 5-bit passes cover bf16). x is read in transposed tile positions and unpacked
+#                     transposed, each output tile packed transposed (kernels/mm_dataflow_common.hpp, mm_compute.cpp).
+#                     128-row down 2550 -> 1414 us a call; vs the HiFi4 program PCC 1.000000000, max |diff| 1.2e-4,
+#                     85% of elements bit-identical, mean |err| vs a fp32 product 1.1749e-6 (HiFi4: 1.1766e-6).
 
 
 def kv_capacity_for(tp):
