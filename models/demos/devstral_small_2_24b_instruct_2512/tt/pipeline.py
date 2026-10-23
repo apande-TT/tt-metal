@@ -326,6 +326,9 @@ PLANNED_TP = 4
 #   decode down fold: each partial tile goes straight into its link worker's send buffer and the worker sends every
 #                     shard once its tiles are in (StreamDownDecode.DIRECT_SEND, kernels/ar_send_shards.cpp), not a
 #                     wave's shards read back after the whole wave.
+#   decode gate / up SwiGLU epilogue as ONE fused SFPU pass a pair (kernels/gate_up_compute.cpp gu_silu_mul, the
+#                     prefill's hoisted silu * up): the epilogue is the program's tail after the last weight push
+#                     (bf8 math - unpack 3.0 -> 2.5 us); trace decode 13.022 -> 12.990 ms, bit-identical.
 
 
 def kv_capacity_for(tp):
