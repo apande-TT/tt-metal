@@ -126,9 +126,9 @@ class TtMinistral3MLP:
     # ... and the long prompt's (> 128 tile rows) down too, in N blocks of LONG_DOWN_SWAPPED_N_BLOCK prompt tile rows
     LONG_DOWN_SWAPPED = True
     LONG_DOWN_SWAPPED_N_BLOCK = 10
-    # ... on the last twenty text layers only: the image prompt's [IMG] rows amplify a rounding-order change through the
-    # layers after it (all 40 layers swapped: image prefill-hidden PCC 0.9944 < 0.995; layers 30-39 and 20-39: 0.995503)
-    LONG_DOWN_SWAPPED_LAYERS = frozenset(range(20, 40))
+    # ... on the last thirty text layers only: the image prompt's [IMG] rows amplify a rounding-order change through the
+    # layers after it (image prefill-hidden PCC: layers 0-39 swapped 0.9944 < 0.995; 10-39 0.99525; 20-39 / 30-39 0.995503)
+    LONG_DOWN_SWAPPED_LAYERS = frozenset(range(10, 40))
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
