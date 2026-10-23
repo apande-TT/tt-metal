@@ -129,6 +129,9 @@ class TtMinistral3MLP:
     # ... on the last thirty text layers only: the image prompt's [IMG] rows amplify a rounding-order change through the
     # layers after it (image prefill-hidden PCC: layers 0-39 swapped 0.9944 < 0.995; 10-39 0.99525; 20-39 / 30-39 0.995503)
     LONG_DOWN_SWAPPED_LAYERS = frozenset(range(10, 40))
+    # The prefill gate / up in 16-deep K blocks (tt/minimal_mm.py SWIGLU_DEEP_K: the SwiGLU pass gets a whole subblock
+    # to hide behind; not bit-identical) on these layers only (all 40: image prefill-hidden PCC 0.994431 < 0.995)
+    PREFILL_GU_DEEP_K_LAYERS = frozenset(range(20, 40))
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -308,6 +311,7 @@ class TtMinistral3MLP:
         # the swapped program, whose srcB multiplier pass takes all 7 -- HiFi2 over srcA's two passes is HiFi4's product.
         self.w_down_t = None
         self.long_down_swapped = self.LONG_DOWN_SWAPPED and layer_idx in self.LONG_DOWN_SWAPPED_LAYERS
+        self.gu_deep_k = layer_idx in self.PREFILL_GU_DEEP_K_LAYERS
         if self.SHORT_DOWN_SWAPPED and type(self) is TtMinistral3MLP and tp > 1 and self.DOWN_DTYPE == ttnn.bfloat8_b:
             # (built on the host: _put's bf8 quantization of the same matrix, dequantized, transposed and tilized there,
             # then uploaded -- no device ops)
@@ -482,7 +486,7 @@ class TtMinistral3MLP:
         )
         if PREFILL_MM_PROGRAM and minimal_mm.supported(x, self.w_gate_up, self.gate_up_cfg, fuse_swiglu=True):
             # the same program with silu * up as one SFPU pass (tt/minimal_mm.py), bit-identical
-            m = minimal_mm.matmul(x, self.w_gate_up, **gu_kw)
+            m = minimal_mm.matmul(x, self.w_gate_up, deep_k_ok=self.gu_deep_k, **gu_kw)
         else:
             m = ttnn.experimental.minimal_matmul(x, self.w_gate_up, **gu_kw)
         if x_l1:  # the caller's norm output, read only here (see TtAttention)
