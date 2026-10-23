@@ -116,6 +116,9 @@ class TtMinistral3MLP:
     # The many-row down projection folds a fp32 residual add into its output stage (tt/minimal_mm.py residual=,
     # bit-identical to ttnn.add(residual, down)): __call__(x, residual=h) returns h + mlp(x). The vision MLPs set it.
     FUSE_RESIDUAL_DOWN = False
+    # A short prompt's (<= 128 tile rows) down projection runs on the full grid with blocks cut to each core's exact
+    # M / N ranges (see _forward) instead of the 80-core grid of whole 16 x 16-tile blocks.
+    SHORT_DOWN_FULL_GRID = True
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -455,7 +458,21 @@ class TtMinistral3MLP:
         down_cfg = None
         # the down keeps minimal_matmul's stock M > N split (stock_orient below): transposed it measured no better
         n_rng_dn = -(-nt // (grid.y if mt > nt else grid.x))
-        if mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
+        m_rng_dn = -(-mt // (grid.x if mt > nt else grid.y))
+        n_sub = max(w for w in (1, 2, 3, 4) if n_rng_dn % w == 0)
+        if self.SHORT_DOWN_FULL_GRID and mt <= 128 and mt < nt and n_sub >= 3:
+            # A short prompt on the FULL grid with blocks cut to each core's exact ranges (M blocks of half the M
+            # range, N blocks of the whole N range, 1 x n_sub subblocks): the 128-row prompt's 128 x 160 output tiles
+            # are 13 x 15 a core over 110 cores instead of 16 x 16 over the 80-core grid of whole 16-tile blocks.
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=-(-m_rng_dn // 2),
+                K_block_size=8,
+                N_block_size=n_rng_dn,
+                subblock_h=1,
+                subblock_w=n_sub,
+                compute_with_storage_grid_size=grid,
+            )
+        elif mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
             down_cfg = ttnn.MinimalMatmulConfig(
                 M_block_size=8,
                 K_block_size=8,
