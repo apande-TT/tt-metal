@@ -123,6 +123,12 @@ class TtMinistral3MLP:
     # The TP text MLP's short-prompt (<= 128 tile rows) down as tt/minimal_mm.matmul(..., swapped=True): the weight in
     # srcB (a bf16 copy of the bf8 weight, transposed once at load: exact), so HiFi2 multiplies the full operands.
     SHORT_DOWN_SWAPPED = True
+    # ... and the long prompt's (> 128 tile rows) down too, in N blocks of LONG_DOWN_SWAPPED_N_BLOCK prompt tile rows
+    LONG_DOWN_SWAPPED = True
+    LONG_DOWN_SWAPPED_N_BLOCK = 10
+    # ... on the last ten text layers only: the image prompt's [IMG] rows amplify a rounding-order change through the
+    # layers after it (all 40 layers swapped: image prefill-hidden PCC 0.9944 < 0.995; layers 30-39: 0.995503)
+    LONG_DOWN_SWAPPED_LAYERS = frozenset(range(30, 40))
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -301,6 +307,7 @@ class TtMinistral3MLP:
         # SHORT_DOWN_SWAPPED: the bf8 weight's values (<= 7 significant bits: exact in bf16) transposed to (N x K) for
         # the swapped program, whose srcB multiplier pass takes all 7 -- HiFi2 over srcA's two passes is HiFi4's product.
         self.w_down_t = None
+        self.long_down_swapped = self.LONG_DOWN_SWAPPED and layer_idx in self.LONG_DOWN_SWAPPED_LAYERS
         if self.SHORT_DOWN_SWAPPED and type(self) is TtMinistral3MLP and tp > 1 and self.DOWN_DTYPE == ttnn.bfloat8_b:
             # (built on the host: _put's bf8 quantization of the same matrix, dequantized, transposed and tilized there,
             # then uploaded -- no device ops)
@@ -553,18 +560,18 @@ class TtMinistral3MLP:
         n_sw = -(-mt // grid.x)
         if (
             self.w_down_t is not None
-            and mt <= 128
-            and n_sw % 2 == 0
+            and ((mt <= 128 and n_sw % 2 == 0) or (self.long_down_swapped and mt > 128))
             and m.layout == ttnn.TILE_LAYOUT
             and not m.is_sharded()
             and int(m.padded_shape[-1]) == int(self.w_down_t.padded_shape[-1])
         ):
-            # the short prompt swapped (SHORT_DOWN_SWAPPED): the weight's 160 rows over the grid's 10 rows (16 a core,
-            # M blocks of 8), the prompt's 128 tile rows over its 11 columns (12 a core), 2 x 2 subblocks, at HiFi2
+            # swapped (SHORT_DOWN_SWAPPED / LONG_DOWN_SWAPPED): the weight's 160 rows over the grid's 10 rows (16 a
+            # core, M blocks of 8), the prompt's tile rows over its 11 columns (128: 12 a core, one N block; 416: 38 a
+            # core in N blocks of 10), 2 x 2 subblocks, at HiFi2
             sw_cfg = ttnn.MinimalMatmulConfig(
                 M_block_size=8,
                 K_block_size=8,
-                N_block_size=n_sw,
+                N_block_size=n_sw if mt <= 128 else self.LONG_DOWN_SWAPPED_N_BLOCK,
                 subblock_h=2,
                 subblock_w=2,
                 compute_with_storage_grid_size=grid,
