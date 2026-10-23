@@ -150,7 +150,7 @@ class TtQwenVAE:
                 batch_parallel=True,
                 single_frame=True,
                 blocking=_decoder_blocking,
-                ccl_links=2,  # the decoder's gathers / halo exchanges over 2 fabric links instead of 1
+                ccl_links=4,  # the decoder's gathers / halo exchanges over 4 fabric links instead of 1
             )
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
