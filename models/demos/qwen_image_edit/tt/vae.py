@@ -139,7 +139,7 @@ class TtQwenVAE:
             # the edit image is a single frame too: the encoder's causal convs keep only their live temporal
             # tap, so neither their T front pad nor its zero frames' MACs run
             self.encoder = qwen_image_encoder3d.build(
-                device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=2
+                device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=4
             )
             self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
             self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
