@@ -1,0 +1,6 @@
+{
+  "arch": "LlamaForCausalLM",
+  "main_class": "adapter:TTLlamaForCausalLM",
+  "weights": "openbmb/MiniCPM5-2B",
+  "note": "Auto-generated vLLM bundle for Tenstorrent."
+}
