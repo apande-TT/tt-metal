@@ -343,6 +343,8 @@ PLANNED_TP = 4
 #                     transposed, each output tile packed transposed (kernels/mm_dataflow_common.hpp, mm_compute.cpp).
 #                     128-row down 2550 -> 1414 us a call; vs the HiFi4 program PCC 1.000000000, max |diff| 1.2e-4,
 #                     85% of elements bit-identical, mean |err| vs a fp32 product 1.1749e-6 (HiFi4: 1.1766e-6).
+#                     The long (416-row) prompt's down too on the last ten layers (LONG_DOWN_SWAPPED_LAYERS 30-39):
+#                     the image prompt's chaotic rows amplify a perturbation only through the layers after it.
 
 
 def kv_capacity_for(tp):
