@@ -333,6 +333,9 @@ PLANNED_TP = 4
 #   decode vocab top-k as a 4-ary tree (VocabTopK.TREE3): 64 locals -> 16 -> 4 -> final, 3 + 3 + 3 serial tile merges
 #                     instead of 7 + 7 (85 cores): 54.3 -> 51.2 us a call, trace decode 12.990 -> 12.988 ms; the exact
 #                     top-32 of [value | position] keys, bit-identical.
+#   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
+#                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
+#                     blocks over the 80-core grid.
 
 
 def kv_capacity_for(tp):
