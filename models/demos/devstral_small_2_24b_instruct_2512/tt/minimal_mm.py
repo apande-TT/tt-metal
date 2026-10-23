@@ -52,6 +52,19 @@ SKIP_PADDING = True
 SWIGLU_OVERLAP = True
 EPI_DONE_FRAC = 0.5
 SWIGLU_OVERLAP_L1_BYTES = 1_240_000
+# SWIGLU_DEEP_K: under SWIGLU_OVERLAP the PACK thread runs a pair's SFPU pass (~1344 cycles) between two 1 x 4
+# subblocks, but an 8-deep K block makes a subblock only ~1024 cycles at HiFi2, so MATH waits for its DEST half every
+# pair (~0.7 us a pair exposed). 16-deep K blocks give the pass a whole subblock; M blocks of at most
+# SWIGLU_DEEP_M_MAX tiles and SWIGLU_DEEP_N_BLOCK-tile N blocks keep the doubled intermediate within
+# SWIGLU_OVERLAP_L1_BYTES. The fp32 partials are then summed in 16-tile K runs instead of 8 (the epilogue reads them as
+# TF32 either way): not bit-identical.
+SWIGLU_DEEP_K = 16
+SWIGLU_DEEP_N_BLOCK = 8
+SWIGLU_DEEP_M_MAX = 6
+# ... with the epilogue copying the fp32 partials straight to DEST (UnpackToDestFp32) instead of through SrcA as TF32
+# (off: 416-row gate/up 8800 vs 8590 us). Callers opt layers in with matmul(..., deep_k_ok=) (the image prompt's
+# prefill-hidden PCC drops below its 0.995 floor with every text layer deep-K: 0.994431).
+SWIGLU_FP32_EPILOGUE = False
 
 
 # minimal_matmul splits M along the grid's x axis and N along y when M > N, else the other way round. ORIENT_MIN_WORK
@@ -182,6 +195,7 @@ def matmul(
     stock_orient=False,
     swapped=False,
     orient=None,
+    deep_k_ok=True,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
@@ -235,6 +249,28 @@ def matmul(
     in1_par = gy if transpose else gx
 
     padded_M = _round_up(M_tiles, in0_par)
+    deep_k = False
+    if (
+        fuse_swiglu
+        and deep_k_ok
+        and SWIGLU_DEEP_K
+        and SWIGLU_OVERLAP
+        and SWIGLU_PACK_SFPU
+        and fp32_acc
+        and in0_heads is None
+        and (sub_h, sub_w) == (1, 4)
+        and K_tiles % SWIGLU_DEEP_K == 0
+        and K_tiles // SWIGLU_DEEP_K >= 2
+        and (2 * (_round_up(N_tiles // 2, in1_par) // in1_par)) % SWIGLU_DEEP_N_BLOCK == 0
+        and x.memory_config().buffer_type == ttnn.BufferType.DRAM
+        and memory_config.buffer_type == ttnn.BufferType.DRAM
+    ):
+        m_core = padded_M // in0_par
+        mb = min(SWIGLU_DEEP_M_MAX, m_core)
+        # the M block that tiles the core's M range with the least padding (the larger on a tie)
+        M_block = min(range(mb, max(1, mb // 2) - 1, -1), key=lambda b: -(-m_core // b) * b - m_core)
+        K_block, N_block = SWIGLU_DEEP_K, SWIGLU_DEEP_N_BLOCK
+        deep_k = True
     padded_K = _round_up(K_tiles, K_block)
     if fuse_swiglu:
         out_N = N_tiles // 2
@@ -433,6 +469,10 @@ def matmul(
     if residual is not None:
         modes = [ttnn.UnpackToDestMode.Default] * 64
         modes[5] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the residual, as binary_ng unpacks a fp32 add's operands
+        ccfg.unpack_to_dest_mode = modes
+    if deep_k and SWIGLU_FP32_EPILOGUE:
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the SwiGLU reads the fp32 partials whole, not as TF32
         ccfg.unpack_to_dest_mode = modes
     c_ct = [K_blocks, M_block, K_block, N_block, M_blocks_per_core, N_blocks_per_core, sub_h, sub_w]
     kernels = [

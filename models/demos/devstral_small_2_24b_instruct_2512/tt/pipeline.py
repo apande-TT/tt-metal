@@ -345,6 +345,7 @@ PLANNED_TP = 4
 #                     85% of elements bit-identical, mean |err| vs a fp32 product 1.1749e-6 (HiFi4: 1.1766e-6).
 #                     The long (416-row) prompt's down too on the last thirty layers (LONG_DOWN_SWAPPED_LAYERS 10-39):
 #                     the image prompt's chaotic rows amplify a perturbation only through the layers after it.
+#   prefill gate / up in 16-deep K blocks on layers 20-39 (minimal_mm.SWIGLU_DEEP_K, PREFILL_GU_DEEP_K_LAYERS).
 
 
 def kv_capacity_for(tp):
