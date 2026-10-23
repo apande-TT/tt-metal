@@ -13,6 +13,7 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
                grid: decode (mode="decode") keeps separate gate / up weights on ttnn.linear instead.
   * down_proj  row-parallel on the intermediate dim, then all_reduce.
 """
+
 from __future__ import annotations
 
 import torch
@@ -119,6 +120,9 @@ class TtMinistral3MLP:
     # A short prompt's (<= 128 tile rows) down projection runs on the full grid with blocks cut to each core's exact
     # M / N ranges (see _forward) instead of the 80-core grid of whole 16 x 16-tile blocks.
     SHORT_DOWN_FULL_GRID = True
+    # The TP text MLP's short-prompt (<= 128 tile rows) down as tt/minimal_mm.matmul(..., swapped=True): the weight in
+    # srcB (a bf16 copy of the bf8 weight, transposed once at load: exact), so HiFi2 multiplies the full operands.
+    SHORT_DOWN_SWAPPED = True
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -290,6 +294,35 @@ class TtMinistral3MLP:
             self.down_cfg = ttnn.init_device_compute_kernel_config(
                 device.arch(),
                 math_fidelity=ttnn.MathFidelity.LoFi if down_lofi else self.PREFILL_DOWN_FIDELITY,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
+        # SHORT_DOWN_SWAPPED: the bf8 weight's values (<= 7 significant bits: exact in bf16) transposed to (N x K) for
+        # the swapped program, whose srcB multiplier pass takes all 7 -- HiFi2 over srcA's two passes is HiFi4's product.
+        self.w_down_t = None
+        if self.SHORT_DOWN_SWAPPED and type(self) is TtMinistral3MLP and tp > 1 and self.DOWN_DTYPE == ttnn.bfloat8_b:
+            # (built on the host: _put's bf8 quantization of the same matrix, dequantized, transposed and tilized there,
+            # then uploaded -- no device ops)
+            wq = ttnn.to_torch(
+                ttnn.from_torch(
+                    torch_module.down_proj.weight.T.detach().to(torch.bfloat16).contiguous(),
+                    dtype=ttnn.bfloat8_b,
+                    layout=ttnn.TILE_LAYOUT,
+                )
+            )
+            wt = ttnn.from_torch(
+                wq.T.contiguous().to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=shard(-1),
+            )
+            del wq
+            self.w_down_t = ttnn.to_device(wt, device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            del wt
+            self.down_swapped_cfg = ttnn.init_device_compute_kernel_config(
+                device.arch(),
+                math_fidelity=ttnn.MathFidelity.HiFi2,
                 math_approx_mode=False,
                 fp32_dest_acc_en=True,
                 packer_l1_acc=False,
@@ -517,7 +550,36 @@ class TtMinistral3MLP:
             memory_config=ttnn.L1_MEMORY_CONFIG if down_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=down_dtype,
         )
+        n_sw = -(-mt // grid.x)
         if (
+            self.w_down_t is not None
+            and mt <= 128
+            and n_sw % 2 == 0
+            and m.layout == ttnn.TILE_LAYOUT
+            and not m.is_sharded()
+            and int(m.padded_shape[-1]) == int(self.w_down_t.padded_shape[-1])
+        ):
+            # the short prompt swapped (SHORT_DOWN_SWAPPED): the weight's 160 rows over the grid's 10 rows (16 a core,
+            # M blocks of 8), the prompt's 128 tile rows over its 11 columns (12 a core), 2 x 2 subblocks, at HiFi2
+            sw_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=n_sw,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=grid,
+            )
+            out = minimal_mm.matmul(
+                m,
+                self.w_down_t,
+                config=sw_cfg,
+                compute_kernel_config=self.down_swapped_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=down_dtype,
+                swapped=True,
+                orient=False,
+            )
+        elif (
             residual is not None
             and self.FUSE_RESIDUAL_DOWN
             and self.tp == 1
