@@ -104,18 +104,30 @@ def _encoder_blocking(in_channels, out_channels, kernel):
     return (c.C_in_block, c.C_out_block, c.T_out_block, c.H_out_block, c.W_out_block)
 
 
+# pack / unpack the latents' 2x2 patches in row major (the TILE permute pads their size-2 dims to whole tiles)
+PACK_ROW_MAJOR = True
+
+
 def pack_latents(z, B, C, H, W):
     """[B, C, H, W] -> [B, (H/2)(W/2), 4C] (QwenImageEditPipeline._pack_latents)."""
+    tiled = PACK_ROW_MAJOR and z.layout == ttnn.TILE_LAYOUT
+    if tiled:  # a 6-D TILE permute pads its size-2 last dim to a whole tile (16x the work); row major moves elements
+        z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
     z = ttnn.reshape(z, (B, C, H // 2, 2, W // 2, 2))
     z = ttnn.permute(z, (0, 2, 4, 1, 3, 5))
-    return ttnn.reshape(z, (B, (H // 2) * (W // 2), C * 4))
+    z = ttnn.reshape(z, (B, (H // 2) * (W // 2), C * 4))
+    return ttnn.to_layout(z, ttnn.TILE_LAYOUT) if tiled else z
 
 
 def unpack_latents(x, B, C, H, W):
     """[B, (H/2)(W/2), 4C] -> [B, C, H, W] (QwenImageEditPipeline._unpack_latents)."""
+    tiled = PACK_ROW_MAJOR and x.layout == ttnn.TILE_LAYOUT
+    if tiled:
+        x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
     x = ttnn.reshape(x, (B, H // 2, W // 2, C, 2, 2))
     x = ttnn.permute(x, (0, 3, 1, 4, 2, 5))
-    return ttnn.reshape(x, (B, C, H, W))
+    x = ttnn.reshape(x, (B, C, H, W))
+    return ttnn.to_layout(x, ttnn.TILE_LAYOUT) if tiled else x
 
 
 class TtQwenVAE:
