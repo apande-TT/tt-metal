@@ -384,6 +384,9 @@ PLANNED_TP = 4
 #                     acquire instead of 1, factor tiles read straight from r, and the multiply + bf16 rounding in ONE
 #                     SFPU pass (FUSED_RNE: the typecast's integer RNE applied to the product in a register): 416-row
 #                     prompt 109.8 -> 71.6 us a call, 128-row 44.6 -> 35.2 us, bit-identical.
+#   prefill q / k RoPE outputs in L1 for short prompts (ministral3_attention.PREFILL_ROPE_OUT_L1_BYTES, q <= 96 KB a
+#                     core), read there by the cache fill and SDPA and freed after SDPA: 128-row prompt q RoPE 39.9 ->
+#                     23.1 us, k 13.3 -> 8.7, SDPA 86.0 -> 67.1 us a layer, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
