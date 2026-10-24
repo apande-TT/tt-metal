@@ -357,6 +357,9 @@ PLANNED_TP = 4
 #   decode sampler MergeTopK on TWO cores (MergeTopK.SPLIT): the leaf merges the second pair of packed key tiles and
 #                     copies its winner into the root's buffers while the root merges the first pair, then the root
 #                     merges the two winners: 10.0 -> ~7.5 us a token, bit-identical.
+#   decode sampler DrawTail on TWO cores, 8 rows a RISC (DrawTail.SPLIT, kernels/draw_tail.cpp SPLIT8): 64-B aligned
+#                     row segments in and out, each core's 16 ids written once its two RISCs have them: 8.2 -> ~4.6 us a
+#                     token, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
@@ -508,12 +511,15 @@ class DrawTail:
     (1, 1, B, 1) uint32 draw."""
 
     CB = 0
+    # grid try (run 8): two cores, one a 16-row half, each RISC 8 rows of it (kernels/draw_tail.cpp SPLIT8)
+    SPLIT = True
 
     def __init__(self, device, batch, pad_token_id, eos_token_id):
         assert batch == ttnn.TILE_SIZE, batch
         self.device, self.batch = device, batch
         self.pad, self.eos = int(pad_token_id), int(eos_token_id)
         self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        self.cores2 = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))])
 
     @staticmethod
     def supports(scores, ids):
@@ -539,6 +545,25 @@ class DrawTail:
             acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         size = 12 * 1024 + 128  # per RISC: scores / ids face pairs, the unfinished and drawn faces; the id row
         fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        if self.SPLIT:
+            cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.cores2, format_descriptors=[fmt])]
+            rt = [t.buffer_address() for t in io]
+            kernels = [
+                ttnn.KernelDescriptor(
+                    kernel_source=_DRAW_TAIL_KERNEL,
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(half, 0), ttnn.CoreCoord(half, 0))]),
+                    compile_time_args=[half, self.pad, self.eos, self.CB] + acc,
+                    runtime_args=[((half, 0), rt)],
+                    config=cfg,
+                    defines=[("SPLIT8", "1"), ("SPLIT8_SUB", str(sub)), ("SPLIT8_SEM", "0")],
+                )
+                for half in (0, 1)
+                for sub, cfg in ((0, ttnn.ReaderConfigDescriptor()), (1, ttnn.WriterConfigDescriptor()))
+            ]
+            sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=self.cores2, initial_value=0)]
+            ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+            return drawn
         cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
         kernels = [
             ttnn.KernelDescriptor(
