@@ -360,6 +360,8 @@ PLANNED_TP = 4
 #   decode sampler DrawTail on TWO cores, 8 rows a RISC (DrawTail.SPLIT, kernels/draw_tail.cpp SPLIT8): 64-B aligned
 #                     row segments in and out, each core's 16 ids written once its two RISCs have them: 8.2 -> ~4.6 us a
 #                     token, bit-identical.
+#   prefill norm stats and their all_gather in L1 (add_stats.STATS_L1; the norm frees both right after the sum):
+#                     416-row stats gather 70-76 -> 57-64 us a call, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

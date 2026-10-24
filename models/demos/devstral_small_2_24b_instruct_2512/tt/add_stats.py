@@ -27,6 +27,8 @@ BLK = 4  # tiles a block (fp32 DEST holds 4)
 CB_X, CB_D, CB_SCALER, CB_H, CB_X2, CB_MASK, CB_OUT, CB_S, CB_SRAW = 0, 1, 2, 3, 4, 5, 16, 17, 18
 # apply()'s stats tile holds the row sum in column 0 and exact zeros in columns 1..31 (no masking needed after a gather)
 CLEAN_STATS = True
+# shard try (run 8): the one-tile-wide stats (~16 KB a core at 416 rows) in L1 for the norm's stats all_gather
+STATS_L1 = True
 # apply_l1's per-core shard bounds (see l1_copy_cores)
 L1_COPY_MIN_CORES = 64
 L1_COPY_MAX_BYTES = 640 * 1024
@@ -130,7 +132,11 @@ def _run(x, d, cast, l1_copy=False):
     stats = None
     if not cast:
         stats = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(shape[:-1] + [_TILE]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
+            ttnn.Shape(shape[:-1] + [_TILE]),
+            ttnn.float32,
+            ttnn.TILE_LAYOUT,
+            device,
+            ttnn.L1_MEMORY_CONFIG if STATS_L1 else ttnn.DRAM_MEMORY_CONFIG,
         )
     xa, da, ha = x.buffer_address(), d.buffer_address(), h.buffer_address()
     base, extra = divmod(rt, ncores)
