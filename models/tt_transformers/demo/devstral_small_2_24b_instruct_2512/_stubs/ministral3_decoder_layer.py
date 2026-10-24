@@ -68,6 +68,9 @@ class TtMinistral3DecoderLayer:
     # shard try (run 8): ... with the norm's row sums and its factor r in L1 (interleaved, ~16 KB a core at 416 rows; both
     # freed as soon as the scale has read them) instead of DRAM
     PREFILL_NORM_FACTOR_L1 = True
+    # structural try (run 8): ... and the rsqrt chain folded into that scale program (norm_scale.scale chain=): the
+    # broadcast row sum gets x 1/N, + eps and rsqrt in DEST, one program fewer a norm
+    PREFILL_NORM_CHAIN_IN_SCALE = True
     # (residual tensor, its sum-of-squares stats, whether those are whole-row totals[, its L1 copy or None]): set by the
     # last layer's fused add (per-device partial stats) or by the model for its bf16 prompt embeddings
     # (carry_input_stats).
@@ -343,6 +346,17 @@ class TtMinistral3DecoderLayer:
                 ttnn.deallocate(sq)
             sq = s_
         f_l1 = sq.memory_config().buffer_type == ttnn.BufferType.L1
+        if x_l1 is not None and self.PREFILL_NORM_SCALE_CPP and self.PREFILL_NORM_CHAIN_IN_SCALE:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_scale
+
+            if norm_scale.supports(x_l1, sq):  # the rsqrt chain below, run inside the scale program
+                y = norm_scale.scale(x_l1, sq, chain=(1.0 / self.hidden, norm._impl.eps))
+                if f_l1:
+                    ttnn.deallocate(sq)
+                ttnn.deallocate(x_l1)
+                out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+                ttnn.deallocate(y)
+                return out
         # rsqrt(sq / N + eps) as ONE SFPU chain: the same fp32 multiply, add and rsqrt the three separate ops ran
         r = ttnn.unary_chain(
             sq,
