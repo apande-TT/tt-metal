@@ -354,6 +354,10 @@ PLANNED_TP = 4
 #                     P @ V stop at the diagonal of the row's P @ V subblock instead of rounding up to whole exp groups
 #                     (partial last exp group), the exp's SFPU init runs once a pass: SDPA 416 424 -> 418 us, 128
 #                     96 -> 86 us, bit-identical.
+#   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
+#                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
+#                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
+#                     QKV output bit-identical.
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
