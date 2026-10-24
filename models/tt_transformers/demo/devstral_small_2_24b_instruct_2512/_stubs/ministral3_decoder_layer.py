@@ -76,6 +76,10 @@ class TtMinistral3DecoderLayer:
     # ... and the o_proj one folded into the MLP's gate / up program together with the residual add (its link workers
     # exchange the partials while the gate / up weights already stream; TtMinistral3MLP.decode_ar).
     DECODE_FOLD_OPROJ_REDUCE = True
+    # The decode input norm as a step-for-step replica of rms_norm's sharded kernel on the residual's own shard cores
+    # (tt/norm_decode.py, kernels/norm_rep_*.cpp) that emits the bf16 TRUNCATION of the normed row: the HiFi2 QKV
+    # multiplies only the high bits of its in0, so it computes the same products from half the activation bytes.
+    DECODE_TRUNC_INPUT_NORM = True
 
     def __init__(self, device, torch_module, meta_rope=False, layer_idx=None) -> None:
         """meta_rope: see TtMinistral3Attention (the caller supplies rotary tables in the matching order).
@@ -128,6 +132,15 @@ class TtMinistral3DecoderLayer:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(device),
             )
 
+    def _trunc_input_norm(self, x) -> bool:
+        if not (self.DECODE_TRUNC_INPUT_NORM and self.self_attn.DECODE_SHARDED_INPUT and self.tp > 1):
+            return False
+        if self.input_layernorm.gamma is not None:
+            return False
+        from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_decode
+
+        return norm_decode.supports(x)
+
     @property
     def attn(self):
         return self.self_attn
@@ -175,7 +188,11 @@ class TtMinistral3DecoderLayer:
         if mode != "decode" and self.tp > 1 and int(x.shape[-1]) * self.tp == self.hidden:
             out = self._prefill_sharded(x, attention_mask, position_ids, position_embeddings, kv_cache)
             return ttnn.reshape(out, in_shape) if len(in_shape) == 3 else out
-        if mode == "decode":
+        if mode == "decode" and self._trunc_input_norm(x):
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_decode
+
+            n = norm_decode.trunc_norm(x, self.input_layernorm._impl.eps)
+        elif mode == "decode":
             # sharded norm reads the fp32 residual directly; the decode QKV reads its width shards as they are
             n = self.input_layernorm.decode(x, keep_sharded=self.self_attn.DECODE_SHARDED_INPUT)
         else:
