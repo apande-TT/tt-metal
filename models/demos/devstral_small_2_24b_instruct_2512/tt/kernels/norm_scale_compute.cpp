@@ -26,6 +26,35 @@
 #include "api/compute/reg_api.h"
 #include "api/compute/tile_move_copy.h"
 
+#if defined(FUSED_RNE) && defined(TRISC_MATH)
+namespace ckernel::sfpu {
+// mul_binary_tile then typecast_tile<Float32, Float16_b> in ONE pass over the rows (FUSED_RNE, cpp try 2): the
+// product in0 * in1 (calculate_sfpu_binary_mul's fp32-DEST path) stays in a register and is rounded there exactly as
+// calculate_typecast_fp32_to_fp16b rounds it after reloading it -- bits + 0x7FFF + bit 16, low half cleared, stored
+// as fp32 -- instead of a store, a reload and a second pass. The constants live in LREGs across the rows.
+template <int ITERATIONS>
+inline void ns_mul_rne(const uint32_t in0, const uint32_t in1, const uint32_t out) {
+    constexpr uint32_t T = 32;  // DEST rows a tile in sfpi addressing
+    const sfpi::vUInt c_one = 1;
+    const sfpi::vUInt c_half = 0x7fff;
+    const sfpi::vUInt c_hi = 0xffff0000;
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vFloat a = sfpi::dst_reg[in0 * T];
+        sfpi::vFloat b = sfpi::dst_reg[in1 * T];
+        sfpi::vFloat p = a * b;
+        sfpi::vUInt u = sfpi::as<sfpi::vUInt>(p);
+        sfpi::vUInt lsb = (u >> 16) & c_one;
+        u = u + c_half;
+        u = u + lsb;
+        u = u & c_hi;
+        sfpi::dst_reg[out * T] = sfpi::as<sfpi::vFloat>(u);
+        sfpi::dst_reg++;
+    }
+}
+}  // namespace ckernel::sfpu
+#endif
+
 void kernel_main() {
     constexpr uint32_t ROWS = get_compile_time_arg_val(0);   // tile rows of this core's shard
     constexpr uint32_t WT = get_compile_time_arg_val(1);     // tiles across a row
@@ -68,6 +97,11 @@ void kernel_main() {
             copy_init(cb_rb);
             copy_tile(cb_rb, 0, dst_b);
             mul_binary_tile_init();
+#ifdef FUSED_RNE
+            for (uint32_t i = 0; i < n; ++i) {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne, (8), i, dst_b, i, VectorMode::RC)));
+            }
+#else
             for (uint32_t i = 0; i < n; ++i) {
                 mul_binary_tile(i, dst_b, i);
             }
@@ -75,6 +109,7 @@ void kernel_main() {
             for (uint32_t i = 0; i < n; ++i) {
                 typecast_tile<0u, 5u>(i);
             }
+#endif
             tile_regs_commit();
             tile_regs_wait();
             for (uint32_t i = 0; i < n; ++i) {

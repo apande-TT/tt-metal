@@ -17,6 +17,8 @@ import ttnn
 _KDIR = Path(__file__).resolve().parent / "kernels"
 CB_X, CB_R, CB_OUT, CB_RB = 0, 1, 2, 6
 CHUNK = 3  # x tiles a DEST acquire (fp32 half-sync DEST holds 4: CHUNK + the broadcast factor)
+# cpp try 2 (run 8): the multiply and the bf16 rounding in one SFPU pass (kernels/norm_scale_compute.cpp FUSED_RNE)
+FUSED_RNE = True
 
 
 def _cores(grid):
@@ -101,6 +103,7 @@ def scale(x_l1, r):
             compile_time_args=[rows, wt, CHUNK],
             runtime_args=[(c, []) for c in cores],
             config=cfg,
+            defines=[("FUSED_RNE", "1")] if FUSED_RNE else [],
         ),
     ]
     ttnn.generic_op([x_l1, r, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))

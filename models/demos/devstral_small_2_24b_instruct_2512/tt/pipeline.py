@@ -381,8 +381,9 @@ PLANNED_TP = 4
 #   prefill norm scale as a generic_op replica of ttnn.multiply's SFPU column-broadcast program
 #                     (ministral3_decoder_layer.PREFILL_NORM_SCALE_CPP, tt/norm_scale.py, kernels/norm_scale_*.cpp):
 #                     the same unpack-to-dest copies, mul_binary_tile and fp32 -> bf16 typecast_tile, 3 x tiles a DEST
-#                     acquire instead of 1, factor tiles read straight from r: 416-row prompt 109.8 -> 94.6 us a call,
-#                     bit-identical.
+#                     acquire instead of 1, factor tiles read straight from r, and the multiply + bf16 rounding in ONE
+#                     SFPU pass (FUSED_RNE: the typecast's integer RNE applied to the product in a register): 416-row
+#                     prompt 109.8 -> 71.6 us a call, 128-row 44.6 -> 35.2 us, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
