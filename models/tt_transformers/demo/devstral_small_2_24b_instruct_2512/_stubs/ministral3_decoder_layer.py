@@ -53,8 +53,14 @@ class TtMinistral3DecoderLayer:
     # residual's sums are handed to the next layer's input norm through _CARRY (only when that layer receives the
     # very same tensor object; anything else recomputes them).
     FUSED_ADD_STATS = True
-    # (residual tensor, its sum-of-squares stats, whether those are whole-row totals): set by the last layer's fused
-    # add (per-device partial stats) or by the model for its bf16 prompt embeddings (carry_input_stats).
+    # ... and that pass also writes a HEIGHT-SHARDED L1 copy of the new residual (tt/add_stats.apply_l1: each core
+    # its own whole tile rows), which the next norm's scale multiply reads natively sharded (no DRAM read of the fp32
+    # residual) and writes its bf16 output into the same shards for the hidden all_gather; the copy is freed right
+    # after the multiply. The MLP residual's copy rides _CARRY to the next layer's input norm.
+    PREFILL_NORM_L1_COPY = True
+    # (residual tensor, its sum-of-squares stats, whether those are whole-row totals[, its L1 copy or None]): set by the
+    # last layer's fused add (per-device partial stats) or by the model for its bf16 prompt embeddings
+    # (carry_input_stats).
     _CARRY = None
     # Set by the model on its last layer: that layer's final sharded-prefill residual add emits bf16 (C++ add + the
     # SFPU round ttnn.typecast runs, tt/add_stats.apply_bf16) for the model's bf16 all_gather, instead of an fp32
@@ -225,20 +231,24 @@ class TtMinistral3DecoderLayer:
         """Prefill with the residual x as this device's (B, 1, S, D/TP) hidden shard (see SHARD_PREFILL_RESIDUAL)."""
         carry, TtMinistral3DecoderLayer._CARRY = TtMinistral3DecoderLayer._CARRY, None
         x_sq, x_total = (carry[1], carry[2]) if carry is not None and carry[0] is x else (None, False)
+        x_l1 = carry[3] if carry is not None and len(carry) > 3 else None
+        if x_l1 is not None and carry[0] is not x:  # a copy of some other tensor: never leave it in L1
+            ttnn.deallocate(x_l1)
+            x_l1 = None
         self.self_attn.prefill_gather = self.mlp.prefill_gather = False
         try:
             a = self.self_attn(
-                self._prefill_norm(self.input_layernorm, x, sq=x_sq, total=x_total),
+                self._prefill_norm(self.input_layernorm, x, sq=x_sq, total=x_total, x_l1=x_l1),
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 kv_cache=kv_cache,
                 mode="prefill",
             )
-            h, h_sq = self._residual_add_stats(x, a)
+            h, h_sq, h_l1 = self._residual_add_stats(x, a, l1=True)
             if a.memory_config().buffer_type == ttnn.BufferType.L1:
                 ttnn.deallocate(a)  # attention's short-prompt L1 output (PREFILL_OPROJ_OUT_L1_BYTES)
-            m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h, sq=h_sq), mode="prefill")
+            m = self.mlp(self._prefill_norm(self.post_attention_layernorm, h, sq=h_sq, x_l1=h_l1), mode="prefill")
         finally:
             self.self_attn.prefill_gather = self.mlp.prefill_gather = True
         if self.bf16_prefill_out and self.FUSED_ADD_STATS:
@@ -246,19 +256,22 @@ class TtMinistral3DecoderLayer:
 
             if add_stats.supports(h, m):
                 return add_stats.apply_bf16(h, m)
-        out, out_sq = self._residual_add_stats(h, m)
+        out, out_sq, out_l1 = self._residual_add_stats(h, m, l1=True)
         if out_sq is not None:
-            TtMinistral3DecoderLayer._CARRY = (out, out_sq, False)
+            TtMinistral3DecoderLayer._CARRY = (out, out_sq, False, out_l1)
         return out
 
-    def _prefill_norm(self, norm, x, sq=None, total=False):
+    def _prefill_norm(self, norm, x, sq=None, total=False, x_l1=None):
         """Full-width bf16 norm output of the hidden-sharded fp32 residual x (sq: its sum-of-squares stats, if known;
-        total: sq holds whole-row totals as carry_input_stats describes, not this device's partial sums)."""
+        total: sq holds whole-row totals as carry_input_stats describes, not this device's partial sums; x_l1: x's
+        height-sharded L1 copy, consumed and freed here)."""
         if self.SHARDED_PREFILL_NORM:
-            return self._sharded_norm(norm, x, sq, total)
+            return self._sharded_norm(norm, x, sq, total, x_l1)
+        if x_l1 is not None:
+            ttnn.deallocate(x_l1)
         return self._bf16(norm(ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())))
 
-    def _sharded_norm(self, norm, x, sq=None, total=False):
+    def _sharded_norm(self, norm, x, sq=None, total=False, x_l1=None):
         """Unit-gamma RMSNorm of the fp32 hidden shard x: each device's sum of squares, an all_gather of those sums,
         the shard scaled by rsqrt(mean + eps) in fp32, and an all_gather of the bf16 result.
 
@@ -291,6 +304,12 @@ class TtMinistral3DecoderLayer:
                 ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
             ],
         )
+        if x_l1 is not None:  # native height-sharded multiply: each core scales its own L1 rows into its own shard
+            y = ttnn.multiply(x_l1, r, dtype=ttnn.bfloat16, memory_config=x_l1.memory_config())
+            ttnn.deallocate(x_l1)
+            out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+            ttnn.deallocate(y)
+            return out
         if PREFILL_AG_IN_L1 and int(x.shape[-2]) > ttnn.TILE_SIZE:
             y = ttnn.multiply(x, r, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
             out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
@@ -304,16 +323,19 @@ class TtMinistral3DecoderLayer:
 
         return getattr(add_stats, "CLEAN_STATS", False)
 
-    def _residual_add_stats(self, x, delta):
-        """(x + delta, the sum-of-squares stats of the sum or None) for the prefill residual (see FUSED_ADD_STATS)."""
+    def _residual_add_stats(self, x, delta, l1=False):
+        """(x + delta, the sum-of-squares stats of the sum or None, the sum's L1 copy or None) for the prefill residual
+        (see FUSED_ADD_STATS; l1: also the PREFILL_NORM_L1_COPY copy, when the rows split evenly into L1 shards)."""
         if self.FUSED_ADD_STATS and self.SHARDED_PREFILL_NORM:
             from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
 
             if add_stats.supports(x, delta):
-                return add_stats.apply(x, delta)
+                if l1 and self.PREFILL_NORM_L1_COPY and add_stats.l1_copy_cores(x):
+                    return add_stats.apply_l1(x, delta)
+                return add_stats.apply(x, delta) + (None,)
         if self.RESIDUAL_DTYPE is not None and x.dtype != self.RESIDUAL_DTYPE:  # a bf16 first-layer input
             x = ttnn.typecast(x, self.RESIDUAL_DTYPE)
-        return self._residual_add(x, delta), None
+        return self._residual_add(x, delta), None, None
 
     @staticmethod
     def _residual_add(x, delta, memory_config=None):
