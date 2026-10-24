@@ -398,6 +398,9 @@ PLANNED_TP = 4
 #                     writer copy and h^2 from the same DEST tiles (add_binary_tile, copy_dest_values, square_tile),
 #                     no row buffer of h packed and unpacked twice: 416-row adds ~2340 -> 2239 us a 2-layer slice,
 #                     128-row unchanged (memory bound), bit-identical.
+#   prefill norm row sums and factor r in L1 for the C++ scale (ministral3_decoder_layer.PREFILL_NORM_FACTOR_L1; ~16
+#                     KB a core, both freed once read): 416 rows sum 12 -> ~10.5 us, rsqrt chain 13 -> 6 us, scale 71
+#                     -> 69 us a norm; 128 rows rsqrt 4 -> 3, scale 35 -> 34 us, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
