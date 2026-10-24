@@ -391,8 +391,9 @@ PLANNED_TP = 4
 #                     (its 32 row sums; the rest is zeros) written as one row of a compact tile, the all_gather moves
 #                     1/32 of the bytes and a DM program rebuilds the exact (..., S, 128) gathered tiles for the sum:
 #                     416 rows 96.5 -> 41.4 + 17.3 us, 128 rows 23.7 -> 8.3 + 9.4 us a call, bit-identical.
-#   prefill final norm's gamma product in L1 for its all_gather (ministral3_r_m_s_norm.FINAL_GAMMA_OUT_L1): 416 rows
-#                     205-240 -> ~180 us, 128 rows 68.8 -> 58.0 us, bit-identical.
+#   prefill final norm's normed rows and gamma product in L1 for its all_gather (ministral3_r_m_s_norm.
+#                     FINAL_GAMMA_OUT_L1): 416 rows x * r 132 -> ~97 us, gamma multiply 205-240 -> ~121 us; 128 rows
+#                     ~49 -> 37 and 68.8 -> 39 us, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
