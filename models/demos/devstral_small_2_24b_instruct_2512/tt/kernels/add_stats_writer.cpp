@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Writer of tt/add_stats.py: for each of this core's tile rows the BLK-tile blocks of h = x + d, then the row's
-// sum-of-squares tile.
+// sum-of-squares tile. With L1_COPY each block is also copied into this core's shard of a height-sharded L1 copy of h
+// (runtime arg 4: its address; the core's rows are exactly its shard).
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -24,6 +25,9 @@ void kernel_main() {
     constexpr uint32_t cb_out = 16;
     constexpr uint32_t cb_s = 17;
     const uint32_t h_bytes = get_tile_size(cb_out);
+#ifdef L1_COPY
+    uint32_t hl1 = get_arg_val<uint32_t>(4);
+#endif
 
     for (uint32_t r = r0; r < r0 + nr; ++r) {
         for (uint32_t t = 0; t < WT; t += BLK) {
@@ -33,6 +37,10 @@ void kernel_main() {
                 noc_async_write_page(r * WT + t + j, sh, l1);
                 l1 += h_bytes;
             }
+#ifdef L1_COPY
+            noc_async_write(get_read_ptr(cb_out), get_noc_addr(hl1), BLK * h_bytes);
+            hl1 += BLK * h_bytes;
+#endif
             noc_async_write_barrier();
             cb_pop_front(cb_out, BLK);
         }

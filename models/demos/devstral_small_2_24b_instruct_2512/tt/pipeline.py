@@ -346,6 +346,10 @@ PLANNED_TP = 4
 #                     _sharded_prefill): stats all_gather + shard norm * the device's gamma columns + ONE gather of the
 #                     bf16 result, instead of gathering the residual and norming + gamma-multiplying the full width on
 #                     every device (4x redundant): device_ms 125.45 -> 122.95.
+#   prefill norm scale multiply natively HEIGHT-SHARDED (ministral3_decoder_layer.PREFILL_NORM_L1_COPY): the residual
+#                     add (add_stats.apply_l1) also writes its fp32 sum into a height-sharded L1 copy (each core its own
+#                     whole tile rows, one local NOC write a block), the norm multiplies from it into bf16 shards for the
+#                     hidden all_gather and frees it: multiply 178 -> 106 us a call, trace prefill 1132.4 -> 1124.6 ms.
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
