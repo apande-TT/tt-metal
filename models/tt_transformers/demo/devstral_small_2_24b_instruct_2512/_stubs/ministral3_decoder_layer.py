@@ -317,9 +317,18 @@ class TtMinistral3DecoderLayer:
                 sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
             # L1 stats (add_stats.STATS_L1) are gathered into L1 and both freed as soon as the sum has read them
             l1 = sq.memory_config().buffer_type == ttnn.BufferType.L1
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import add_stats
+
+            compact = clean and add_stats.is_compact(sq, x)  # (add_stats.COMPACT_STATS: rebuilt after the gather)
             g = ttnn.all_gather(sq, dim=3, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None, **ccl)
             if l1:
                 ttnn.deallocate(sq)
+            if compact:
+                from models.demos.devstral_small_2_24b_instruct_2512.tt import stats_expand
+
+                full = stats_expand.expand(g, x)
+                ttnn.deallocate(g)
+                g = full
             sq = g
             if not clean:
                 sq = ttnn.multiply(sq, self._stats_mask)
