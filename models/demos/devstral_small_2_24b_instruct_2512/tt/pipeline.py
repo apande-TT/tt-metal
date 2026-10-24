@@ -387,6 +387,10 @@ PLANNED_TP = 4
 #   prefill q / k RoPE outputs in L1 for short prompts (ministral3_attention.PREFILL_ROPE_OUT_L1_BYTES, q <= 96 KB a
 #                     core), read there by the cache fill and SDPA and freed after SDPA: 128-row prompt q RoPE 39.9 ->
 #                     23.1 us, k 13.3 -> 8.7, SDPA 86.0 -> 67.1 us a layer, bit-identical.
+#   prefill norm stats gathered COMPACTED (add_stats.COMPACT_STATS, tt/stats_expand.py): each stats tile's column 0
+#                     (its 32 row sums; the rest is zeros) written as one row of a compact tile, the all_gather moves
+#                     1/32 of the bytes and a DM program rebuilds the exact (..., S, 128) gathered tiles for the sum:
+#                     416 rows 96.5 -> 41.4 + 17.3 us, 128 rows 23.7 -> 8.3 + 9.4 us a call, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

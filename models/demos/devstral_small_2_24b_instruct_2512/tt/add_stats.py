@@ -29,6 +29,11 @@ CB_X, CB_D, CB_SCALER, CB_H, CB_X2, CB_MASK, CB_OUT, CB_S, CB_SRAW = 0, 1, 2, 3,
 CLEAN_STATS = True
 # shard try (run 8): the one-tile-wide stats (~16 KB a core at 416 rows) in L1 for the norm's stats all_gather
 STATS_L1 = True
+# structural try (run 8): the stats written compacted -- each stats tile's column 0 (its 32 row sums) as one row of a
+# compact tile, (1, 1, tile_rows, 32) for tile_rows a multiple of 32 -- so the norm's stats all_gather moves 1/32 of
+# the bytes; tt/stats_expand.py rebuilds the gathered (..., S, 128) tiles exactly (zeros + column 0) for the sum
+COMPACT_STATS = True
+CB_ROW = 19
 # apply_l1's per-core shard bounds (see l1_copy_cores)
 L1_COPY_MIN_CORES = 64
 L1_COPY_MAX_BYTES = 640 * 1024
@@ -69,6 +74,22 @@ def apply(x, d):
     """x: fp32 (or bf16, widened exactly) TILE interleaved [..., S, W]; d: same shape, bf16 or fp32. Returns
     (h = x + d fp32 [..., S, W], stats fp32 [..., S, 32] with sum(h^2) of each row in column 0)."""
     return _run(x, d, cast=False)
+
+
+def compact_rows(x):
+    """Tile rows of x's stats when apply() writes them compacted (COMPACT_STATS), else 0."""
+    shape = [int(s) for s in x.shape]
+    rows = 1
+    for s in shape[:-1]:
+        rows *= s
+    rt = rows // _TILE
+    return rt if COMPACT_STATS and rt % _TILE == 0 and rt >= 2 * _TILE else 0
+
+
+def is_compact(stats, x) -> bool:
+    """Whether stats is apply()'s compacted stats tensor for the residual x."""
+    rt = compact_rows(x)
+    return bool(rt) and tuple(int(s) for s in stats.shape) == (1, 1, rt, _TILE)
 
 
 def l1_copy_cores(x):
@@ -130,9 +151,10 @@ def _run(x, d, cast, l1_copy=False):
             ),
         )
     stats = None
+    compact = not cast and bool(compact_rows(x))
     if not cast:
         stats = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(shape[:-1] + [_TILE]),
+            ttnn.Shape([1, 1, rt, _TILE] if compact else shape[:-1] + [_TILE]),
             ttnn.float32,
             ttnn.TILE_LAYOUT,
             device,
@@ -180,7 +202,7 @@ def _run(x, d, cast, l1_copy=False):
             compile_time_args=[wt, BLK] + _accessor_args(h) + ([] if cast else _accessor_args(stats)),
             runtime_args=rw,
             config=ttnn.WriterConfigDescriptor(),
-            defines=[("L1_COPY", "1")] if h_l1 is not None else [],
+            defines=([("L1_COPY", "1")] if h_l1 is not None else []) + ([("COMPACT_STATS", "1")] if compact else []),
         ),
         ttnn.KernelDescriptor(
             kernel_source=_CAST_COMPUTE if cast else _COMPUTE,
@@ -208,6 +230,9 @@ def _run(x, d, cast, l1_copy=False):
         _cb(cores, CB_MASK, ttnn.float32, 1),
         _cb(cores, CB_SRAW, ttnn.float32, 2),
     ]
+    if compact:  # the 32 row sums of a stats tile, gathered into one row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=CB_ROW, data_format=ttnn.uint32, page_size=128)
+        cbs.append(ttnn.CBDescriptor(total_size=128, core_ranges=cores, format_descriptors=[fmt]))
     if h_l1 is not None:
         ttnn.generic_op([x, d, h, stats, h_l1], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
         return h, stats, h_l1
