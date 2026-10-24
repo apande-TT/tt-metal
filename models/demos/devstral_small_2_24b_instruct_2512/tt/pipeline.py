@@ -342,6 +342,10 @@ PLANNED_TP = 4
 #   prefill SDPA reads only each causal q chunk's K / V rows up to its diagonal (tt/sdpa_prefill.py CAUSAL_READ_SKIP,
 #                     kernels/sdpa_reader.cpp: the stock reader + SDPA_CAUSAL_READ_SKIP; the compute already skipped
 #                     those tiles): 416-row SDPA 529 -> 424 us a call, bit-identical.
+#   prefill final norm on the hidden shards (ministral3_model.SHARDED_FINAL_NORM, ministral3_r_m_s_norm
+#                     _sharded_prefill): stats all_gather + shard norm * the device's gamma columns + ONE gather of the
+#                     bf16 result, instead of gathering the residual and norming + gamma-multiplying the full width on
+#                     every device (4x redundant): device_ms 125.45 -> 122.95.
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
