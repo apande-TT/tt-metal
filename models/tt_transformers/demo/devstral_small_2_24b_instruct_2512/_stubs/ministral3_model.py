@@ -42,6 +42,9 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.token
 
 
 class TtMinistral3Model:
+    # structural try (run 8): the prefill final norm on the hidden shards (see _sharded_final_norm)
+    SHARDED_FINAL_NORM = True
+
     def __init__(self, device, torch_module, max_seq_len: int = 8192, n_layers=None) -> None:
         self.device = device
         cfg = torch_module.config
@@ -56,6 +59,17 @@ class TtMinistral3Model:
         ]
         self.norm = TtMinistral3RMSNorm.build(device, torch_module.norm)
         self.tp = self.layers[0].tp
+        # structural try (run 8, SHARDED_FINAL_NORM): the final norm's checkpoint gamma split over the TP mesh, each
+        # device multiplying only its own hidden columns before the gather
+        self._gamma_shard = None
+        if self.SHARDED_FINAL_NORM and self.tp > 1 and self.norm.gamma is not None:
+            self._gamma_shard = ttnn.from_torch(
+                torch_module.norm.weight.detach().to(torch.bfloat16).reshape(1, 1, 1, -1).contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                mesh_mapper=ttnn.ShardTensorToMesh(device, dim=3),
+            )
         # the last layer's prefill output only feeds the bf16 all_gather below (see bf16_prefill_out)
         self.layers[-1].bf16_prefill_out = True
         self.head_dim = self.layers[0].self_attn.head_dim
@@ -162,10 +176,20 @@ class TtMinistral3Model:
                 kv_cache=None if kv_caches is None else kv_caches[i],
                 mode="prefill",
             )
+        if shard and self._gamma_shard is not None and int(x.shape[-1]) * self.tp == d:
+            out = self._sharded_final_norm(self._bf16(x))
+            return ttnn.reshape(out, (b, s, d))
         if shard:
             x = ttnn.all_gather(self._bf16(x), dim=3, **tp_ccl_args())
         out = self._bf16(self.norm(self._bf16(x)))
         return ttnn.reshape(out, (b, s, d))
+
+    def _sharded_final_norm(self, x):
+        """The final RMSNorm on the bf16 hidden shard x, through the norm's own call (TtMinistral3RMSNorm
+        _sharded_prefill): stats all_gather + shard norm * gamma columns + one gather of the bf16 result."""
+        layer = self.layers[-1]
+        ctx = dict(hidden=layer.hidden, stats_mask=layer._stats_mask, gamma_shard=self._gamma_shard, ccl=tp_ccl_args())
+        return self.norm(x, hidden_shard=ctx)
 
     # The sharded gather's bf16 slice goes through L1 (interleaved, <= this many bytes per bank) on its way to the
     # residual dtype: the typecast reads it there instead of from DRAM, and it is freed right after.

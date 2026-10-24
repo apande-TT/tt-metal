@@ -159,7 +159,9 @@ class TtMinistral3RMSNorm:
         n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, hidden_shard=None, **kwargs):
+        if hidden_shard is not None:
+            return self._sharded_prefill(x, **hidden_shard)
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.
         shape = tuple(x.shape)
         if len(shape) != 4:
@@ -171,6 +173,29 @@ class TtMinistral3RMSNorm:
         if self.gamma is not None:
             out = ttnn.multiply(out, self.gamma)
         return ttnn.reshape(out, shape)
+
+    def _sharded_prefill(self, x, hidden, stats_mask, gamma_shard, ccl):
+        """This norm (with its checkpoint gamma) on a TP mesh's bf16 hidden shard x (B, 1, S, D / TP), gathered once
+        at the end (structural try, run 8; the model's final norm, see TtMinistral3Model.SHARDED_FINAL_NORM): each
+        device's row sums of squares, an all_gather of those sums (masked to column 0, summed in fp32), x *
+        rsqrt(mean + eps) on the shard, * the device's gamma columns, and ONE all_gather of the bf16 result --
+        instead of gathering the residual and norming + multiplying the full width redundantly on every device."""
+        cfg = self._impl.compute_kernel_config_hifi2
+        sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
+        sq = ttnn.all_gather(sq, dim=3, **ccl)
+        sq = ttnn.multiply(sq, stats_mask)
+        sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        r = ttnn.unary_chain(
+            sq,
+            [
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, 1.0 / hidden),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.ADD_UNARY_SFPU, self._impl.eps),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
+            ],
+        )
+        y = ttnn.multiply(x, r, dtype=ttnn.bfloat16)
+        y = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16)
+        return ttnn.all_gather(y, dim=3, **ccl)
 
 
 # Module-level `build` — primary test entry point.
