@@ -71,6 +71,9 @@ class TtMinistral3DecoderLayer:
     # structural try (run 8): ... and the rsqrt chain folded into that scale program (norm_scale.scale chain=): the
     # broadcast row sum gets x 1/N, + eps and rsqrt in DEST, one program fewer a norm
     PREFILL_NORM_CHAIN_IN_SCALE = True
+    # cpp try (run 8): ... and the compact stats' expand + row sum too (norm_scale.scale nd=, FUSED_SUM): the scale
+    # program reads the gathered compact stats itself, two programs fewer a norm
+    PREFILL_NORM_FUSED_SUM = True
     # (residual tensor, its sum-of-squares stats, whether those are whole-row totals[, its L1 copy or None]): set by the
     # last layer's fused add (per-device partial stats) or by the model for its bf16 prompt embeddings
     # (carry_input_stats).
@@ -329,6 +332,23 @@ class TtMinistral3DecoderLayer:
             g = ttnn.all_gather(sq, dim=3, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None, **ccl)
             if l1:
                 ttnn.deallocate(sq)
+            if (
+                compact
+                and x_l1 is not None
+                and self.PREFILL_NORM_SCALE_CPP
+                and self.PREFILL_NORM_CHAIN_IN_SCALE
+                and self.PREFILL_NORM_FUSED_SUM
+            ):
+                from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_scale
+
+                nd = int(g.shape[-1]) // ttnn.TILE_SIZE
+                if norm_scale.supports_gathered(x_l1, g, nd):  # the expand + sum below, inside the scale program
+                    y = norm_scale.scale(x_l1, g, chain=(1.0 / self.hidden, norm._impl.eps), nd=nd)
+                    ttnn.deallocate(g)
+                    ttnn.deallocate(x_l1)
+                    out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+                    ttnn.deallocate(y)
+                    return out
             if compact:
                 from models.demos.devstral_small_2_24b_instruct_2512.tt import stats_expand
 
