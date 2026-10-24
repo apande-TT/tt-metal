@@ -365,7 +365,8 @@ PLANNED_TP = 4
 #   decode input norm as a generic_op replica of rms_norm's sharded kernel (tt/norm_decode.py, kernels/norm_rep_*.cpp:
 #                     same LLK calls, scalers and two-stage reduce) that packs the bf16 TRUNCATION of the normed row --
 #                     what the HiFi2 QKV multiplies of an fp32 in0 anyway -- so the QKV reads half the activation bytes:
-#                     norm 5.71 -> 7.45 us, QKV 24.2 -> 21.9 us (-0.55 us a layer), bit-identical.
+#                     norm 5.71 -> 6.88 us (factor multicast from the root, MCAST_FACTOR), QKV 24.2 -> ~21.6 us
+#                     (~-1.4 us a layer), bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

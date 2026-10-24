@@ -22,6 +22,8 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 _F32_TILE, _BF16_TILE = 4096, 2048
 CB_X, CB_X2, CB_SCALER, CB_PART, CB_EXT, CB_SCG, CB_EX2, CB_EPS, CB_EX2PE, CB_EXG, CB_OUT = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16
 SEM_GATHER, SEM_FACTOR = 0, 1
+# cpp try 2 (run 8): the root multicasts the norm factor to all cores (else a root -> row worker -> row unicast tree)
+MCAST_FACTOR = True
 
 
 def _bf16_pair(v: float) -> int:
@@ -91,15 +93,23 @@ def trunc_norm(h, eps: float):
     for y in range(ny):
         for x in range(nx):
             role = 2 if (x, y) == (0, 0) else (1 if x == 0 else 0)
-            if role == 2:
-                fwd = [(0, yy) for yy in range(1, ny)] + [(xx, 0) for xx in range(1, nx)]
-            elif role == 1:
-                fwd = [(xx, y) for xx in range(1, nx)]
+            if MCAST_FACTOR:
+                # the root multicasts the factor to (1..7, 0) and (0..7, 1..4)
+                rects = [(1, 0, nx - 1, 0), (0, 1, nx - 1, ny - 1)] if role == 2 else []
+                tail = [len(rects)]
+                for a_, b_, c_, d_ in rects:
+                    tail += xy_phys(a_, b_) + xy_phys(c_, d_) + [(c_ - a_ + 1) * (d_ - b_ + 1)]
             else:
-                fwd = []
-            rt = [x] + xy_phys(0, y) + root + [scalar_w, cinv_root if role == 2 else cinv_one, eps_u, y, len(fwd)]
-            for fx, fy in fwd:
-                rt += xy_phys(fx, fy)
+                if role == 2:
+                    fwd = [(0, yy) for yy in range(1, ny)] + [(xx, 0) for xx in range(1, nx)]
+                elif role == 1:
+                    fwd = [(xx, y) for xx in range(1, nx)]
+                else:
+                    fwd = []
+                tail = [len(fwd)]
+                for fx, fy in fwd:
+                    tail += xy_phys(fx, fy)
+            rt = [x] + xy_phys(0, y) + root + [scalar_w, cinv_root if role == 2 else cinv_one, eps_u, y] + tail
             roles[role].append(((x, y), rt))
     kernels = []
     for role, items in roles.items():
@@ -113,6 +123,7 @@ def trunc_norm(h, eps: float):
                 compile_time_args=[wt, role, SEM_GATHER, SEM_FACTOR, nx, ny],
                 runtime_args=items,
                 config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
+                defines=[("MCAST_FACTOR", "1")] if MCAST_FACTOR else [],
             )
         )
         kernels.append(

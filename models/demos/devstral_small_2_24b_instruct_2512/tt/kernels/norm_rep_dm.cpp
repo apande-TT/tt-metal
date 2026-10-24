@@ -8,7 +8,9 @@
 // it there. A row worker (y > 0) waits for its 8, then sends its reduced tile into slot 8 + y - 1 of the root's cb_ext;
 // the root waits for 12, and once the compute has the factor it sends it to the row workers, which pass it on to their
 // row (unicast writes into each core's cb_exg, each followed by a semaphore increment). All transfers are unicast to
-// NOC coordinates passed in, and every count follows its write barrier.
+// NOC coordinates passed in, and every count follows its write barrier. MCAST_FACTOR: the root instead multicasts the
+// factor tile and then the factor semaphore to every other core (rectangles in the runtime args, as layernorm's own
+// sender does), and nothing is forwarded.
 
 #include <cstdint>
 
@@ -90,6 +92,33 @@ void kernel_main() {
     } else {
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fsem), 1);
     }
+#ifdef MCAST_FACTOR
+    if constexpr (ROLE == 2) {
+        // nfw = rectangles: x0 y0 x1 y1 cores each (NOC coordinates), together every core but this one
+        for (uint32_t i = 0; i < nfw; ++i) {
+            const uint32_t b = fw0 + 5 * i;
+            noc_async_write_multicast(
+                exg,
+                get_noc_multicast_addr(
+                    get_arg_val<uint32_t>(b), get_arg_val<uint32_t>(b + 1), get_arg_val<uint32_t>(b + 2),
+                    get_arg_val<uint32_t>(b + 3), exg),
+                TILE_BYTES,
+                get_arg_val<uint32_t>(b + 4));
+        }
+        noc_async_write_barrier();
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fsem) = 1;
+        for (uint32_t i = 0; i < nfw; ++i) {
+            const uint32_t b = fw0 + 5 * i;
+            noc_semaphore_set_multicast(
+                fsem,
+                get_noc_multicast_addr(
+                    get_arg_val<uint32_t>(b), get_arg_val<uint32_t>(b + 1), get_arg_val<uint32_t>(b + 2),
+                    get_arg_val<uint32_t>(b + 3), fsem),
+                get_arg_val<uint32_t>(b + 4));
+        }
+        noc_async_write_barrier();
+    }
+#else
     for (uint32_t i = 0; i < nfw; ++i) {
         const uint32_t tx = get_arg_val<uint32_t>(fw0 + 2 * i), ty = get_arg_val<uint32_t>(fw0 + 2 * i + 1);
         noc_async_write(exg, get_noc_addr(tx, ty, exg), TILE_BYTES);
@@ -100,6 +129,7 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(tx, ty, fsem), 1);
     }
     noc_async_atomic_barrier();
+#endif
     cb_push_back(cb_exg, 1);
 
     cb_wait_front(cb_out, WT);  // cb_out IS this core's output shard
