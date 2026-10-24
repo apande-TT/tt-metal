@@ -24,14 +24,17 @@ PERF_DENOISE_STEPS = max(1, int(os.environ.get("TT_PERF_DENOISE_STEPS", "2")))
 # Condition-image side; defaults to the demo's own area (the pipeline's VAE/halo path is built for it).
 PERF_AREA = int(os.environ.get("TT_PERF_AREA", str(I.DEFAULT_AREA)))
 
-from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape  # noqa: E402,F401
+from models.experimental.perf_automation.agent.perf_adapter import (  # noqa: E402,F401
+    resolve_batch,
+    resolve_mesh_shape,
+    resolve_trace_region,
+)
 
 # The demo opens a 2x4 mesh via demo/mesh.open_mesh().
 _SRC_MESH = (2, 4)
 _MESH_SHAPE = resolve_mesh_shape(default_rows=_SRC_MESH[0], default_cols=_SRC_MESH[1])
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
-_TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", "41943040"))
 
 
 def _open_device():
@@ -45,10 +48,18 @@ def _open_device():
     except (TypeError, ValueError):
         params = {}
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    # THE REGION THIS MODEL RESERVES FOR ITS OWN TRACES, read off the open it is declared on rather
+    # than copied here. resolve_trace_region takes the larger of that and what the tool asks for, so
+    # TT_PERF_TRACE_REGION can give a capture more room and can never hand this open less than the
+    # demo sized: at 40 MiB every stage dies in mesh_trace.cpp's region assertion and the test still
+    # passes (an untimed stage costs only its own row), leaving a reading that is missing the stage
+    # holding three quarters of the pipeline.
+    _declared = params["trace_region_size"].default if "trace_region_size" in params else None
+    _trace_region = resolve_trace_region(_declared if isinstance(_declared, int) else 0)
     kw = {}
     if _PERF_TRACE:
         if "trace_region_size" in params or has_var_kw:
-            kw["trace_region_size"] = _TRACE_REGION
+            kw["trace_region_size"] = _trace_region
         if "num_command_queues" in params or has_var_kw:
             kw["num_command_queues"] = 1
     shape_given = False
@@ -69,7 +80,7 @@ def _open_device():
     # resolved MeshShape directly with the same knobs.
     dev_kw = {"l1_small_size": 24576}
     if _PERF_TRACE:
-        dev_kw["trace_region_size"] = _TRACE_REGION
+        dev_kw["trace_region_size"] = _trace_region
         dev_kw["num_command_queues"] = 1
     if rows * cols > 1:
         ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
