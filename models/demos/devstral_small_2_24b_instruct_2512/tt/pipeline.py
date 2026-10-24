@@ -378,6 +378,11 @@ PLANNED_TP = 4
 #                     PREFILL_NORM_FACTOR_SHARDED_ROWS, <= 64-row shards): the native sharded scale multiply reads no
 #                     DRAM: 128-row prompt 54.9 -> 42.7 + 1.9 us a call (at 128-row shards it is slower, so not
 #                     there), bit-identical.
+#   prefill norm scale as a generic_op replica of ttnn.multiply's SFPU column-broadcast program
+#                     (ministral3_decoder_layer.PREFILL_NORM_SCALE_CPP, tt/norm_scale.py, kernels/norm_scale_*.cpp):
+#                     the same unpack-to-dest copies, mul_binary_tile and fp32 -> bf16 typecast_tile, 3 x tiles a DEST
+#                     acquire instead of 1, factor tiles read straight from r: 416-row prompt 109.8 -> 94.6 us a call,
+#                     bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
