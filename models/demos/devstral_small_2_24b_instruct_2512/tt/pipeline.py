@@ -405,6 +405,11 @@ PLANNED_TP = 4
 #                     norm_scale.scale chain=): each core turns its row sums into factors first (x 1/N, + eps, rsqrt:
 #                     the unary_chain's SFPU calls, on the column-0 faces only), one program fewer a norm: 416 rows
 #                     scale + rsqrt 69 + 6 -> 71 us, 128 rows 34 + 3 -> 36 us, bit-identical.
+#   ... and the compact stats' expand + row sum folded in as well (ministral3_decoder_layer.PREFILL_NORM_FUSED_SUM,
+#                     norm_scale.scale nd=, FUSED_SUM): the reader drops each device's gathered compact row into column
+#                     0 of a tile, the compute folds them as ttnn.sum's accurate SFPU reduce does (copy, add_binary_tile
+#                     in device order) before the rsqrt chain: 416 rows expand + sum + scale 16 + 10 + 71 -> 78 us, 128
+#                     rows 9 + 5 + 36 -> 39 us, two programs fewer a norm, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

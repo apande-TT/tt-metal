@@ -66,6 +66,7 @@ void kernel_main() {
 #ifdef NORM_CHAIN
     constexpr uint32_t MUL_BITS = get_compile_time_arg_val(3);  // fp32 bits of 1 / N
     constexpr uint32_t ADD_BITS = get_compile_time_arg_val(4);  // fp32 bits of eps
+    constexpr uint32_t ND = get_compile_time_arg_val(5);        // FUSED_SUM: devices whose partial sums cb_r holds
 #endif
 
     constexpr uint32_t cb_x = 0, cb_r = 1, cb_out = 2, cb_rb = 6;
@@ -74,7 +75,11 @@ void kernel_main() {
     compute_kernel_hw_startup(cb_x, cb_out);
     copy_init(cb_x);
     cb_wait_front(cb_x, ROWS * WT);
+#ifdef FUSED_SUM
+    cb_wait_front(cb_r, ROWS * ND);
+#else
     cb_wait_front(cb_r, ROWS);
+#endif
 #ifdef NORM_CHAIN
     // cb_r holds the row SUMS: each core's ROWS factor tiles rsqrt(sum * (1/N) + eps) first, by the SFPU functions,
     // fp32 DEST and approx-off config of the ttnn.unary_chain (MUL_UNARY_SFPU, ADD_UNARY_SFPU, RSQRT) they replace,
@@ -86,7 +91,20 @@ void kernel_main() {
     cb_reserve_back(cb_f, ROWS);
     for (uint32_t t = 0; t < ROWS; ++t) {
         tile_regs_acquire();
+#ifdef FUSED_SUM
+        // the row sum over the ND devices' partials (column 0 of cb_r's tiles t * ND + d), as ttnn.sum's accurate
+        // fp32 SFPU row reduce of the expanded stats folds them: the first tile copied in, each next one copied to
+        // a work slot and add_binary_tile'd onto it in device order (its intra-tile pass adds only zeros to column 0)
+        copy_init(cb_r);
+        copy_tile(cb_r, t * ND, 0);
+        add_binary_tile_init();
+        for (uint32_t d = 1; d < ND; ++d) {
+            copy_tile(cb_r, t * ND + d, 1);
+            add_binary_tile(0, 1, 0);
+        }
+#else
         copy_tile(cb_r, t, 0);
+#endif
         binop_with_scalar_tile_init();
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar, (APPROX, MUL_UNARY, 8, DST_ACCUM_MODE), 0,
@@ -166,6 +184,10 @@ void kernel_main() {
 #ifdef NORM_CHAIN
     cb_pop_front(cb_f, ROWS);
 #endif
+#ifdef FUSED_SUM
+    cb_pop_front(cb_r, ROWS * ND);
+#else
     cb_pop_front(cb_r, ROWS);
+#endif
     cb_pop_front(cb_x, ROWS * WT);
 }
