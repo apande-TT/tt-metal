@@ -34,6 +34,8 @@ STATS_L1 = True
 # the bytes; tt/stats_expand.py rebuilds the gathered (..., S, 128) tiles exactly (zeros + column 0) for the sum
 COMPACT_STATS = True
 CB_ROW = 19
+# cpp try (run 8): h, its writer copy and h^2 from one DEST pass (kernels/add_stats_compute.cpp ONE_PASS), no cb_h
+ONE_PASS = True
 # apply_l1's per-core shard bounds (see l1_copy_cores)
 L1_COPY_MIN_CORES = 64
 L1_COPY_MAX_BYTES = 640 * 1024
@@ -211,6 +213,7 @@ def _run(x, d, cast, l1_copy=False):
             compile_time_args=[wt, BLK],
             runtime_args=rc,
             config=cfg,
+            defines=[("ONE_PASS", "1")] if ONE_PASS and not cast else [],
         ),
     ]
     cbs = [
@@ -222,8 +225,8 @@ def _run(x, d, cast, l1_copy=False):
         cbs.append(_cb(cores, CB_OUT, out_dtype, 2 * BLK))
         ttnn.generic_op([x, d, h], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
         return h
+    cbs += [] if ONE_PASS else [_cb(cores, CB_H, ttnn.float32, wt)]
     cbs += [
-        _cb(cores, CB_H, ttnn.float32, wt),
         _cb(cores, CB_X2, ttnn.float32, wt),
         _cb(cores, CB_OUT, ttnn.float32, 2 * BLK),
         _cb(cores, CB_S, ttnn.float32, 2),

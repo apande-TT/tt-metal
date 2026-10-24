@@ -394,6 +394,10 @@ PLANNED_TP = 4
 #   prefill final norm's normed rows and gamma product in L1 for its all_gather (ministral3_r_m_s_norm.
 #                     FINAL_GAMMA_OUT_L1): 416 rows x * r 132 -> ~97 us, gamma multiply 205-240 -> ~121 us; 128 rows
 #                     ~49 -> 37 and 68.8 -> 39 us, bit-identical.
+#   prefill residual add + norm stats in ONE DEST pass (add_stats.ONE_PASS, kernels/add_stats_compute.cpp): h, its
+#                     writer copy and h^2 from the same DEST tiles (add_binary_tile, copy_dest_values, square_tile),
+#                     no row buffer of h packed and unpacked twice: 416-row adds ~2340 -> 2239 us a 2-layer slice,
+#                     128-row unchanged (memory bound), bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
