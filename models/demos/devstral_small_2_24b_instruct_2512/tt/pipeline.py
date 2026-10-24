@@ -374,6 +374,10 @@ PLANNED_TP = 4
 #                     tiles -- exponent section read, the row's two 16-byte exponent groups and two 16-byte mantissa
 #                     face rows written back, one RISC a kv head -- no untilize / patch / re-tilize of the tile row:
 #                     6.3 -> ~3.9 us a layer, trace decode 12.95 -> 12.77 ms, bit-identical.
+#   prefill norm's per-row factor resharded into the L1 copy's height shards (ministral3_decoder_layer.
+#                     PREFILL_NORM_FACTOR_SHARDED_ROWS, <= 64-row shards): the native sharded scale multiply reads no
+#                     DRAM: 128-row prompt 54.9 -> 42.7 + 1.9 us a call (at 128-row shards it is slower, so not
+#                     there), bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
