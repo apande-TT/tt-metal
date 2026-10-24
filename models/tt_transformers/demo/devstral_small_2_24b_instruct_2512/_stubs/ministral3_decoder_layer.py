@@ -291,10 +291,18 @@ class TtMinistral3DecoderLayer:
             clean = sq is not None and self.FUSED_ADD_STATS and self._clean_stats()
             if sq is None:  # sum(x^2) in column 0
                 sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
-            sq = ttnn.all_gather(sq, dim=3, **ccl)
+            # L1 stats (add_stats.STATS_L1) are gathered into L1 and both freed as soon as the sum has read them
+            l1 = sq.memory_config().buffer_type == ttnn.BufferType.L1
+            g = ttnn.all_gather(sq, dim=3, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None, **ccl)
+            if l1:
+                ttnn.deallocate(sq)
+            sq = g
             if not clean:
                 sq = ttnn.multiply(sq, self._stats_mask)
-            sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+            s_ = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if l1:
+                ttnn.deallocate(sq)
+            sq = s_
         # rsqrt(sq / N + eps) as ONE SFPU chain: the same fp32 multiply, add and rsqrt the three separate ops ran
         r = ttnn.unary_chain(
             sq,
