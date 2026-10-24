@@ -38,6 +38,7 @@ import functools
 import json
 import math
 import os
+import struct
 import time
 from pathlib import Path
 
@@ -368,6 +369,8 @@ TRACE_REGION_SIZE = 300_000_000
 
 _TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
 _TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
+_TOPK_MERGE4_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4.cpp")
+_TOPK_MERGE4_DM_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4_dm.cpp")
 _NOISE_LOOKUP_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "noise_lookup.cpp")
 
 
@@ -914,6 +917,100 @@ class VocabTopK:
         return vals, ids
 
 
+class MergeTopK:
+    """The top-K of the TP gathered VocabTopK lists, (1, 1, B, TP * K) bf16 values + uint32 vocab ids, as ONE
+    single-core program (generic_op, kernels/topk_merge4.cpp).
+
+    ttnn.topk sorts the gathered row from scratch (a full 64-wide bitonic sort per tile); each gathered tile is
+    already a sorted run, so the kernel runs only the merge half of the bitonic algorithm (rebuild / merge /
+    rebuild per pair of runs, then merge / rebuild of the two winners): 28 compare steps instead of 63.
+    kernels/topk_merge4_dm.cpp moves the tiles a pair at a time under one barrier (the stock reader waits out one
+    DRAM round trip per tile).
+
+    scale (the sampler's 1 / temperature): the values leave as fp32 scores value * scale, the sampler's typecast +
+    multiply folded into the program (the same SFPU fp32 multiply, bit-identical); None keeps bf16 values."""
+
+    VAL, IDX = ttnn.bfloat16, ttnn.uint32
+    IN, IN_IDX, MID_VAL, MID_IDX, FIN_VAL, FIN_IDX, OUT_VAL, OUT_IDX = range(8)
+
+    def __init__(self, device, k, scale=None):
+        self.device, self.k = device, k
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        self.scale_bits = 0 if scale is None else struct.unpack("<I", struct.pack("<f", scale))[0]
+        self.out_dtype = self.VAL if scale is None else ttnn.float32
+
+    def supports(self, vals, ids):
+        rows, width = int(vals.shape[-2]), int(vals.shape[-1])
+        return (
+            self.k == 32
+            and rows == 32
+            and width == 128
+            and vals.dtype == self.VAL
+            and ids.dtype == self.IDX
+            and tuple(ids.shape) == tuple(vals.shape)
+            and vals.layout == ids.layout == ttnn.TILE_LAYOUT
+        )
+
+    def _cb(self, index, tiles, dtype, tile_bytes):
+        return ttnn.CBDescriptor(
+            total_size=tiles * tile_bytes,
+            core_ranges=self.core,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
+        )
+
+    def __call__(self, vals, ids):
+        wt = int(vals.shape[-1]) // 32
+        out_shape = ttnn.Shape((1, 1, int(vals.shape[-2]), self.k))
+        out_vals = ttnn.allocate_tensor_on_device(
+            out_shape, self.out_dtype, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        out_ids = ttnn.allocate_tensor_on_device(
+            out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        V, I = 2048, 4096  # bf16 / uint32 (and fp32) tile bytes
+        cbs = [
+            self._cb(self.IN, wt, self.VAL, V),
+            self._cb(self.IN_IDX, wt, self.IDX, I),
+            self._cb(self.MID_VAL, 2, self.VAL, V),
+            self._cb(self.MID_IDX, 2, self.IDX, I),
+            self._cb(self.FIN_VAL, 1, self.VAL, V),
+            self._cb(self.FIN_IDX, 1, self.IDX, I),
+            self._cb(self.OUT_VAL, 1, self.out_dtype, V if self.out_dtype == self.VAL else I),
+            self._cb(self.OUT_IDX, 1, self.IDX, I),
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True  # uint32 ids ride the swaps in 32-bit DEST (as ttnn.topk)
+        kern = lambda src, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.core,
+            compile_time_args=ct,
+            runtime_args=[((0, 0), rt)],
+            config=cfg,
+            **kw,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        kernels = [
+            # a pair of gathered tiles (values + ids) in flight under one barrier, as the compute consumes them
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.IN, self.IN_IDX, wt] + acc(vals, ids),
+                [vals.buffer_address(), ids.buffer_address()],
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            kern(_TOPK_MERGE4_KERNEL, list(range(8)) + [wt // 2, self.scale_bits], [], compute_cfg),
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                [out_vals.buffer_address(), out_ids.buffer_address()],
+                ttnn.WriterConfigDescriptor(),
+                defines=[("MERGE_TOPK_WRITER", "1")],
+            ),
+        ]
+        ttnn.generic_op([vals, ids, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out_vals, out_ids
+
+
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
 # below; Gate 2 reads INVOKED (filled by the probe installed at build) against this table.
 GRADUATED_STUBS = {
@@ -1189,6 +1286,8 @@ class DevstralPipeline:
             vocab = int(tcfg.vocab_size)
             self._shard_shape = (1, 1, self.batch, vocab // tp)
             self._vocab_topk = VocabTopK(device, self.top_k)
+            # the merge also emits the sampler's fp32 scores (value / temperature), see sample()
+            self._merge_topk = MergeTopK(device, self.top_k, scale=1.0 / self.temperature)
             base = (torch.arange(tp, dtype=torch.int32) * (vocab // tp)).repeat_interleave(self.top_k)
             self._shard_base = ttnn.from_torch(
                 base.reshape(1, 1, 1, -1).expand(1, 1, self.batch, -1).contiguous(),
@@ -1372,7 +1471,10 @@ class DevstralPipeline:
         returns the (1, 1, B, 1) uint32 ids the model itself drew (before pad substitution)."""
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
         vals, idx = self._topk(logits)
-        scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
+        if vals.dtype == ttnn.float32:  # MergeTopK already emitted the scores (value / temperature)
+            scores = vals
+        else:
+            scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
         if self._noise_lookup is not None:  # the candidates' noise in one program, straight from the table
             scores = ttnn.add(scores, self._noise_lookup(state["step"], state["noise"], idx))
         else:
@@ -1423,6 +1525,9 @@ class DevstralPipeline:
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.add(ttnn.typecast(ids, ttnn.uint32), self._shard_base)
+        if self._merge_topk.supports(vals, ids):
+            # the gathered lists are sorted runs: merge them (MergeTopK) instead of sorting the row again
+            return self._merge_topk(vals, ids)
         return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
