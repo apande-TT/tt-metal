@@ -50,6 +50,11 @@ class TtMinistral3RMSNorm:
     # multiplying by the all-ones row -- the interleaved kernel then holds no 5120-wide gamma row in L1 (its static
     # buffers ended ~27 KB under the L1 top, leaving no room for the decode all_reduce's 40-core scratch).
     UNIT_PREFILL_NO_WEIGHT = True
+    # The decode norm whose width shards feed the HiFi2 QKV directly (decode keep_sharded) runs without the all-ones
+    # weight: with it, rms_norm adds a FUSE_GAMMA pass (x * 1.0 through SrcA) whose only effect is truncating the fp32
+    # output to TF32, and the HiFi2 QKV multiplies only the high bits of its in0 anyway (a bf16-truncated row gives
+    # bit-identical products), so the QKV output is unchanged and the norm skips the pass.
+    DECODE_SHARDED_NO_WEIGHT = True
 
     def __init__(self, canonical_instance, gamma=None, gamma_rows=None, unit_weight=False) -> None:
         self._impl = canonical_instance
@@ -141,10 +146,11 @@ class TtMinistral3RMSNorm:
         l1 (unit gamma only): unshard into L1 instead of DRAM (the decode gate / up multicast the row from there
         once per K block, so each block's activation fetch skips a DRAM round trip)."""
         mem, prog = self._decode_cfg(int(x.shape[-1]))
+        no_weight = keep_sharded and self.gamma is None and self.unit_weight and self.DECODE_SHARDED_NO_WEIGHT
         n = ttnn.rms_norm(
             ttnn.to_memory_config(x, mem),
             epsilon=self._impl.eps,
-            weight=self._impl.weight,
+            weight=None if no_weight else self._impl.weight,
             program_config=prog,
             memory_config=mem,
             compute_kernel_config=self._impl.compute_kernel_config_hifi2,
