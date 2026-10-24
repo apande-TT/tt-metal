@@ -24,6 +24,10 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 _COMPUTE = str(_KDIR / "sdpa_compute.cpp")
 _DM_DIR = "ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/dataflow/"
 _READER = _DM_DIR + "reader_interleaved.cpp"
+# cpp attempt (run 8): with CAUSAL_SKIP on one K chunk, kernels/sdpa_reader.cpp (the stock reader + SDPA_CAUSAL_READ_SKIP)
+# reads only each Q chunk's K / V rows up to its diagonal -- the tiles the compute skips are never fetched
+_CAUSAL_READER = str(_KDIR / "sdpa_reader.cpp")
+CAUSAL_READ_SKIP = True
 _WRITER = _DM_DIR + "writer_interleaved.cpp"
 
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
@@ -236,8 +240,11 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
         config=cfg,
         defines=d,
     )
+    read_skip = is_causal and CAUSAL_SKIP and CAUSAL_READ_SKIP and k_num_chunks == 1
+    reader_src = _CAUSAL_READER if read_skip else _READER
+    reader_defines = defines + ([("SDPA_CAUSAL_READ_SKIP", "1")] if read_skip else [])
     kernels = [
-        kern(_READER, reader_ct, rt_r, ttnn.ReaderConfigDescriptor(), defines),
+        kern(reader_src, reader_ct, rt_r, ttnn.ReaderConfigDescriptor(), reader_defines),
         kern(_WRITER, writer_ct, rt_w, ttnn.WriterConfigDescriptor(), defines),
         kern(_COMPUTE, compute_ct, rt_c, ccfg, compute_defines),
     ]
