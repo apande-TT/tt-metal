@@ -54,6 +54,11 @@ void kernel_main() {
 #ifdef PACKED_IN
     constexpr std::uint32_t shard_log2 = get_compile_time_arg_val(10);  // log2 of each device's vocab shard width
 #endif
+#ifdef MERGE_LEAF
+    constexpr std::uint32_t pair0 = 1;  // MergeTopK.SPLIT: the leaf merges the second pair (its winner sorts ascending)
+#else
+    constexpr std::uint32_t pair0 = 0;
+#endif
 
     compute_kernel_hw_startup(in_val, in_idx, out_val);
     ckernel::topk_tile_init();
@@ -80,8 +85,8 @@ void kernel_main() {
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE, DST_ACCUM_MODE, calculate_topk_defuse, (true, /*largest=*/true), 0, VectorMode::RC_custom, 2));
         bitwise_or_tile_init();
-        bitwise_or_tile<DataFormat::Int32>(2, (2 * p) << shard_log2);      // + the vocab offset of the pair's first device
-        bitwise_or_tile<DataFormat::Int32>(3, (2 * p + 1) << shard_log2);  // ... and of its second
+        bitwise_or_tile<DataFormat::Int32>(2, (2 * (p + pair0)) << shard_log2);      // + the vocab offset of the pair's first device
+        bitwise_or_tile<DataFormat::Int32>(3, (2 * (p + pair0) + 1) << shard_log2);  // ... and of its second
         ckernel::topk_tile_init();                         // index tracking back on (the unary init reset it)
 #else
         in_val_dfb.wait_front(2);
@@ -101,7 +106,7 @@ void kernel_main() {
         MATH((ckernel::sfpu::topk_replay_init = 0));
         ckernel::topk_rebuild(0, /*idir=*/false, 0, K, logk, 0);  // run 0 descending, run 1 ascending
         ckernel::topk_merge</*idir=*/false>(0, 0, K);             // DST 0 <- the top K (bitonic)
-        ckernel::topk_rebuild(0, (p & 1) != 0, 0, K, logk, 1);
+        ckernel::topk_rebuild(0, ((p + pair0) & 1) != 0, 0, K, logk, 1);
         tile_regs_commit();
         in_val_dfb.pop_front(2);
 #ifndef PACKED_IN
@@ -120,7 +125,39 @@ void kernel_main() {
         mid_idx_dfb.push_back(1);
     }
 
+#ifdef MERGE_LEAF
+    return;  // the leaf's winner leaves through its writer (topk_merge4_dm.cpp MERGE_LEAF_SEND)
+#endif
+
     // Level 2: the two winners (descending, ascending) -> the top K, descending.
+#ifdef MERGE_ROOT
+    // the second winner is the leaf's, landed in cb 8 / 9 (same steps on the same data: the same bits)
+    constexpr std::uint32_t rmt_val = 8;
+    constexpr std::uint32_t rmt_idx = 9;
+    DataflowBuffer rmt_val_dfb(rmt_val);
+    DataflowBuffer rmt_idx_dfb(rmt_idx);
+    mid_val_dfb.wait_front(1);
+    mid_idx_dfb.wait_front(1);
+    rmt_val_dfb.wait_front(1);
+    rmt_idx_dfb.wait_front(1);
+    tile_regs_acquire();
+    reconfig_data_format_srca(mid_val);
+    copy_init(mid_val);
+    copy_tile(mid_val, 0, 0);
+    copy_tile(rmt_val, 0, 1);
+    reconfig_data_format_srca(mid_val, mid_idx);
+    copy_init(mid_idx);
+    copy_tile(mid_idx, 0, 2);
+    copy_tile(rmt_idx, 0, 3);
+    ckernel::topk_merge</*idir=*/false>(0, 0, K);
+    MATH((ckernel::sfpu::topk_replay_init = 0));
+    ckernel::topk_rebuild(0, /*idir=*/false, 0, K, logk, 1);
+    tile_regs_commit();
+    mid_val_dfb.pop_front(1);
+    mid_idx_dfb.pop_front(1);
+    rmt_val_dfb.pop_front(1);
+    rmt_idx_dfb.pop_front(1);
+#else
     mid_val_dfb.wait_front(2);
     mid_idx_dfb.wait_front(2);
     tile_regs_acquire();
@@ -138,6 +175,7 @@ void kernel_main() {
     tile_regs_commit();
     mid_val_dfb.pop_front(2);
     mid_idx_dfb.pop_front(2);
+#endif
 
     fin_val_dfb.reserve_back(1);
     fin_idx_dfb.reserve_back(1);

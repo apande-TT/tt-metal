@@ -354,6 +354,9 @@ PLANNED_TP = 4
 #                     P @ V stop at the diagonal of the row's P @ V subblock instead of rounding up to whole exp groups
 #                     (partial last exp group), the exp's SFPU init runs once a pass: SDPA 416 424 -> 418 us, 128
 #                     96 -> 86 us, bit-identical.
+#   decode sampler MergeTopK on TWO cores (MergeTopK.SPLIT): the leaf merges the second pair of packed key tiles and
+#                     copies its winner into the root's buffers while the root merges the first pair, then the root
+#                     merges the two winners: 10.0 -> ~7.5 us a token, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
@@ -1015,10 +1018,18 @@ class MergeTopK:
 
     VAL, IDX = ttnn.bfloat16, ttnn.uint32
     IN, IN_IDX, MID_VAL, MID_IDX, FIN_VAL, FIN_IDX, OUT_VAL, OUT_IDX = range(8)
+    RMT_VAL, RMT_IDX = 8, 9
+    # grid try (run 8, packed keys): the two first-level pair merges on two cores at once -- the leaf core (0, 1)
+    # merges the second pair and copies its winner into the root's (0, 0) rmt buffers (semaphore 0); the root merges
+    # the first pair, then the two winners. Same steps on the same data: bit-identical.
+    SPLIT = True
 
     def __init__(self, device, k, scale=None):
         self.device, self.k = device, k
         self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        self.leaf = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 1), ttnn.CoreCoord(0, 1))])
+        self.both = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 1))])
+        self.root_phys = device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
         self.scale_bits = 0 if scale is None else struct.unpack("<I", struct.pack("<f", scale))[0]
         self.out_dtype = self.VAL if scale is None else ttnn.float32
 
@@ -1072,6 +1083,8 @@ class MergeTopK:
         )
         acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
         shard_log2 = int(self.shard_width).bit_length() - 1
+        if self.SPLIT and wt == 4:
+            return self._split_packed(keys, out_vals, out_ids, compute_cfg, acc, shard_log2)
         kernels = [
             kern(
                 _TOPK_MERGE4_DM_KERNEL,
@@ -1096,6 +1109,59 @@ class MergeTopK:
             ),
         ]
         ttnn.generic_op([keys, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out_vals, out_ids
+
+    def _split_packed(self, keys, out_vals, out_ids, compute_cfg, acc, shard_log2):
+        V, I = 2048, 4096
+        out_bytes = V if self.out_dtype == self.VAL else I
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=tiles * size,
+                core_ranges=self.both,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=size)],
+            )
+            for index, tiles, dtype, size in (
+                (self.IN, 2, self.IDX, I),  # one pair of raw 32-bit keys
+                (self.IN_IDX, 1, self.IDX, I),  # unused here
+                (self.MID_VAL, 1, self.VAL, V),
+                (self.MID_IDX, 1, self.IDX, I),
+                (self.FIN_VAL, 1, self.VAL, V),
+                (self.FIN_IDX, 1, self.IDX, I),
+                (self.OUT_VAL, 1, self.out_dtype, out_bytes),
+                (self.OUT_IDX, 1, self.IDX, I),
+                (self.RMT_VAL, 1, self.VAL, V),
+                (self.RMT_IDX, 1, self.IDX, I),
+            )
+        ]
+        kern = lambda src, cores, xy, ct, rt, cfg, defs: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=[(xy, rt)],
+            config=cfg,
+            defines=defs,
+        )
+        rd = [self.IN, self.IN_IDX, 2] + acc(keys, keys)
+        ka = keys.buffer_address()
+        cct = list(range(8)) + [1, self.scale_bits, shard_log2]
+        pk = ("PACKED_IN", "1")
+        kernels = [
+            kern(_TOPK_MERGE4_DM_KERNEL, self.core, (0, 0), rd, [ka, ka, 0, 0], ttnn.ReaderConfigDescriptor(),
+                 [pk, ("MERGE_SPLIT", "1"), ("MERGE_ROOT", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.leaf, (0, 1), rd, [ka, ka, 2], ttnn.ReaderConfigDescriptor(),
+                 [pk, ("MERGE_SPLIT", "1")]),
+            kern(_TOPK_MERGE4_KERNEL, self.core, (0, 0), cct, [], compute_cfg, [pk, ("MERGE_ROOT", "1")]),
+            kern(_TOPK_MERGE4_KERNEL, self.leaf, (0, 1), cct, [], compute_cfg, [pk, ("MERGE_LEAF", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.core, (0, 0), [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                 [out_vals.buffer_address(), out_ids.buffer_address()], ttnn.WriterConfigDescriptor(),
+                 [("MERGE_TOPK_WRITER", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.leaf, (0, 1), [self.MID_VAL, self.MID_IDX, 1] + acc(out_vals, out_ids),
+                 [int(self.root_phys.x), int(self.root_phys.y), 0], ttnn.WriterConfigDescriptor(),
+                 [("MERGE_LEAF_SEND", "1")]),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=self.both, initial_value=0)]
+        ttnn.generic_op([keys, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return out_vals, out_ids
 
     def supports(self, vals, ids):
