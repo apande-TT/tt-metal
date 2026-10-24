@@ -21,6 +21,10 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/typecast.h"
+#ifdef NORM_CHAIN
+#include "api/compute/eltwise_unary/binop_with_scalar.h"
+#include "api/compute/eltwise_unary/rsqrt.h"
+#endif
 #include "api/compute/pack.h"
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/reg_api.h"
@@ -59,6 +63,10 @@ void kernel_main() {
     constexpr uint32_t ROWS = get_compile_time_arg_val(0);   // tile rows of this core's shard
     constexpr uint32_t WT = get_compile_time_arg_val(1);     // tiles across a row
     constexpr uint32_t CHUNK = get_compile_time_arg_val(2);  // x tiles a DEST acquire (+ the broadcast tile)
+#ifdef NORM_CHAIN
+    constexpr uint32_t MUL_BITS = get_compile_time_arg_val(3);  // fp32 bits of 1 / N
+    constexpr uint32_t ADD_BITS = get_compile_time_arg_val(4);  // fp32 bits of eps
+#endif
 
     constexpr uint32_t cb_x = 0, cb_r = 1, cb_out = 2, cb_rb = 6;
     constexpr uint32_t dst_b = CHUNK;  // the broadcast factor's DEST slot
@@ -67,15 +75,50 @@ void kernel_main() {
     copy_init(cb_x);
     cb_wait_front(cb_x, ROWS * WT);
     cb_wait_front(cb_r, ROWS);
+#ifdef NORM_CHAIN
+    // cb_r holds the row SUMS: each core's ROWS factor tiles rsqrt(sum * (1/N) + eps) first, by the SFPU functions,
+    // fp32 DEST and approx-off config of the ttnn.unary_chain (MUL_UNARY_SFPU, ADD_UNARY_SFPU, RSQRT) they replace,
+    // on faces 0 and 2 only (VectorMode::C: column 0, all the broadcast reads) -- same per-element arithmetic
+    constexpr uint32_t cb_f = 7;
+    reconfig_data_format_srca(cb_r);
+    copy_init(cb_r);
+    pack_reconfig_data_format(cb_f);
+    cb_reserve_back(cb_f, ROWS);
+    for (uint32_t t = 0; t < ROWS; ++t) {
+        tile_regs_acquire();
+        copy_tile(cb_r, t, 0);
+        binop_with_scalar_tile_init();
+        MATH(SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar, (APPROX, MUL_UNARY, 8, DST_ACCUM_MODE), 0,
+            VectorMode::C, MUL_BITS));
+        binop_with_scalar_tile_init();
+        MATH(SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar, (APPROX, ADD_UNARY, 8, DST_ACCUM_MODE), 0,
+            VectorMode::C, ADD_BITS));
+        rsqrt_tile_init();
+        MATH(SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt, (APPROX, 8, DST_ACCUM_MODE, false), 0, VectorMode::C));
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile(0, cb_f);
+        tile_regs_release();
+    }
+    cb_push_back(cb_f, ROWS);
+    cb_wait_front(cb_f, ROWS);
+    pack_reconfig_data_format(cb_out);
+    constexpr uint32_t cb_bc = cb_f;  // the factors the rows broadcast
+#else
+    constexpr uint32_t cb_bc = cb_r;
+#endif
 
     for (uint32_t t = 0; t < ROWS; ++t) {
         // the row's factor, column-broadcast (as the stock kernel's process_tile prologue)
         pack_reconfig_data_format(cb_out, cb_rb);
-        reconfig_data_format(cb_r, cb_r);
-        unary_bcast_init<BroadcastType::COL>(cb_r);
+        reconfig_data_format(cb_bc, cb_bc);
+        unary_bcast_init<BroadcastType::COL>(cb_bc);
         cb_reserve_back(cb_rb, 1);
         tile_regs_acquire();
-        unary_bcast<BroadcastType::COL>(cb_r, t, 0);
+        unary_bcast<BroadcastType::COL>(cb_bc, t, 0);
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(0, cb_rb);
@@ -120,6 +163,9 @@ void kernel_main() {
         }
         cb_pop_front(cb_rb, 1);
     }
+#ifdef NORM_CHAIN
+    cb_pop_front(cb_f, ROWS);
+#endif
     cb_pop_front(cb_r, ROWS);
     cb_pop_front(cb_x, ROWS * WT);
 }

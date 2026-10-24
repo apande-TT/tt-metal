@@ -401,6 +401,10 @@ PLANNED_TP = 4
 #   prefill norm row sums and factor r in L1 for the C++ scale (ministral3_decoder_layer.PREFILL_NORM_FACTOR_L1; ~16
 #                     KB a core, both freed once read): 416 rows sum 12 -> ~10.5 us, rsqrt chain 13 -> 6 us, scale 71
 #                     -> 69 us a norm; 128 rows rsqrt 4 -> 3, scale 35 -> 34 us, bit-identical.
+#   prefill norm rsqrt chain folded into the C++ scale (ministral3_decoder_layer.PREFILL_NORM_CHAIN_IN_SCALE,
+#                     norm_scale.scale chain=): each core turns its row sums into factors first (x 1/N, + eps, rsqrt:
+#                     the unary_chain's SFPU calls, on the column-0 faces only), one program fewer a norm: 416 rows
+#                     scale + rsqrt 69 + 6 -> 71 us, 128 rows 34 + 3 -> 36 us, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

@@ -10,12 +10,13 @@ inits are paid once per chunk. Each core reads its own factor tiles straight fro
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import ttnn
 
 _KDIR = Path(__file__).resolve().parent / "kernels"
-CB_X, CB_R, CB_OUT, CB_RB = 0, 1, 2, 6
+CB_X, CB_R, CB_OUT, CB_RB, CB_F = 0, 1, 2, 6, 7
 CHUNK = 3  # x tiles a DEST acquire (fp32 half-sync DEST holds 4: CHUNK + the broadcast factor)
 # cpp try 2 (run 8): the multiply and the bf16 rounding in one SFPU pass (kernels/norm_scale_compute.cpp FUSED_RNE)
 FUSED_RNE = True
@@ -52,8 +53,14 @@ def supports(x_l1, r) -> bool:
         return False
 
 
-def scale(x_l1, r):
-    """bf16(x_l1 * r) in x_l1's height-sharded layout; x_l1 fp32 [..., S, W], r fp32 [..., S, 1] interleaved."""
+def _bits(v):
+    return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+def scale(x_l1, r, chain=None):
+    """bf16(x_l1 * r) in x_l1's height-sharded layout; x_l1 fp32 [..., S, W], r fp32 [..., S, 1] interleaved.
+    chain=(inv_n, eps): r holds the row sums and the factor is rsqrt(r * inv_n + eps), computed in the kernel by the
+    SFPU calls of the ttnn.unary_chain(MUL_UNARY_SFPU, ADD_UNARY_SFPU, RSQRT) it replaces (bit-identical)."""
     device = x_l1.device()
     mc = x_l1.memory_config()
     spec = mc.shard_spec
@@ -78,11 +85,14 @@ def scale(x_l1, r):
         cb(CB_RB, 2, 4096, ttnn.float32),
         ttnn.cb_descriptor_from_sharded_tensor(CB_OUT, out),
     ]
+    if chain:  # the rows' factors, computed from the sums in r
+        cbs.append(cb(CB_F, rows, 4096, ttnn.float32))
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
+    cfg.math_approx_mode = False  # (as the unary program: rsqrt is exact-mode)
     modes = [ttnn.UnpackToDestMode.Default] * 64
-    for c in (CB_X, CB_R, CB_RB):
+    for c in (CB_X, CB_R, CB_RB, CB_F):
         modes[c] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     acc = list(ttnn.TensorAccessorArgs(r).get_compile_time_args())
@@ -100,10 +110,10 @@ def scale(x_l1, r):
             kernel_source=str(_KDIR / "norm_scale_compute.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=crs,
-            compile_time_args=[rows, wt, CHUNK],
+            compile_time_args=[rows, wt, CHUNK] + ([_bits(chain[0]), _bits(chain[1])] if chain else []),
             runtime_args=[(c, []) for c in cores],
             config=cfg,
-            defines=[("FUSED_RNE", "1")] if FUSED_RNE else [],
+            defines=([("FUSED_RNE", "1")] if FUSED_RNE else []) + ([("NORM_CHAIN", "1")] if chain else []),
         ),
     ]
     ttnn.generic_op([x_l1, r, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
