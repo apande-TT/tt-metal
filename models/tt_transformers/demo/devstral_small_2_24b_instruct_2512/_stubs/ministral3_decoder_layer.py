@@ -62,6 +62,9 @@ class TtMinistral3DecoderLayer:
     # so the multiply reads no DRAM at all -- while a shard holds at most this many rows (the 32 x 128-row prompt's
     # 64: 54.9 -> 42.7 + 1.9 us; at the 32 x 416 prompt's 128 the sharded multiply is slower, 110 -> 121 + 9 us).
     PREFILL_NORM_FACTOR_SHARDED_ROWS = 64
+    # ... or, instead, that multiply as tt/norm_scale.py's program (cpp try 1, run 8): binary_ng's SFPU column-broadcast
+    # calls with several x tiles a DEST acquire, the factor tiles read straight from r.
+    PREFILL_NORM_SCALE_CPP = True
     # (residual tensor, its sum-of-squares stats, whether those are whole-row totals[, its L1 copy or None]): set by the
     # last layer's fused add (per-device partial stats) or by the model for its bf16 prompt embeddings
     # (carry_input_stats).
@@ -333,6 +336,15 @@ class TtMinistral3DecoderLayer:
                 ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
             ],
         )
+        if x_l1 is not None and self.PREFILL_NORM_SCALE_CPP:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_scale
+
+            if norm_scale.supports(x_l1, r):
+                y = norm_scale.scale(x_l1, r)
+                ttnn.deallocate(x_l1)
+                out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+                ttnn.deallocate(y)
+                return out
         if x_l1 is not None:  # native height-sharded multiply: each core scales its own L1 rows into its own shard
             spec = x_l1.memory_config().shard_spec
             factor_sharded = int(spec.shape[0]) <= self.PREFILL_NORM_FACTOR_SHARDED_ROWS
