@@ -65,6 +65,9 @@ class TtMinistral3DecoderLayer:
     # ... or, instead, that multiply as tt/norm_scale.py's program (cpp try 1, run 8): binary_ng's SFPU column-broadcast
     # calls with several x tiles a DEST acquire, the factor tiles read straight from r.
     PREFILL_NORM_SCALE_CPP = True
+    # shard try (run 8): ... with the norm's row sums and its factor r in L1 (interleaved, ~16 KB a core at 416 rows; both
+    # freed as soon as the scale has read them) instead of DRAM
+    PREFILL_NORM_FACTOR_L1 = True
     # (residual tensor, its sum-of-squares stats, whether those are whole-row totals[, its L1 copy or None]): set by the
     # last layer's fused add (per-device partial stats) or by the model for its bf16 prompt embeddings
     # (carry_input_stats).
@@ -332,10 +335,14 @@ class TtMinistral3DecoderLayer:
             sq = g
             if not clean:
                 sq = ttnn.multiply(sq, self._stats_mask)
-            s_ = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            # the row sums and their factor r in L1 (PREFILL_NORM_FACTOR_L1) when the C++ scale reads r from there
+            f_l1 = x_l1 is not None and self.PREFILL_NORM_SCALE_CPP and self.PREFILL_NORM_FACTOR_L1
+            s_mem = ttnn.L1_MEMORY_CONFIG if f_l1 else ttnn.DRAM_MEMORY_CONFIG
+            s_ = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg, memory_config=s_mem)
             if l1:
                 ttnn.deallocate(sq)
             sq = s_
+        f_l1 = sq.memory_config().buffer_type == ttnn.BufferType.L1
         # rsqrt(sq / N + eps) as ONE SFPU chain: the same fp32 multiply, add and rsqrt the three separate ops ran
         r = ttnn.unary_chain(
             sq,
@@ -345,11 +352,15 @@ class TtMinistral3DecoderLayer:
                 ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
             ],
         )
+        if f_l1:
+            ttnn.deallocate(sq)
         if x_l1 is not None and self.PREFILL_NORM_SCALE_CPP:
             from models.demos.devstral_small_2_24b_instruct_2512.tt import norm_scale
 
             if norm_scale.supports(x_l1, r):
                 y = norm_scale.scale(x_l1, r)
+                if f_l1:
+                    ttnn.deallocate(r)
                 ttnn.deallocate(x_l1)
                 out = ttnn.all_gather(y, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
                 ttnn.deallocate(y)
