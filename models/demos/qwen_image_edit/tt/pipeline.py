@@ -481,6 +481,20 @@ class TtQwenImageEditPipeline:
         s_img = enc.latents.shape[1] * len(enc.img_shapes)
         return int(enc.batch * (s_img + enc.vl["input_ids"].shape[1] - I.PROMPT_TEMPLATE_DROP))
 
+    def denoise_trace_repeats(self):
+        """How many times ONE EDIT runs denoise_trace_step: the schedule's own length.
+
+        Every other stage runs once per edit; this one runs once per timestep, and the traced pass
+        times each stage exactly once. Unstated, a millisecond saved in the step that runs 50 times
+        is ranked like one saved in a stage that runs once -- and this stage is ~99% of a request.
+        The rows of the table the step rolls ARE the schedule (upload: sched = zeros(len(timesteps),
+        _SCHED_COLS)), so the count is the scheduler's, not a number written here: a run with
+        --steps 20 states 20.
+        """
+        if "denoise" in self._trace:
+            return int(self._trace["denoise"][1].n)
+        return int(I.encode_inputs(I.batch_size_from_env()).num_inference_steps)
+
     # vae_decode
     def vae_decode_trace_inputs(self):
         enc, g = self._stage_reference("vae_decode")
