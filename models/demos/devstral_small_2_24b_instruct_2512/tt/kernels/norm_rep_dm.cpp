@@ -10,7 +10,9 @@
 // row (unicast writes into each core's cb_exg, each followed by a semaphore increment). All transfers are unicast to
 // NOC coordinates passed in, and every count follows its write barrier. MCAST_FACTOR: the root instead multicasts the
 // factor tile and then the factor semaphore to every other core (rectangles in the runtime args, as layernorm's own
-// sender does), and nothing is forwarded.
+// sender does), and nothing is forwarded. SLOT_SEMS: each cb_ext slot has its own arrival semaphore (sem_gather + slot),
+// so a worker hands its compute slot k as soon as slots 0..k have landed -- the reduce (one tile at a time, in slot
+// order) overlaps the arrivals instead of starting after the last one.
 
 #include <cstdint>
 
@@ -60,25 +62,49 @@ void kernel_main() {
     cb_wait_front(cb_part, 1);
     noc_async_write(get_read_ptr(cb_part), get_noc_addr(wx, wy, ext_base + slot * TILE_BYTES), TILE_BYTES);
     noc_async_write_barrier();
+#ifdef SLOT_SEMS
+    noc_semaphore_inc(get_noc_addr(wx, wy, get_semaphore(sem_gather + slot)), 1);
+#else
     noc_semaphore_inc(get_noc_addr(wx, wy, gsem), 1);
+#endif
     noc_async_atomic_barrier();
     cb_pop_front(cb_part, 1);
 
     if constexpr (ROLE == 1) {
+#ifdef SLOT_SEMS
+        for (uint32_t k = 0; k < ROW_LEN; ++k) {
+            cb_reserve_back(cb_ext, 1);
+            noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_gather + k)), 1);
+            cb_push_back(cb_ext, 1);
+        }
+#else
         cb_reserve_back(cb_ext, ROW_LEN);
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(gsem), ROW_LEN);
         cb_push_back(cb_ext, ROW_LEN);
+#endif
         cb_wait_front(cb_ex2, 1);
         noc_async_write(
             get_read_ptr(cb_ex2), get_noc_addr(rx, ry, ext_base + (ROW_LEN + row - 1) * TILE_BYTES), TILE_BYTES);
         noc_async_write_barrier();
+#ifdef SLOT_SEMS
+        noc_semaphore_inc(get_noc_addr(rx, ry, get_semaphore(sem_gather + ROW_LEN + row - 1)), 1);
+#else
         noc_semaphore_inc(get_noc_addr(rx, ry, gsem), 1);
+#endif
         noc_async_atomic_barrier();
         cb_pop_front(cb_ex2, 1);
     } else if constexpr (ROLE == 2) {
+#ifdef SLOT_SEMS
+        for (uint32_t k = 0; k < ROW_LEN + ROWS - 1; ++k) {
+            cb_reserve_back(cb_ext, 1);
+            noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_gather + k)), 1);
+            cb_push_back(cb_ext, 1);
+        }
+#else
         cb_reserve_back(cb_ext, ROW_LEN + ROWS - 1);
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(gsem), ROW_LEN + ROWS - 1);
         cb_push_back(cb_ext, ROW_LEN + ROWS - 1);
+#endif
     }
 
     // the factor: the root gets it from its compute, everyone else from the core that forwards it

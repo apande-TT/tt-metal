@@ -21,7 +21,9 @@ import ttnn
 _KDIR = Path(__file__).resolve().parent / "kernels"
 _F32_TILE, _BF16_TILE = 4096, 2048
 CB_X, CB_X2, CB_SCALER, CB_PART, CB_EXT, CB_SCG, CB_EX2, CB_EPS, CB_EX2PE, CB_EXG, CB_OUT = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16
-SEM_GATHER, SEM_FACTOR = 0, 1
+SEM_FACTOR, SEM_GATHER = 0, 1  # SLOT_SEMS: SEM_GATHER + slot for each of the 12 cb_ext slots
+# cpp try 3 (run 8): one arrival semaphore per cb_ext slot, so the workers' reduces overlap the partials' arrival
+SLOT_SEMS = True
 # cpp try 2 (run 8): the root multicasts the norm factor to all cores (else a root -> row worker -> row unicast tree)
 MCAST_FACTOR = True
 
@@ -83,7 +85,8 @@ def trunc_norm(h, eps: float):
         cb(CB_EXG, 1, _F32_TILE, ttnn.float32),
         ttnn.cb_descriptor_from_sharded_tensor(CB_OUT, out),
     ]
-    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=cores, initial_value=0) for i in (SEM_GATHER, SEM_FACTOR)]
+    n_sems = 2 + (nx + ny - 2 if SLOT_SEMS else 0)
+    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=cores, initial_value=0) for i in range(n_sems)]
     ccfg = ttnn.ComputeConfigDescriptor()
     ccfg.math_fidelity = ttnn.MathFidelity.HiFi4
     ccfg.fp32_dest_acc_en = True
@@ -123,7 +126,7 @@ def trunc_norm(h, eps: float):
                 compile_time_args=[wt, role, SEM_GATHER, SEM_FACTOR, nx, ny],
                 runtime_args=items,
                 config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
-                defines=[("MCAST_FACTOR", "1")] if MCAST_FACTOR else [],
+                defines=([("MCAST_FACTOR", "1")] if MCAST_FACTOR else []) + ([("SLOT_SEMS", "1")] if SLOT_SEMS else []),
             )
         )
         kernels.append(
