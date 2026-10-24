@@ -10239,7 +10239,7 @@ from .commands.capture_inputs import cmd_capture_inputs  # noqa: F401
 
 from .commands.op_synth import cmd_op_synth  # noqa: F401
 from .commands.emit_e2e import cmd_emit_e2e  # noqa: F401
-from .commands.optimize import cmd_optimize  # noqa: F401
+from .commands.optimize import add_cpp_flags, cmd_optimize  # noqa: F401
 from .commands.optimize_dashboard import cmd_optimize_dashboard  # noqa: F401
 from .commands.autocommit import wrap as _autocommit_wrap, add_commit_push_args as _add_commit_push_args  # noqa: F401
 from ._cli_helpers.trace_replays import add_trace_replays_arg, apply_trace_replays
@@ -11584,6 +11584,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "a real win/regression, at the cost of that many times the wall-clock per call; BEFORE and "
         "AFTER always read the same value, so any setting stays internally comparable.",
     )
+    add_cpp_flags(popt)
     popt.add_argument(
         "--fresh",
         action="store_true",
@@ -11684,7 +11685,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="read metrics from a live dashboard URL (e.g. http://127.0.0.1:8798) "
         "instead of run state files — best for an in-flight run",
     )
-    pph.add_argument("--repo", required=True, help="target HF repo id, e.g. ashwaaaaa/<model>-tt")
+    pph.add_argument("--repo", required=True, help="target HF repo id, e.g. apande-TT/<model>-tt")
     pph.add_argument("--weights", help="base weights HF repo id to reference (pointer; not uploaded)")
     pph.add_argument("--private", action="store_true", help="create the HF repo as private")
     pph.add_argument(

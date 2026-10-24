@@ -340,6 +340,30 @@ def _relativize_to_model_root(path_str: str, model_root: Path) -> str:
 # ---- the driver --------------------------------------------------------------
 
 
+def _node_key(node) -> tuple:
+    """A test node id, normalized for comparison: (normalized file path, test function or '')."""
+    f, _, fn = str(node).partition("::")
+    return (os.path.normpath(f), fn)
+
+
+def _pinned_pipelines(discovered, task, perf_node, pcc_node):
+    """The pipelines of a run whose correctness gate is pinned with --pcc-test.
+
+    The optimized pipeline (the pinned gate + its perf test) comes first; every OTHER discovered pipeline
+    (model_files._enumerate_pipelines: one per demo/demo_<task>.py, each with its own e2e PCC test) stays
+    as a GATE-ONLY entry -- no perf test, so run.pipelines_from_manifest leaves it out of the optimization,
+    while pcc_runner.gate_nodes still runs its e2e PCC test on every edit. The pipelines share the model
+    code: a lever the pinned test accepts can still break another pipeline's output, and a gate that ran
+    only the pinned test could not see it (Devstral: six runs gated on text_generation alone while
+    image_text_to_text's prefill hidden PCC fell from 0.9954 to 0.9904 under the same 0.995 floor)."""
+    out = [{"task": task, "perf_test": perf_node, "pcc_test": pcc_node}]
+    for p in discovered or []:
+        node = p.get("pcc_test")
+        if node and _node_key(node) not in {_node_key(o["pcc_test"]) for o in out}:
+            out.append({"task": p.get("task", "main"), "perf_test": None, "pcc_test": node})
+    return out
+
+
 def _enforce_pcc_gate_policy(pcc_test, model_root, config) -> None:
     """Decide where the correctness gate comes from, and STOP when there is no ground truth.
 
@@ -782,7 +806,7 @@ def before_loop(
         }
         pathmap["perf_tests"] = [pathmap["perf_test"]]
         _pt_rel_node = f"{_pt_rel}::{_pt_case}" if _pt_case else _pt_rel
-        pathmap["pipelines"] = [{"task": _task, "perf_test": _pt_rel_node, "pcc_test": pcc_override["path"]}]
+        pathmap["pipelines"] = _pinned_pipelines(pathmap.get("pipelines"), _task, _pt_rel_node, pcc_override["path"])
         pathmap["is_multimodal"] = False
         print(
             f"      perf test -> {config['perf_test']} (explicit --perf-test; auto-generation skipped)",
@@ -844,9 +868,10 @@ def before_loop(
         # generated test that defines its OWN capped count is a measurement condition nobody asked
         # for, and nothing read it back. Voxtral's test defined TT_PERF_AUDIO_STREAMS=2 while the
         # pipeline was built for its declared batch of 8, so prefill measured a quarter of the real
-        # workload and was printed against a full-batch roofline. Reported rather than refused: the
-        # same test also defines TT_PERF_FLUSH_EVERY=32, which changes no workload, and no static rule
-        # tells the two apart.
+        # workload and was printed against a full-batch roofline. The skeleton's own knobs
+        # (TT_PERF_FLUSH_EVERY, TT_PERF_EAGER_OSL_TOKENS, ...) are excluded by skeleton_env_vars, so
+        # what survives here is the model's own axis -- which the heavy-axis bridge below now sizes
+        # when exactly one survives, and which is still only REPORTED when several do.
         try:
             from .perf_test_gen import invented_workload_vars as _invented
 
@@ -865,9 +890,16 @@ def before_loop(
         _pp, _, _pf = perf_node.partition("::")
         pathmap["perf_test"] = {"path": _pp, "case": _pf, "note": "auto-gen from --pcc-test"}
         pathmap["perf_tests"] = [pathmap["perf_test"]]
-        pathmap["pipelines"] = [{"task": _task, "perf_test": perf_node, "pcc_test": pcc_override["path"]}]
+        pathmap["pipelines"] = _pinned_pipelines(pathmap.get("pipelines"), _task, perf_node, pcc_override["path"])
         pathmap["is_multimodal"] = False
         print(f"      auto-gen perf from pcc -> {perf_node}", file=sys.stderr, flush=True)
+    if pcc_abs is not None:
+        for _gate in (pathmap.get("pipelines") or [])[1:]:
+            print(
+                f"      also gated on -> {_gate['pcc_test']} (pipeline {_gate['task']}; every edit must clear it too)",
+                file=sys.stderr,
+                flush=True,
+            )
     usage_suffix = record_agent_call(
         "discover",
         "discovery_sub_agent",
@@ -1161,6 +1193,34 @@ def before_loop(
                 )
     except Exception as _cap_e:  # noqa: BLE001
         print(f"      capacity-bridge skipped: {str(_cap_e)[:160]}", file=sys.stderr, flush=True)
+
+    # HEAVY-AXIS BRIDGE, through the SAME function measure_runs() uses -- not a second copy, for the
+    # reason the capacity bridge above is shared: a baseline sized differently from the candidates
+    # measures a different workload and every delta after it is against the wrong reference.
+    try:
+        from . import gitio
+        from .measure import heavy_axis_scaled
+        from .model_contract import declared_stage_names
+
+        _pp_abs = model_root / str(perf_rel)
+        _axis = heavy_axis_scaled(
+            gitio.repo_root(model_root),
+            perf_rel,
+            case,
+            _pp_abs.read_text(errors="ignore"),
+            tuple(declared_stage_names(model_root) or ()),
+        )
+        if _axis and not os.environ.get(_axis[0]):
+            os.environ[_axis[0]] = _axis[1]
+            print(
+                f"      heavy-axis bridge: {_axis[0]} raised to {_axis[1]} -- this model's own "
+                f"axis, sized to the same op budget as the token axis, so the profile samples the "
+                f"request it ranks against instead of the literal the generated test defaulted to",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as _ax_e:  # noqa: BLE001
+        print(f"      heavy-axis bridge skipped: {str(_ax_e)[:160]}", file=sys.stderr, flush=True)
 
     def _run_baseline():
         return profile_model(

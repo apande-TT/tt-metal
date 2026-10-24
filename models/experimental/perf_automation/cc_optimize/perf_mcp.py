@@ -426,7 +426,7 @@ def _note_device_crash(where: str, error_text: str = "") -> None:
 
 
 def _note_device_ok() -> None:
-    _CONSEC_CRASH["n"] = 0
+    _dr().note_ok()
 
 
 def _l1_sig(text) -> bool:
@@ -826,6 +826,31 @@ def _partial_reason(knob: str, st: dict) -> str:
 
 
 _MAX_KERNEL_WEDGES = int(os.environ.get("PERF_MCP_MAX_KERNEL_WEDGES", "3"))
+# CLEAN TRIES PER KERNEL RUNG, PER OP. One by default: a measured kernel is the proof the rung was
+# explored, and that stays the rule unless the operator asks for more. The rung was hard-wired to one,
+# so a large op whose first hand kernel lost had no second chance at all: on minicpm5_2b (2026-10-19)
+# one C++ try on the prefill gate/up kernel -- about 55 ms of a stage 120 ms over its band -- closed it,
+# and the run spent its last rounds with nothing to work. Read at call time, as the gate caps are, and
+# shared by the ladder that hands the rung out and the recorder that accepts it (_rung_allowance), so
+# the two cannot disagree. A later try is handed the previous attempt's note (termination_check), so it
+# builds on that kernel instead of starting again.
+_KERNEL_CAP_ENVS = {"cpp": "PERF_MCP_MAX_CPP_ATTEMPTS", "tt-lang": "PERF_MCP_MAX_TTL_ATTEMPTS"}
+
+
+def _kernel_cap(kind: str) -> int:
+    """How many clean (measured, not wedged) tries the `kind` kernel rung gets on one op; 1 if unset."""
+    env = _KERNEL_CAP_ENVS.get(_normalise_rung(kind))
+    try:
+        return max(1, int(os.environ.get(env, "1") or "1")) if env else 1
+    except ValueError:
+        return 1
+
+
+def _cpp_only() -> bool:
+    """PERF_MCP_CPP_ONLY=1: the C++ rung is the whole ladder. Every op is offered only a C++ kernel and
+    the structural gates (host, decode, conv, fold and the rest) are not consulted -- an operator who
+    asks for C++ alone has already decided the cheaper levers are spent. Off unless set to exactly 1."""
+    return os.environ.get("PERF_MCP_CPP_ONLY") == "1"
 
 
 def _material_gap_ms(device_ms: float) -> float:
@@ -1739,9 +1764,71 @@ def _untried_material_ops(blocking, attempts) -> list:
 
 
 def _rung_state(matches, kind):
-    clean = any((a.get("kernel_kind") or "").lower() == kind and not a.get("wedged") for a in matches)
+    """(clean tries, wedged tries) of `kind` among `matches`. The count is what _kernel_cap compares;
+    it reads truthy for one or more, as the boolean it replaced did."""
+    clean = sum(1 for a in matches if (a.get("kernel_kind") or "").lower() == kind and not a.get("wedged"))
     wedged = sum(1 for a in matches if (a.get("kernel_kind") or "").lower() == kind and a.get("wedged"))
     return clean, wedged
+
+
+def _kernel_retry_reason(kind: str, clean: int) -> str:
+    """The rung text for a kernel rung's second and later clean try on one op."""
+    return (
+        "%s attempt %d of %d on this op: build on the previous kernel (its recorded note follows) -- keep "
+        "what it got right and change what lost, do not start over; record_kernel_attempt(...,'%s',...)."
+        % ("C++" if kind == "cpp" else "tt-lang", clean + 1, _kernel_cap(kind), kind)
+    )
+
+
+def _cpp_rung(matches: list, first_reason: str):
+    """(False, "cpp", reason) while the C++ rung has tries left on this op, else None.
+
+    Closes after _kernel_cap("cpp") clean tries or _MAX_KERNEL_WEDGES wedges. One copy, read by the
+    ordinary ladder and by the C++-only one, so the two hand the rung out by the same rule."""
+    clean, wedged = _rung_state(matches, "cpp")
+    if clean >= _kernel_cap("cpp") or wedged >= _MAX_KERNEL_WEDGES:
+        return None
+    _tr = _trace_on()
+    if wedged:
+        if _tr:
+            _r = (
+                "apply the PROVEN trace-safe recipe (fix the recipe application, do NOT bounce rungs): %s (attempt %d)"
+                % (
+                    _TRACE_SAFE_HINT,
+                    wedged + 1,
+                )
+            )
+        else:
+            _r = (
+                "the C++ kernel crashed in EAGER (TT_PERF_TRACE=0) — a real math/runtime error, not a trace issue; fix it from the traceback/check_pcc and retry (attempt %d)"
+                % (wedged + 1)
+            )
+        return (False, "cpp", _r)
+    _suffix = _ISOLATE_FIRST if _tr else _EAGER_NOTE
+    if clean:
+        return (False, "cpp", _kernel_retry_reason("cpp", clean) + _suffix)
+    return (False, "cpp", first_reason + _suffix)
+
+
+def _cpp_only_status(open_op: dict, op_code: str, matches: list) -> tuple[bool, str, str]:
+    """The ladder under PERF_MCP_CPP_ONLY: the C++ rung alone, by the same rule the full ladder uses.
+
+    The launch-gap bucket and sealed op classes have no kernel to write, so they clear at once."""
+    if (open_op.get("bucket") or "").lower() == "host_fallback" or not _is_kernel_able(op_code):
+        return (True, "done", "C++-only run (PERF_MCP_CPP_ONLY=1): no C++ kernel applies to this op")
+    _cpp = _cpp_rung(
+        matches,
+        "C++-only run (PERF_MCP_CPP_ONLY=1): author a C++ Metalium kernel via ttnn.generic_op (GUIDELINES/12) "
+        "for this op and record it.",
+    )
+    if _cpp:
+        return _cpp
+    return (
+        True,
+        "done",
+        "C++-only run (PERF_MCP_CPP_ONLY=1): C++ rung spent (%d clean tr%s, the cap)"
+        % (_kernel_cap("cpp"), "y" if _kernel_cap("cpp") == 1 else "ies"),
+    )
 
 
 def _trace_compat_feedback(raw_reason: str) -> str:
@@ -1818,6 +1905,8 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
     fidelity = (open_op.get("fidelity") or "").lower()
     bound = (open_op.get("bound_by") or "").lower()
     is_matmul = "matmul" in (op_code or "").lower()
+    if _cpp_only():
+        return _cpp_only_status(open_op, op_code, matches)
     # BOX (0) HOST / dispatch bucket (GAP-A) — NOT a device op, so the matmul ladder (grid/dtype/
     # tt-lang/C++) is meaningless. Its lever is a STRUCTURAL host-loop transform (trace capture /
     # 2-CQ). Routed via recall_knobs(op_class=host_fallback).
@@ -1989,9 +2078,7 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
         _tr = _trace_on()
         _suffix = _ISOLATE_FIRST if _tr else _EAGER_NOTE
         _tl_clean, _tl_wedged = _rung_state(matches, "tt-lang")
-        _cpp_clean, _cpp_wedged = _rung_state(matches, "cpp")
-        _tl_done = _tl_clean or _tl_wedged >= _MAX_KERNEL_WEDGES
-        _cpp_done = _cpp_clean or _cpp_wedged >= _MAX_KERNEL_WEDGES
+        _tl_done = _tl_clean >= _kernel_cap("tt-lang") or _tl_wedged >= _MAX_KERNEL_WEDGES
         if not _tl_done and _ttl_available():
             if _tl_wedged:
                 if _tr:
@@ -2008,33 +2095,18 @@ def _op_ladder_status(open_op: dict, op_code: str, attempts: list) -> tuple[bool
                         % (_tl_wedged + 1)
                     )
                 return (False, "tt-lang", _r)
+            if _tl_clean:
+                return (False, "tt-lang", _kernel_retry_reason("tt-lang", _tl_clean) + _suffix)
             return (
                 False,
                 "tt-lang",
                 "knobs exhausted (grid+dtype); author a tt-lang kernel (GUIDELINES/11) and record it." + _suffix,
             )
-        if (_tl_done or not _ttl_available()) and not _cpp_done:
-            if _cpp_wedged:
-                if _tr:
-                    _r = (
-                        "apply the PROVEN trace-safe recipe (fix the recipe application, do NOT bounce rungs): %s (attempt %d)"
-                        % (
-                            _TRACE_SAFE_HINT,
-                            _cpp_wedged + 1,
-                        )
-                    )
-                else:
-                    _r = (
-                        "the C++ kernel crashed in EAGER (TT_PERF_TRACE=0) — a real math/runtime error, not a trace issue; fix it from the traceback/check_pcc and retry (attempt %d)"
-                        % (_cpp_wedged + 1)
-                    )
-                return (False, "cpp", _r)
-            return (
-                False,
-                "cpp",
-                "tt-lang measured; author a C++ Metalium kernel via ttnn.generic_op (GUIDELINES/12) and record it."
-                + _suffix,
-            )
+        _cpp = _cpp_rung(
+            matches, "tt-lang measured; author a C++ Metalium kernel via ttnn.generic_op (GUIDELINES/12) and record it."
+        )
+        if _cpp:
+            return _cpp
     # every box ticked (knobs + structural + tt-lang + C++) -> genuine irreducible residual -> DONE.
     # STRUCTURAL is asserted ABOVE (before the kernel rungs), so reaching here means it is already tried.
     return (
@@ -2779,7 +2851,24 @@ def _adaptive_run(cmd, cwd, env, label="device run", stall_s=None, backstop=None
                 proc.communicate(timeout=30)
             except Exception:  # noqa: BLE001
                 pass
-            raise _sp.TimeoutExpired(cmd, limit if now - last_progress >= limit else backstop)
+            # THE KILL IS RECOVERED HERE, ONCE, FOR EVERY CALLER. This is the one place this module
+            # SIGKILLs a device run, and it used to leave the board exactly as the kill found it: the
+            # full-pipeline gate reset only inside its trace-region grow, which stops once the region
+            # is at its ceiling, and the op-sig probe never reset at all. Run 1791980272 (2026-10-14,
+            # minicpm5_2b, --devices 0) then spent 4 back-to-back 662 s attempts stuck in
+            # fetch_queue_reserve_back on the board the previous kill left behind. The reset goes
+            # through the one rule every other killing path uses (probes.reset_after_ended_child),
+            # so a single-chip run still meets the veto and its work probe -- until a stall repeats
+            # with nothing working between (probes.reset_after_killed_child), which the veto cannot see.
+            stalled = now - last_progress >= limit
+            try:
+                from agent import probes as _pr
+
+                _reset = _pr.reset_after_killed_child if stalled else _pr.reset_after_ended_child
+                _reset(error_text="".join(buf)[-4000:], env=env)
+            except Exception:  # noqa: BLE001 -- the next run's own device open says if it is still needed
+                pass
+            raise _sp.TimeoutExpired(cmd, limit if stalled else backstop)
     rc = proc.returncode
     pt.join(timeout=30)
     return _AdaptiveResult(rc, "".join(buf))
@@ -2989,13 +3078,14 @@ def _read_stage_doc(state_dir_path=None, model="", task="") -> dict:
 
 
 def _parse_gathered_weights(out: str) -> dict:
-    """{subtree: resident bytes read PER ITEM} from the pipeline's marker, or {} when it printed none.
+    """{subtree: bytes of the pipeline's declared lookup tables} from the census marker, or {} for none.
 
     Resident is not the same as streamed. The ceiling assumes one unit of work reads every weight in
     its subtree once, which is true of a matmul weight and false of a lookup table -- voxtral's
     embed_tokens is 805 MB and a decode step reads one 6 KB row of it. Nothing in the checkpoint
     separates the two: embed_tokens and lm_head are both [131072, 3072], same size, same section.
-    The pipeline holds them and says which is which.
+    The pipeline holds them and declares its tables once (stage_seams.GATHERED_TABLES_ATTR); the
+    census credits their bytes per subtree and trace_replay prints that (weight_census.gathered_marker).
     """
     out_map: dict = {}
     try:
@@ -3165,7 +3255,7 @@ def _persist_stage_ms(
                     # PER-REQUEST counts, from the legacy marker. "isl" above holds TOTALS a stage
                     # stated for one call; these must be multiplied by the batch and those must not.
                     "isl_per_request": stage_isl_per_request or {},
-                    # THE READ SET, MEASURED. Distinct device tensors each stage's ops touched, from
+                    # THE READ SET, MEASURED. Distinct device tensors each stage's ops streamed, from
                     # trace_replay's dispatch hook. The roofline's memory floor divides by this;
                     # every other source for it is an inference from the checkpoint plus a naming
                     # convention, and the one that matters most -- what a TOKEN reads -- had no
@@ -3229,8 +3319,10 @@ def read_stage_spread(state_dir_path=None, model="", task="") -> dict:
 def read_stage_bytes(state_dir_path=None, model="", task="") -> dict:
     """The measured per-stage read set in BYTES, or {}. Read by the report renderer.
 
-    The distinct device tensors each stage's ops touched, observed by trace_replay's dispatch hook
-    while the stage ran in isolation. This is the roofline's memory-floor divisor, MEASURED -- the
+    The distinct device tensors each stage's ops STREAMED -- handed and never written, a gathered
+    table at the rows that came out of it -- observed by trace_replay's dispatch hook while the stage
+    ran in isolation. What the step writes (its KV rows, its activations) is priced by summary's
+    per-item term on top. This is the roofline's memory-floor divisor, MEASURED -- the
     alternative sources are the checkpoint's total (which counts towers a token never reads), a name
     list (`audio_tower|vision_tower|...`, which a model can spell differently), and a stage_roots
     section map (which drops lm_head on any untied model).
@@ -3522,10 +3614,11 @@ def _run_full_pipeline_ms():
     for _ in range(_FULLPIPE_SAMPLES):
         # A stall with NO trace is the silent-overflow signature: a too-small region can HANG the mesh,
         # and _adaptive_run then SIGKILLs it and RAISES -- so it never reaches the grow below. Handle it
-        # HERE: reset the wedged device, double the region up to the DRAM ceiling, and retry the SAME
-        # sample (without spending the measurement budget), so a hang that printed nothing self-corrects
-        # instead of just burning samples. Only a timeout-type stall triggers this; a clean crash still
-        # returns and takes the message-based grow path below.
+        # HERE: double the region up to the DRAM ceiling and retry the SAME sample (without spending
+        # the measurement budget), so a hang that printed nothing self-corrects instead of just burning
+        # samples. _adaptive_run has already reset the board it killed, at the ceiling too. Only a
+        # timeout-type stall triggers this; a clean crash still returns and takes the message-based
+        # grow path below.
         r = None
         for _stall_try in range(int(_STALL_GROW_ROUNDS) + 1):
             try:
@@ -3538,15 +3631,9 @@ def _run_full_pipeline_ms():
                     break
                 env["TT_PERF_TRACE_REGION"] = str(min(cur * 2, _TRACE_REGION_MAX))
                 sys.stderr.write(
-                    "[full-pipeline-gate] run stalled with no trace (silent overflow); resetting device "
-                    "and growing trace region to %s B, retrying\n" % env["TT_PERF_TRACE_REGION"]
+                    "[full-pipeline-gate] run stalled with no trace (silent overflow); growing trace "
+                    "region to %s B, retrying\n" % env["TT_PERF_TRACE_REGION"]
                 )
-                try:
-                    from agent.probes import _device_reset
-
-                    _device_reset(error_text=str(exc))
-                except Exception:  # noqa: BLE001
-                    pass
         if r is None:
             continue
         # ENDED ITSELF FOR HEAT (agent.probes.thermal_yield): no reading, and no reason to take the next
@@ -3592,10 +3679,11 @@ def _run_full_pipeline_ms():
             # Decode ms and prefill ms are not the same currency (decode recurs per token, prefill
             # once per request), so a phase split guessed from free text can put time in the wrong
             # pool and be acted on. Measured, it cannot.
-            # THE BYTES A STAGE ACTUALLY READ. Parsed here beside its time because they are one
+            # THE BYTES A STAGE ACTUALLY STREAMED. Parsed here beside its time because they are one
             # measurement of one stage: trace_replay observes the distinct device tensors the stage's
-            # ops touched, which is the quantity the roofline has always had to infer from the
-            # checkpoint and a tower name list.
+            # ops read without writing, which is the quantity the roofline has always had to infer
+            # from the checkpoint and a tower name list. The integer up to the first space; the
+            # breakdown trace_replay prints behind it (in_step=, gathered_saved=) is for a reader.
             if "TRACE_STAGE_BYTES[" in line:
                 try:
                     _bn = line.split("TRACE_STAGE_BYTES[", 1)[1].split("]", 1)[0].strip()
@@ -3966,7 +4054,7 @@ def _run_full_pipeline_ms():
                     _med / 1e6,
                     depth=str(_st).strip().lower(),
                     mode="bytes_mb",
-                    source="trace_replay observed read set (%d agreeing samples)" % len(_svals),
+                    source="trace_replay observed streamed read set (%d agreeing samples)" % len(_svals),
                     model=_MODEL_ROOT.name if _MODEL_ROOT else "",
                 )
         except Exception:  # noqa: BLE001 -- a pin that cannot be written must not cost a measurement
@@ -5078,6 +5166,11 @@ def _stage_deltas(now: dict, bar: dict, spread: dict | None = None) -> dict:
     """
     out = {}
     _tol_by_stage = spread or {}
+    # WHAT A STEP'S DELTA IS WORTH TO ONE REQUEST. A stage the pipeline states a request repeats
+    # (stage_repeats_per_request) gets `repeats` and `delta_per_request_ms` beside its per-step
+    # delta, so a 0.02 ms step win on a 127-step stage reads as the ~2.5 ms it is. Additive: the win
+    # rule and the bars still judge the per-step number against the stage's own spread.
+    _reps = stage_repeats_per_request(list(now)) if now else {}
     for name, ms in sorted(now.items()):
         prev = bar.get(name)
         row = {"ms": round(ms, 4), "best": (round(prev, 4) if prev else None)}
@@ -5094,6 +5187,9 @@ def _stage_deltas(now: dict, bar: dict, spread: dict | None = None) -> dict:
             row["tol_ms"] = round(prev * tol, 4)
             row["improved"] = ms < prev * (1.0 - tol)
             row["regressed"] = ms > prev * (1.0 + tol)
+            if _reps.get(name):
+                row["repeats"] = int(_reps[name])
+                row["delta_per_request_ms"] = round((ms - prev) * int(_reps[name]), 4)
         else:
             row["delta_pct"] = None
             row["delta_ms"] = None
@@ -5576,6 +5672,11 @@ def _check_full_pipeline_latency_body() -> dict:
     cq = 1
     ms, method, err, path = _measure_full_pipeline_guarded()
     if ms is None:
+        # THE SAME CRASH POLICY AS EVERY OTHER DEVICE TOOL. measure_candidate and check_pcc feed
+        # note_crash (a dead-board signature resets at once, an ambiguous crash counts toward the
+        # two-strike reset); this gate fed it nothing, so its crashes never reached recovery at all.
+        if not _is_measurement_failure(err or ""):
+            _note_device_crash("check_full_pipeline_latency", err or "")
         return _emit_fullpipe({"status": "crash", "error": err, "cq": cq})
     # A HEADLINE OF ZERO IS A RUN THAT MEASURED NOTHING, and it used to be reported as `ok`. The
     # perf test prints TRACE_PER_TOKEN_MS=0.0000 and exits PASSED when every stage's timing hook
@@ -5604,6 +5705,7 @@ def _check_full_pipeline_latency_body() -> dict:
                 ),
             }
         )
+    _note_device_ok()  # a positive reading: the device ran the whole pipeline, so the crash streak ends
     metric = "trace_per_token_ms" if method == "trace" else "eager_full_pipeline_ms"
     mode = _fullpipe_mode(method, path)
     base_path = _FULLPIPE_BASELINE_1CQ_PATH
@@ -6361,7 +6463,9 @@ def _rung_allowance(op_signature: str, kernel_kind: str, attempts: list, partial
         # and there is no gate re-asking for a second. A gate rung is different precisely because
         # something IS re-asking, up to its cap, and refusing it earlier than the cap leaves the
         # gate with no route to clear.
-        allowed = _gate_rung_allowance(rung) or 1
+        # The kernel rungs take _kernel_cap, the number the ladder hands them out up to (1 unless the
+        # operator raised it).
+        allowed = _gate_rung_allowance(rung) or _kernel_cap(rung)
     return tries, allowed
 
 
@@ -7195,8 +7299,10 @@ def _fold_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: nothing recurs within a layer
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    _req = _per_request_reader(prof)
+    if not _req.material_sum(cands):
         return None
+
     # THE LADDER IS PER GROUP. It was read off every attempt the model ever recorded, so one fold win on
     # one group answered the ladder for all of them: an image-edit port's early folds of its vision
     # reduction and its VAE convs closed it, and no repeated group of its 50-step denoise was ever
@@ -7205,16 +7311,10 @@ def _fold_gate(prof: dict, attempts: list) -> dict | None:
     # Ranked by what the group costs ONE REQUEST -- its gap times its stage's cost weight, the weight
     # the blocking ranking uses -- so a group in a stage a request repeats is not queued behind groups
     # in stages it runs once. Only the first _FUSION_GROUPS_ENV groups are held to the ladder.
-    # A stage is read off the op_code only when that code names ONE group: several open groups under one
-    # bare class name cannot be placed by name, and such a group keeps weight 1 rather than borrow the
-    # stage where its class costs most (which boosted a vision elementwise group 130x as "denoise").
-    _w = stage_cost_weights(prof)
-    _codes = [str(o.get("op_code") or "") for o in ops]
-
+    # Placed by fingerprint, and by the bare op_code only when that code names ONE group -- see
+    # _open_op_stage, the placement rule this gate and the blocking ranking share.
     def _per_request(o):
-        code = str(o.get("op_code") or "")
-        stage = stage_of_op(code, prof) if _codes.count(code) == 1 else ""
-        return float(o.get("gap_ms") or 0.0) * float(_w.get(stage or "", 1.0))
+        return _req.gap(o, o.get("gap_ms"))
 
     _held = int(os.environ.get(_FUSION_GROUPS_ENV, _FUSION_GROUPS_DEFAULT) or _FUSION_GROUPS_DEFAULT)
     lever = worst = None
@@ -7306,7 +7406,7 @@ def _order_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: no projection is adjacent to a slice/gather
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(cands):
         return None
     if _gate_retired(_ORDER_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -7365,7 +7465,7 @@ def _conv_gate(prof: dict, attempts: list) -> dict | None:
     if not convs:
         return None  # (1) not applicable: this model has no convolution at all
     gap = sum(float(o.get("gap_ms") or 0.0) for o in convs)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(convs):
         return None
     if _gate_retired(_CONV_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -7431,7 +7531,7 @@ def _split_gate(prof: dict, attempts: list) -> dict | None:
     if not cands:
         return None  # (1) not applicable: nothing fused has open gap here
     gap = sum(float(o.get("gap_ms") or 0.0) for o in cands)
-    if gap < _material_gap_ms(float(prof.get("device_ms") or 0.0)):
+    if not _per_request_reader(prof).material_sum(cands):
         return None
     if _gate_retired(_SPLIT_LEVER, attempts):
         return None  # (2) measured win, or (3) capped
@@ -8363,6 +8463,100 @@ def _blocking_order_key(b: dict, short_names) -> tuple:
     return (done, -float(gap) * float(b.get("cost_weight") or 1.0))
 
 
+def _open_op_stage(o: dict, profile, codes) -> str:
+    """Which stage one OPEN OP lives in, or "". An open op is a fingerprint (op_code + shape).
+
+    BY THE FINGERPRINT FIRST. The bare op_code names a class that runs in every stage -- a matmul runs
+    in all of them -- so placing by it put every recurring-step matmul in whichever stage matmuls cost
+    the most, and weighed it as that stage. The shape is what tells a one-row step projection from a
+    prompt-length one.
+
+    By the bare code only when it names ONE open fingerprint (`codes`: every open op's code): several
+    groups under one class name cannot be placed by name, and such a group keeps no stage rather than
+    borrow the one where its class costs most -- which once boosted a vision elementwise group 130x as
+    the denoise stage."""
+    code = str((o or {}).get("op_code") or "").strip()
+    if not code:
+        return ""
+    shape = str((o or {}).get("shape") or "").strip()
+    if shape:
+        placed = stage_of_op("%s %s" % (code, shape), profile)
+        if placed:
+            return placed
+    if list(codes or ()).count(code) != 1:
+        return ""
+    return stage_of_op(code, profile)
+
+
+def _per_request_reader(profile):
+    """How much closing an open op's gap saves ONE REQUEST, and whether that is material -- read once.
+
+    THE CUTOFF USED TO RUN BEFORE THE WEIGHT. termination_check dropped every op whose PROFILED gap was
+    under _material_gap_ms, and only the survivors were weighed by stage_cost_weights. The profile runs
+    a recurring step once, so a stage a request repeats 127 times showed every op under the cutoff:
+    all of them were dropped before the x127 could apply, the queue held only once-per-request stages,
+    and the stage the band check named as still short was never offered an op. The same raw-gap test
+    sat in every structural gate, so none of them could see that stage either.
+
+    Membership is the OLD test OR the new one, so it only ever widens: an op that was material is still
+    material, and an op is also material when its gap times its stage's weight clears the cutoff
+    restated per request (the profile's device_ms with each marked stage's share scaled by its weight,
+    never below 1, so the cutoff can only rise to meet the larger units).
+
+    A GAP ITS STAGE CANNOT RESOLVE IS NOT MULTIPLIED. Multiplying a gap multiplies its error with it,
+    so the weight is withheld from an op whose gap is inside its stage's measured run-to-run wobble
+    (read_stage_spread x the op's own device_ms). With no spread on file nothing is withheld; the
+    roofline leaves at_floor only a gap within a tenth of the op's own floor -- it has no absolute
+    cutoff, since one judged on the profiled pass would run before this weight -- and the per-op launch
+    cost is already inside every op's floor.
+
+    Fields: weights ({stage: weight}, stage_cost_weights), stage(o), gap(o, raw) -> per-request ms,
+    material(o, raw) -> bool, material_sum(ops) -> bool (a gate's summed gap_ms). Stage names are
+    whatever the capture and the pipeline report."""
+    import types as _types
+
+    profile = profile or {}
+    weights = stage_cost_weights(profile)
+    spread = _measured_spread() if weights else {}
+    codes = [str(o.get("op_code") or "").strip() for o in profile.get("open_ops") or [] if isinstance(o, dict)]
+    dev = float(profile.get("device_ms") or 0.0)
+    cutoff_raw = _material_gap_ms(dev)
+    req_dev = dev
+    for st, buckets in (profile.get("stage_buckets") or {}).items():
+        st_ms = sum(float(b.get("device_ms") or 0.0) for b in (buckets or []) if isinstance(b, dict))
+        req_dev += st_ms * (max(1.0, float(weights.get(st, 1.0))) - 1.0)
+    cutoff_req = _material_gap_ms(req_dev)
+
+    placed = {}  # one lookup per fingerprint: the cutoff and the entry both ask
+
+    def stage(o):
+        if not weights:
+            return ""
+        key = (str((o or {}).get("op_code") or ""), str((o or {}).get("shape") or ""))
+        if key not in placed:
+            placed[key] = _open_op_stage(o, profile, codes)
+        return placed[key]
+
+    def gap(o, raw):
+        raw = float(raw or 0.0)
+        st = stage(o)
+        w = float(weights.get(st or "", 1.0))
+        if w > 1.0 and spread.get(st) and raw <= float(o.get("device_ms") or 0.0) * float(spread[st]):
+            w = 1.0
+        return raw * w
+
+    def material(o, raw):
+        return float(raw or 0.0) >= cutoff_raw or gap(o, raw) >= cutoff_req
+
+    def material_sum(ops):
+        # A structural gate's applicability test, over the summed gap_ms of its candidates.
+        ops = [o for o in ops or [] if isinstance(o, dict)]
+        raw = sum(float(o.get("gap_ms") or 0.0) for o in ops)
+        return raw >= cutoff_raw or sum(gap(o, o.get("gap_ms")) for o in ops) >= cutoff_req
+
+    return _types.SimpleNamespace(weights=weights, stage=stage, gap=gap, material=material, material_sum=material_sum)
+
+
 def stage_of_op(op, profile) -> str:
     """Which stage this op costs the most in, read from the capture, or "" when it cannot say.
 
@@ -8528,6 +8722,7 @@ def finish_round() -> dict:
     # still ends -- the agent exits on its own and no tool can prevent that -- but it ends recorded
     # as REFUSED, and the run stops on its round budget. The budget becoming the visible stopping
     # point is the honest outcome: it says the work was not finished instead of claiming it was.
+    _rep: dict = {}
     try:
         # THE GATE'S OWN ANSWER, not a second one. termination_check already builds the blocking list
         # and already names what has no attempt yet; asking it here means finish_round and the target
@@ -8560,11 +8755,29 @@ def finish_round() -> dict:
         )
     if _left:
         _owed.append("%d material op(s) have no attempt on the rung they are next owed" % len(_left))
-    _verdict["why"] = (
-        "NOT FINISHED. %s. Go back to the top of the LOOP: call termination_check, take the next "
-        "target -- prefer ops in the stacks named here -- and work its rung. Banking wins and writing "
-        "a summary is not an ending while either half is outstanding." % ", and ".join(_owed)
-    )
+    # A REFUSAL IS NOT ALWAYS AN ORDER TO GO BACK. "Go back to the top of the LOOP and take the next
+    # target" presumes there is one. When the gate itself answered with no target -- every material
+    # op's rungs tried, and nothing it could hand over -- the loop it sends the agent back to says the
+    # same thing, and the gate's own directive for that state is "call finish_round". The two tools
+    # then contradicted each other (Devstral run 4, 2026-10-18: the gate said call finish_round, this
+    # said call termination_check, and the agent went looking through the tool's source for a way
+    # out). The verdict is still REFUSED -- a band that cannot be reached is not waived, and the run
+    # ends on its round budget as designed -- but what the agent is told to do is to exit.
+    # ONE REFUSAL EXIT, two wordings: the verdict below is recorded and returned once either way.
+    if _short and not _left and _rep and _rep.get("next_target") is None:
+        _verdict["nothing_reachable"] = True
+        _verdict["why"] = (
+            "NOT FINISHED, AND NOTHING LEFT TO WORK. %s, yet the gate has no target: every material op "
+            "has its rungs tried. The round ends REFUSED on the record -- exit now rather than looping "
+            "back to termination_check, which will say the same. The run goes on by its round budget; a "
+            "later capture may open a new op." % ", and ".join(_owed)
+        )
+    else:
+        _verdict["why"] = (
+            "NOT FINISHED. %s. Go back to the top of the LOOP: call termination_check, take the next "
+            "target -- prefer ops in the stacks named here -- and work its rung. Banking wins and writing "
+            "a summary is not an ending while either half is outstanding." % ", and ".join(_owed)
+        )
     _record_round_finish(_verdict)
     return _verdict
 
@@ -8676,15 +8889,26 @@ def termination_check() -> dict:
     attempts = [a for a in _load_attempts_all() if _attempt_counts_for_the_ladder(a)]
     blocking, cleared = [], []
     material = _material_gap_ms(dev)
+    # The gates read this view too (see _gate_prof below); built first so the cutoff is judged per
+    # request -- an op's gap times its stage's weight -- not per profiled pass (_per_request_reader).
+    _gate_prof = {**prof, "open_ops": rep.get("open_ops") or []}
+    _req = _per_request_reader(_gate_prof)
     for o in rep.get("open_ops") or []:
         gap = o.get("gap_ms") or 0.0
         # eff_gap is precision-aware for matmuls, == gap otherwise; keep the op if EITHER is material.
         eff_gap = o.get("eff_gap_ms")
         if eff_gap is None:
             eff_gap = gap
-        if max(gap, eff_gap) < material:
+        if not _req.material(o, max(gap, eff_gap)):
             continue
-        op_code = o.get("op_code") or o.get("bucket") or ""
+        # NAMED BY OP AND SHAPE (_group_name), as the fold gate names its groups. A matmul's op_code
+        # carries its dims; a shapeless class (GenericOp, BinaryNg, LayerNorm) does not, so every
+        # instance of it shared one name -- and _op_match matches a shapeless name on class alone, so
+        # one attempt on any of them answered the ladder for all of them. A model's custom kernels
+        # all profile as GenericOpDeviceOperation: one cpp try on a small attention kernel closed the
+        # largest kernel in its prefill (a fused gate/up matmul, a third of the stage) unexamined.
+        # The target carries this name, so the agent records against it and its ladder is its own.
+        op_code = _group_name(o) or o.get("bucket") or ""
         entry = {
             "op": op_code,
             "op_class": o.get("bucket"),
@@ -8723,7 +8947,9 @@ def termination_check() -> dict:
         # WHERE THIS OP LIVES, resolved once here rather than again for whichever entry wins: the
         # ordering below needs it for every candidate, and next_target used to recompute it for the
         # one it picked.
-        entry["stage"] = stage_of_op(op_code, prof)
+        # By fingerprint when the weights are in force (_open_op_stage): the bare code put every
+        # recurring-step matmul in whichever stage matmuls cost most. Unweighted, exactly as before.
+        entry["stage"] = _req.stage(o) if _req.weights else stage_of_op(op_code, prof)
         done, rung, reason = _op_ladder_status(o, op_code, attempts)
         if done:
             cleared.append({**entry, "verdict": reason})
@@ -8741,34 +8967,36 @@ def termination_check() -> dict:
     # the shape this caller had, so the gate logic was pinned while the wiring between the two was
     # never exercised at all.
     #
-    # A merged view rather than a mutation: `prof` is the cached profile object, and the roofline's
-    # work queue is a derived reading of it, not a property of the capture. Handed to every gate,
+    # A merged view rather than a mutation (built above the per-op loop, which reads it too): `prof`
+    # is the cached profile object, and the roofline's work queue is a derived reading of it, not a
+    # property of the capture. Handed to every gate,
     # including the two that read other fields today, so the next gate to read open_ops cannot
     # inherit this by being wired the older way.
-    _gate_prof = {**prof, "open_ops": rep.get("open_ops") or []}
-    host_block = _host_gate(_gate_prof, blocking, attempts)
-    if host_block:
-        blocking.append(host_block)
-    decode_block = _decode_gate(_gate_prof, attempts)
-    if decode_block:
-        blocking.append(decode_block)
-    conv_block = _conv_gate(_gate_prof, attempts)
-    if conv_block:
-        blocking.append(conv_block)
-    fold_block = _fold_gate(_gate_prof, attempts)
-    if fold_block:
-        blocking.append(fold_block)
-    # Exactly as before the fusion ladder: these three ride with the FOLD rung, not the later ones.
-    if fold_block and fold_block.get("next_rung") == _FOLD_LEVER[0][-1]:
-        order_block = _order_gate(_gate_prof, attempts)
-        if order_block:
-            blocking.append(order_block)
-        split_block = _split_gate(_gate_prof, attempts)
-        if split_block:
-            blocking.append(split_block)
-        stock_block = _stock_gate(_gate_prof, attempts)
-        if stock_block:
-            blocking.append(stock_block)
+    # A C++-only run consults none of them: the operator asked for the C++ rung alone (_cpp_only).
+    if not _cpp_only():
+        host_block = _host_gate(_gate_prof, blocking, attempts)
+        if host_block:
+            blocking.append(host_block)
+        decode_block = _decode_gate(_gate_prof, attempts)
+        if decode_block:
+            blocking.append(decode_block)
+        conv_block = _conv_gate(_gate_prof, attempts)
+        if conv_block:
+            blocking.append(conv_block)
+        fold_block = _fold_gate(_gate_prof, attempts)
+        if fold_block:
+            blocking.append(fold_block)
+        # Exactly as before the fusion ladder: these three ride with the FOLD rung, not the later ones.
+        if fold_block and fold_block.get("next_rung") == _FOLD_LEVER[0][-1]:
+            order_block = _order_gate(_gate_prof, attempts)
+            if order_block:
+                blocking.append(order_block)
+            split_block = _split_gate(_gate_prof, attempts)
+            if split_block:
+                blocking.append(split_block)
+            stock_block = _stock_gate(_gate_prof, attempts)
+            if stock_block:
+                blocking.append(stock_block)
     # A STAGE THAT HAS REACHED ITS BAND GOES LAST. The gate works out which stacks are still short --
     # three lines from where the target is chosen -- and used that only to refuse to stop, never to
     # decide what to work on. So the target stayed "the biggest gap anywhere", and on
@@ -8787,7 +9015,7 @@ def termination_check() -> dict:
     # WEIGHED BY WHAT THE STAGE REALLY COSTS (stage_cost_weights): the gap is read off a capped
     # profile that samples the stages unequally. The gap itself is reported unchanged; only the
     # order uses the weight, and with no weights every op's is 1 and the order is the old one.
-    _weights = stage_cost_weights(prof)
+    _weights = _req.weights
     for b in blocking:
         b["cost_weight"] = round(float(_weights.get(b.get("stage") or "", 1.0)), 4)
     blocking.sort(key=lambda b: _blocking_order_key(b, _short_names))
@@ -8831,8 +9059,13 @@ def termination_check() -> dict:
     # actually happened last time (a crash message, a wedge, a PCC miss) from the log and appends it,
     # so a fresh round starting on a target someone already tried is not starting blind on WHY it
     # failed -- it still has to prove a fix by measuring, same as ever, but it knows what broke.
-    _target_reason = blocking[0]["reason"]
-    _prior_note = _last_recorded_note(blocking[0]["op"])
+    # NOTHING BLOCKING IS A VERDICT, NOT A CRASH. `next_target` below already yields None for an empty
+    # list, but these two reads ran first and raised IndexError the moment the last material op cleared
+    # its checklist -- the very moment can_stop had just been set. The harness treats a raised gate as
+    # "not done" and launches another round, so a finished run relaunched empty rounds until its round
+    # budget was spent (Devstral run 3, 2026-10-15: rounds 4-10 of 10 did nothing).
+    _target_reason = blocking[0]["reason"] if blocking else ""
+    _prior_note = _last_recorded_note(blocking[0]["op"]) if blocking else ""
     if _prior_note and _prior_note not in _target_reason:
         _target_reason = _target_reason.rstrip() + " | Last recorded attempt on this target: " + _prior_note
     next_target = (
@@ -8882,6 +9115,39 @@ def termination_check() -> dict:
         else ""
     )
     _persist_target(next_target)
+    if can_stop:
+        _directive = (
+            "DONE — every material-gap op has its full checklist ticked (grid + dtype knobs + tt-lang "
+            "+ C++). No reachable rung remains."
+        )
+    elif next_target is None:
+        # A STACK STILL OWES ITS BAND BUT NO OP IS LEFT TO HAND OVER. Before, this case could not be
+        # reached (see the IndexError note above); once it is, telling the agent to "work next_target"
+        # sends it after a target that is null. Say what is true and what to do.
+        _directive = (
+            "NOT DONE — %s still above the achievable band, yet no material op has a rung left to try: "
+            "nothing to work this round. Call finish_round (it records the round as REFUSED, there being "
+            "nothing reachable) and exit; the run goes on by its round budget, and a later capture may "
+            "open a new op." % ", ".join(str(r.get("stage") or "?") for r in _short)
+        )
+    else:
+        _directive = (
+            "NOT DONE — work next_target (the largest-gap blocking op) at its rung, IN THE STAGE "
+            "next_target.stage names: the ranking already accounts for where the time is, and the "
+            "metric in your instructions describes only the recurring stage, so following the metric "
+            "instead of the target spends effort where little is left. " + _stage_time_note + "REUSE-FIRST: "
+            "BEFORE editing, call recall_knobs(next_target.op_class, next_target.grid, "
+            "next_target.bound_by) and APPLY/ADAPT any matching "
+            "catalogued knob (heed its negative knowledge); improvise from scratch ONLY if nothing "
+            "matches — a recalled knob still requires check_pcc + measure + record_kernel_attempt (it "
+            "never skips a rung). Ladder ORDER: "
+            "knob:grid -> knob:fidelity -> knob:dtype -> knob:shard -> tt-lang -> cpp. record_kernel_attempt for EACH rung (knobs too: "
+            "kind='grid'/'fidelity'/'dtype'/'shard'; kernels: 'tt-lang'/'cpp'). A later rung does NOT clear an op while an "
+            "earlier rung is untried. WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs "
+            "had no match), call distill_knob to persist it for reuse; if the win re-used a provisional "
+            "lever from another model, pass its id to distill_knob to graduate it. Re-run "
+            "termination_check after each rung."
+        )
     return {
         "can_stop": can_stop,
         # WHICH STACKS STILL OWE THE BAND, and by how much. A veto the caller cannot see reads as
@@ -8899,26 +9165,7 @@ def termination_check() -> dict:
         "next_target": next_target,
         "blocking_ops": blocking,
         "cleared_ops": cleared,
-        "directive": (
-            "DONE — every material-gap op has its full checklist ticked (grid + dtype knobs + tt-lang "
-            "+ C++). No reachable rung remains."
-            if can_stop
-            else "NOT DONE — work next_target (the largest-gap blocking op) at its rung, IN THE STAGE "
-            "next_target.stage names: the ranking already accounts for where the time is, and the "
-            "metric in your instructions describes only the recurring stage, so following the metric "
-            "instead of the target spends effort where little is left. " + _stage_time_note + "REUSE-FIRST: "
-            "BEFORE editing, call recall_knobs(next_target.op_class, next_target.grid, "
-            "next_target.bound_by) and APPLY/ADAPT any matching "
-            "catalogued knob (heed its negative knowledge); improvise from scratch ONLY if nothing "
-            "matches — a recalled knob still requires check_pcc + measure + record_kernel_attempt (it "
-            "never skips a rung). Ladder ORDER: "
-            "knob:grid -> knob:fidelity -> knob:dtype -> knob:shard -> tt-lang -> cpp. record_kernel_attempt for EACH rung (knobs too: "
-            "kind='grid'/'fidelity'/'dtype'/'shard'; kernels: 'tt-lang'/'cpp'). A later rung does NOT clear an op while an "
-            "earlier rung is untried. WRITE-BACK: after you COMMIT a win you IMPROVISED (recall_knobs "
-            "had no match), call distill_knob to persist it for reuse; if the win re-used a provisional "
-            "lever from another model, pass its id to distill_knob to graduate it. Re-run "
-            "termination_check after each rung."
-        ),
+        "directive": _directive,
     }
 
 
