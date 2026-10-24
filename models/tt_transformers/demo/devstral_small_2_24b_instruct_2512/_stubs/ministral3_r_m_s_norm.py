@@ -55,6 +55,8 @@ class TtMinistral3RMSNorm:
     # output to TF32, and the HiFi2 QKV multiplies only the high bits of its in0 anyway (a bf16-truncated row gives
     # bit-identical products), so the QKV output is unchanged and the norm skips the pass.
     DECODE_SHARDED_NO_WEIGHT = True
+    # The sharded prefill final norm's gamma product lands in L1 for its all_gather (shard try, run 8).
+    FINAL_GAMMA_OUT_L1 = True
 
     def __init__(self, canonical_instance, gamma=None, gamma_rows=None, unit_weight=False) -> None:
         self._impl = canonical_instance
@@ -200,6 +202,12 @@ class TtMinistral3RMSNorm:
             ],
         )
         y = ttnn.multiply(x, r, dtype=ttnn.bfloat16)
+        if self.FINAL_GAMMA_OUT_L1:
+            g = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(y)
+            out = ttnn.all_gather(g, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+            ttnn.deallocate(g)
+            return out
         y = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16)
         return ttnn.all_gather(y, dim=3, **ccl)
 
