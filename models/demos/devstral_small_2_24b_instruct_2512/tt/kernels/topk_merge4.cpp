@@ -16,6 +16,13 @@
 // 28 compare steps instead of 63, with no packs between a pair's steps. The ids ride the swaps (index tracking)
 // as uint32 tiles exactly as in ttnn.topk; equal values order arbitrarily, as ttnn.topk's unstable network does.
 //
+// PACKED_IN (pipeline.py MergeTopK over VocabTopK.PACKED_OUT): the gathered input is ONE tensor of VocabTopK's raw
+// packed [bf16 value | u16 position'] key tiles, already in column layout (cb in_val, UInt32 pages, raw into DEST).
+// Each pair is split in DEST by topk_defuse_tile's own sweep with an INT32 index store -- the value words
+// [bf16 | 0] at DST 0 / 1 (the bits a bf16 tile widens to) and the positions [0 | u16] at DST 2 / 3 -- and the
+// device's vocab offset (device << ct arg 10, the log2 shard width) is OR-ed into the positions: the same words the
+// split tensors' transposes + typecast + offset add put there, so the merge below and its result are unchanged.
+//
 // SCALE (ct arg 9, the fp32 bits of the sampler's 1 / temperature; 0 = off): the values leave as fp32 scores
 // value * scale -- the sampler's typecast + multiply, folded. The transpose widens bf16 exactly into 32-bit DEST
 // and the SFPU multiply is the one ttnn.multiply's fp32 scalar path runs (val * param), so the bits are the same.
@@ -23,6 +30,7 @@
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
+#include "api/compute/eltwise_unary/bitwise.h"
 #include "api/compute/topk.h"
 #include "api/compute/transpose.h"
 #include "api/compute/tile_move_copy.h"
@@ -43,6 +51,9 @@ void kernel_main() {
     constexpr std::uint32_t scale = get_compile_time_arg_val(9);  // fp32 bits of the score scale, 0 = none
     constexpr int K = 32;
     constexpr int logk = 5;
+#ifdef PACKED_IN
+    constexpr std::uint32_t shard_log2 = get_compile_time_arg_val(10);  // log2 of each device's vocab shard width
+#endif
 
     compute_kernel_hw_startup(in_val, in_idx, out_val);
     ckernel::topk_tile_init();
@@ -58,6 +69,21 @@ void kernel_main() {
 
     // Level 1: each pair of sorted runs -> its top K, sorted in alternating directions across the pairs.
     for (std::uint32_t p = 0; p < pairs; ++p) {
+#ifdef PACKED_IN
+        in_val_dfb.wait_front(2);
+        tile_regs_acquire();
+        reconfig_data_format_srca(in_val);
+        copy_init(in_val);
+        copy_tile(in_val, 0, 0);
+        copy_tile(in_val, 1, 1);
+        // split: values in place at DST 0 / 1, positions [0 | u16] at DST 2 / 3 (INT32 store, not the pack-half move)
+        MATH(SFPU_UNARY_CALL(
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_topk_defuse, (true, /*largest=*/true), 0, VectorMode::RC_custom, 2));
+        bitwise_or_tile_init();
+        bitwise_or_tile<DataFormat::Int32>(2, (2 * p) << shard_log2);      // + the vocab offset of the pair's first device
+        bitwise_or_tile<DataFormat::Int32>(3, (2 * p + 1) << shard_log2);  // ... and of its second
+        ckernel::topk_tile_init();                         // index tracking back on (the unary init reset it)
+#else
         in_val_dfb.wait_front(2);
         in_idx_dfb.wait_front(2);
         tile_regs_acquire();
@@ -69,6 +95,7 @@ void kernel_main() {
         transpose_init(in_idx);
         transpose_tile(in_idx, 0, 2);
         transpose_tile(in_idx, 1, 3);
+#endif
         // The 32-bit transpose records its MOP into replay slots 16..31, over the rebuild's cached windows: make
         // the rebuild record them again (as the LLK's own fuse / defuse sweeps do after clobbering them).
         MATH((ckernel::sfpu::topk_replay_init = 0));
@@ -77,7 +104,9 @@ void kernel_main() {
         ckernel::topk_rebuild(0, (p & 1) != 0, 0, K, logk, 1);
         tile_regs_commit();
         in_val_dfb.pop_front(2);
+#ifndef PACKED_IN
         in_idx_dfb.pop_front(2);
+#endif
 
         mid_val_dfb.reserve_back(1);
         mid_idx_dfb.reserve_back(1);

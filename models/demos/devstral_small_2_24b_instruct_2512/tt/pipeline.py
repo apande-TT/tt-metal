@@ -334,6 +334,11 @@ PLANNED_TP = 4
 #   decode vocab top-k as a 4-ary tree (VocabTopK.TREE3): 64 locals -> 16 -> 4 -> final, 3 + 3 + 3 serial tile merges
 #                     instead of 7 + 7 (85 cores): 54.3 -> 51.2 us a call, trace decode 12.990 -> 12.988 ms; the exact
 #                     top-32 of [value | position] keys, bit-identical.
+#   decode sampler's cross-device top-k as ONE gather (VocabTopK.PACKED_OUT + MergeTopK.packed): the final core emits
+#                     its merged packed key tile raw (kernels/topk_final_packed.cpp), a single fp32 all_gather moves
+#                     it, and MergeTopK splits the keys in DEST (stock topk_defuse sweep, INT32 index store) + ORs in
+#                     each device's vocab offset before its merge -- no position gather, typecast or offset add;
+#                     trace decode 12.986 -> 12.977 ms, bit-identical.
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
@@ -371,6 +376,7 @@ _TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
 _TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
 _TOPK_MERGE4_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4.cpp")
 _TOPK_MERGE4_DM_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4_dm.cpp")
+_TOPK_FINAL_PACKED_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_final_packed.cpp")
 _NOISE_LOOKUP_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "noise_lookup.cpp")
 
 
@@ -557,6 +563,10 @@ class VocabTopK:
     # 8 x 8 tree's do, so each merge still sees bitonic pairs.
     TREE3 = True
     FANIN = 4
+    # PACKED_OUT (TREE3, fused keys; packed()): the final core emits its merged packed key tile RAW (column layout,
+    # float32 pages; kernels/topk_final_packed.cpp) instead of splitting it into value + position tiles, so ONE
+    # tensor crosses the TP gather and MergeTopK.packed splits the keys itself.
+    PACKED_OUT = True
 
     def __init__(self, device, k):
         assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
@@ -580,7 +590,7 @@ class VocabTopK:
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
         )
 
-    def _tree3(self, x, vals, ids, ht, wt, wt_local):
+    def _tree3(self, x, vals, ids, ht, wt, wt_local, packed_out=False):
         """TREE3 (fused keys): locals (gx, ly) -> first-level middle (gx, 8 + h) for ly in 4h..4h+3 -> second-level
         middle (8, j) for the first-level row 8 + j // 2, columns 4 (j % 2)..+3 -> final (9, 0) <- (8, 0..3). The same
         stock local / final kernels and kernels/topk_mid.cpp, wired by the same gather protocol (semaphores 0/1, 2/3,
@@ -606,7 +616,7 @@ class VocabTopK:
             self._cb(G_VAL, f * kt, P, all_set, PB),
             self._cb(G_IDX, f * kt, self.VAL, all_set),
             self._cb(OUT_VAL, 2, P, sending, PB),
-            self._cb(OUT_VAL, 2, self.VAL, final_set),
+            self._cb(OUT_VAL, 2, P, final_set, PB) if packed_out else self._cb(OUT_VAL, 2, self.VAL, final_set),
             self._cb(OUT_IDX, 2, self.IDX, all_set),
             self._cb(IN, 4, self.VAL, local_set),
             self._cb(IN_IDX, 4, self.IDX, local_set),
@@ -681,23 +691,46 @@ class VocabTopK:
                 ttnn.ReaderConfigDescriptor(),
                 defines=fdefs,
             ),
-            kern(
-                f"{_TOPK_KERNELS}/compute/topk_final.cpp",
-                final_set,
-                sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
-                [],
-                compute_cfg,
-            ),
-            kern(
-                f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
-                final_set,
-                [OUT_VAL, OUT_IDX, ht, kt]
-                + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
-                + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
-                [(final, [vals.buffer_address(), ids.buffer_address()])],
-                ttnn.WriterConfigDescriptor(),
-            ),
         ]
+        if packed_out:  # the merged packed keys out raw, one tensor (vals)
+            acc = list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+            kernels += [
+                kern(
+                    _TOPK_FINAL_PACKED_KERNEL,
+                    final_set,
+                    sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
+                    [],
+                    compute_cfg,
+                    compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+                ),
+                kern(
+                    _TOPK_MERGE4_DM_KERNEL,
+                    final_set,
+                    [OUT_VAL, OUT_IDX, ht * kt] + acc + acc,
+                    [(final, [vals.buffer_address(), vals.buffer_address()])],
+                    ttnn.WriterConfigDescriptor(),
+                    defines=[("MERGE_TOPK_WRITER", "1"), ("WRITE_ONE", "1")],
+                ),
+            ]
+        else:
+            kernels += [
+                kern(
+                    f"{_TOPK_KERNELS}/compute/topk_final.cpp",
+                    final_set,
+                    sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
+                    [],
+                    compute_cfg,
+                ),
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
+                    final_set,
+                    [OUT_VAL, OUT_IDX, ht, kt]
+                    + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+                    + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
+                    [(final, [vals.buffer_address(), ids.buffer_address()])],
+                    ttnn.WriterConfigDescriptor(),
+                ),
+            ]
         for gx in range(g):
             for h in range(2):
                 m1 = (gx, n + h)
@@ -748,7 +781,38 @@ class VocabTopK:
                     defines=fdefs,
                 )
             )
-        ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+        io = [x, vals] if packed_out else [x, vals, ids]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+
+    def supports_packed(self, x):
+        grid = self.device.compute_with_storage_grid_size()
+        width = int(x.shape[-1])
+        wt = width // 32
+        return (
+            self.PACKED_OUT
+            and self.TREE3
+            and self.FUSED
+            and self.GROUPS == self.LOCALS == 8
+            and grid.x >= 10
+            and grid.y >= 10
+            and int(x.shape[-2]) % 32 == 0
+            and width <= 65536
+            and wt % 64 == 0
+            and (wt // 64) >= 2
+            and (wt // 64) & (wt // 64 - 1) == 0
+        )
+
+    def packed(self, x):
+        """(1, 1, B, k) float32 tensor of the merged packed [bf16 value | u16 position'] keys, column layout (see
+        PACKED_OUT): the top k of each row, as the TREE3 program's final core holds them before its split."""
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        ht, wt = rows // 32, width // 32
+        wt_local = wt // (self.GROUPS * self.LOCALS)
+        keys = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, rows, self.k)), self.PACKED, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        self._tree3(x, keys, None, ht, wt, wt_local, packed_out=True)
+        return keys
 
     def __call__(self, x):
         g, n, k, kt = self.GROUPS, self.LOCALS, self.k, self.kt
@@ -938,6 +1002,82 @@ class MergeTopK:
         self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
         self.scale_bits = 0 if scale is None else struct.unpack("<I", struct.pack("<f", scale))[0]
         self.out_dtype = self.VAL if scale is None else ttnn.float32
+
+    def supports_packed(self, keys):
+        rows, width = int(keys.shape[-2]), int(keys.shape[-1])
+        sw = getattr(self, "shard_width", 0)
+        return (
+            self.k == 32
+            and rows == 32
+            and width == 128
+            and keys.dtype == ttnn.float32
+            and keys.layout == ttnn.TILE_LAYOUT
+            and sw > 0
+            and sw & (sw - 1) == 0
+            and sw <= 65536
+            and 3 * sw < 2**31
+        )
+
+    def packed(self, keys):
+        """The same top-K from the gathered VocabTopK.packed keys (1, 1, 32, TP * 32) float32 (column layout): the
+        kernel splits each key (value word + position, the device's vocab offset OR-ed in) right before the merge."""
+        wt = int(keys.shape[-1]) // 32
+        out_shape = ttnn.Shape((1, 1, int(keys.shape[-2]), self.k))
+        out_vals = ttnn.allocate_tensor_on_device(
+            out_shape, self.out_dtype, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        out_ids = ttnn.allocate_tensor_on_device(
+            out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        V, I = 2048, 4096
+        cbs = [
+            self._cb(self.IN, wt, self.IDX, I),  # raw 32-bit keys
+            self._cb(self.IN_IDX, 1, self.IDX, I),  # unused here
+            self._cb(self.MID_VAL, 2, self.VAL, V),
+            self._cb(self.MID_IDX, 2, self.IDX, I),
+            self._cb(self.FIN_VAL, 1, self.VAL, V),
+            self._cb(self.FIN_IDX, 1, self.IDX, I),
+            self._cb(self.OUT_VAL, 1, self.out_dtype, V if self.out_dtype == self.VAL else I),
+            self._cb(self.OUT_IDX, 1, self.IDX, I),
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True
+        kern = lambda src, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.core,
+            compile_time_args=ct,
+            runtime_args=[((0, 0), rt)],
+            config=cfg,
+            **kw,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        shard_log2 = int(self.shard_width).bit_length() - 1
+        kernels = [
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.IN, self.IN_IDX, wt] + acc(keys, keys),
+                [keys.buffer_address(), keys.buffer_address()],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("PACKED_IN", "1")],
+            ),
+            kern(
+                _TOPK_MERGE4_KERNEL,
+                list(range(8)) + [wt // 2, self.scale_bits, shard_log2],
+                [],
+                compute_cfg,
+                defines=[("PACKED_IN", "1")],
+            ),
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                [out_vals.buffer_address(), out_ids.buffer_address()],
+                ttnn.WriterConfigDescriptor(),
+                defines=[("MERGE_TOPK_WRITER", "1")],
+            ),
+        ]
+        ttnn.generic_op([keys, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out_vals, out_ids
 
     def supports(self, vals, ids):
         rows, width = int(vals.shape[-2]), int(vals.shape[-1])
@@ -1288,6 +1428,7 @@ class DevstralPipeline:
             self._vocab_topk = VocabTopK(device, self.top_k)
             # the merge also emits the sampler's fp32 scores (value / temperature), see sample()
             self._merge_topk = MergeTopK(device, self.top_k, scale=1.0 / self.temperature)
+            self._merge_topk.shard_width = vocab // tp  # VocabTopK.packed positions are within a device's shard
             base = (torch.arange(tp, dtype=torch.int32) * (vocab // tp)).repeat_interleave(self.top_k)
             self._shard_base = ttnn.from_torch(
                 base.reshape(1, 1, 1, -1).expand(1, 1, self.batch, -1).contiguous(),
@@ -1521,6 +1662,12 @@ class DevstralPipeline:
             return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
         # Shard top-k (VocabTopK: 16-bit positions within the shard), gathered, then labelled with vocab ids: the
         # gathered block of device d holds positions in vocab [d * W, (d + 1) * W).
+        if self._vocab_topk.supports_packed(local) and int(local.shape[-1]) == self._merge_topk.shard_width:
+            # ONE gather: each device's packed [value | position] key tile (VocabTopK.packed); MergeTopK.packed splits
+            # the keys and adds the devices' vocab offsets itself (no id gather, typecast or offset add)
+            keys = ttnn.all_gather(self._vocab_topk.packed(local), dim=3, num_links=1, topology=ttnn.Topology.Linear)
+            if self._merge_topk.supports_packed(keys):
+                return self._merge_topk.packed(keys)
         vals, ids = self._vocab_topk(local)
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)

@@ -38,6 +38,16 @@ void kernel_main() {
 #ifndef MERGE_TOPK_WRITER
     for (uint32_t t = 0; t < tiles; t += 2) {
         dfb0.reserve_back(2);
+#ifdef PACKED_IN
+        // one tensor: the packed key tiles (acc1 / dfb1 unused)
+        for (uint32_t i = 0; i < 2; ++i) {
+            noc.async_read(acc0, dfb0, bytes0, {.page_id = t + i}, {.offset_bytes = i * bytes0});
+        }
+        noc.async_read_barrier();
+        dfb0.push_back(2);
+        (void)acc1;
+        (void)bytes1;
+#else
         dfb1.reserve_back(2);
         for (uint32_t i = 0; i < 2; ++i) {
             noc.async_read(acc0, dfb0, bytes0, {.page_id = t + i}, {.offset_bytes = i * bytes0});
@@ -46,6 +56,18 @@ void kernel_main() {
         noc.async_read_barrier();
         dfb0.push_back(2);
         dfb1.push_back(2);
+#endif
+    }
+#else
+#ifdef WRITE_ONE
+    // one output (VocabTopK.PACKED_OUT's packed key tiles): dfb1 / acc1 unused
+    (void)acc1;
+    (void)bytes1;
+    for (uint32_t t = 0; t < tiles; ++t) {
+        dfb0.wait_front(1);
+        noc.async_write(dfb0, acc0, bytes0, {.offset_bytes = 0}, {.page_id = t});
+        noc.async_write_barrier();
+        dfb0.pop_front(1);
     }
 #else
     for (uint32_t t = 0; t < tiles; ++t) {
@@ -57,5 +79,6 @@ void kernel_main() {
         dfb0.pop_front(1);
         dfb1.pop_front(1);
     }
+#endif
 #endif
 }
