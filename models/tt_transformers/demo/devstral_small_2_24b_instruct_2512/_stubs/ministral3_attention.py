@@ -91,6 +91,9 @@ class TtMinistral3Attention:
     # cores, k on the next B), so q's and k's RoPE run as ONE rotary_embedding_llama_fused_qk and K / V are appended
     # by ONE paged_fused_update_cache (each needs its two inputs on disjoint cores).
     DECODE_FUSED_QK = True
+    # That K / V append as tt/kv_append.py's program (cpp try 1, run 8): the new rows packed to bfloat8_b and written
+    # straight into the cache tiles (exponent groups + mantissa face rows), not untilized / patched / re-tilized.
+    DECODE_KV_APPEND = True
     # Decode o_proj as the MLP down's C++ streaming program (tt/down_decode.py: the concatenated heads multicast once,
     # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
     # partials left in L1 for the reduce-scatter.
@@ -935,7 +938,12 @@ class TtMinistral3Attention:
             q, k = ttnn.experimental.rotary_embedding_llama_fused_qk(
                 q, k, cos, sin, trans, compute_kernel_config=self.compute_cfg
             )
-            ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import kv_append
+
+            if self.DECODE_KV_APPEND and kv_append.supports(k_cache, k, v_cache, v, cur_pos):
+                kv_append.append(k_cache, k, v_cache, v, cur_pos)
+            else:
+                ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
             ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
             ttnn.deallocate(v)
             return self._decode_attend(q, k_cache, v_cache, cur_pos, head_cfg)
