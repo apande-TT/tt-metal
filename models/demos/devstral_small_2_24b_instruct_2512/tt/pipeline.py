@@ -350,6 +350,10 @@ PLANNED_TP = 4
 #                     add (add_stats.apply_l1) also writes its fp32 sum into a height-sharded L1 copy (each core its own
 #                     whole tile rows, one local NOC write a block), the norm multiplies from it into bf16 shards for the
 #                     hidden all_gather and frees it: multiply 178 -> 106 us a call, trace prefill 1132.4 -> 1124.6 ms.
+#   prefill SDPA causal rows at EXACT widths (kernels/sdpa_compute.cpp RowCols.need): mask, row max, exp / row sum and
+#                     P @ V stop at the diagonal of the row's P @ V subblock instead of rounding up to whole exp groups
+#                     (partial last exp group), the exp's SFPU init runs once a pass: SDPA 416 424 -> 418 us, 128
+#                     96 -> 86 us, bit-identical.
 #   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
 #                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
 #                     blocks over the 80-core grid.
