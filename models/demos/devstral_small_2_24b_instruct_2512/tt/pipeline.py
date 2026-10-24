@@ -368,6 +368,12 @@ PLANNED_TP = 4
 #                     norm 5.71 -> 6.55 us (factor multicast from the root, MCAST_FACTOR; one arrival semaphore per
 #                     gathered slot so the reduces overlap the arrivals, SLOT_SEMS), QKV 24.2 -> ~21.8 us; trace decode
 #                     12.98 -> 12.95 ms, bit-identical.
+#   decode K / V append as ONE generic_op (ministral3_attention.DECODE_KV_APPEND, tt/kv_append.py,
+#                     kernels/kv_append_*.cpp) instead of paged_fused_update_cache: the new rows packed to bfloat8_b by
+#                     the packer (a bfp8 face row depends only on its 16 values) and spliced straight into the cache
+#                     tiles -- exponent section read, the row's two 16-byte exponent groups and two 16-byte mantissa
+#                     face rows written back, one RISC a kv head -- no untilize / patch / re-tilize of the tile row:
+#                     6.3 -> ~3.9 us a layer, trace decode 12.95 -> 12.77 ms, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
