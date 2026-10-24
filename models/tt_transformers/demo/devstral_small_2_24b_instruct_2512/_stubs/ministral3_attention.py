@@ -139,6 +139,10 @@ class TtMinistral3Attention:
     # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
     # static buffers).
     PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
+    # The prefill RoPEs write q / k into L1 (interleaved) instead of DRAM while q takes at most this many bytes per
+    # core (shard try, run 8: the 32 x 128-row prompt's ~76 KB); SDPA and the cache fill read them there, and both
+    # are freed right after SDPA.
+    PREFILL_ROPE_OUT_L1_BYTES = 96 * 1024
     # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
     # own L1 bank to their slots) instead of nlp_concat_heads.
     CPP_PREFILL_CONCAT = True
@@ -596,7 +600,7 @@ class TtMinistral3Attention:
         q_cos, q_sin = (cos, sin) if shared else (per_core(q[0]), per_core(q[1]))
         return tuple(rope[:2]) + q + ((cos, sin, q_cos, q_sin),)
 
-    def _prefill_rope(self, t, cos, sin, rows=None):
+    def _prefill_rope(self, t, cos, sin, rows=None, out_mem=None):
         """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view.
         rows: (cos, sin) per-core tables from prefill_rope_tables, moved into L1 for the op when _rope_regroup
         picks them (with the pair-swap tile) and freed after it."""
@@ -619,7 +623,7 @@ class TtMinistral3Attention:
             trans,
             is_decode_mode=False,
             compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=out_mem or ttnn.DRAM_MEMORY_CONFIG,
         )
         for x in l1:
             ttnn.deallocate(x)
@@ -788,8 +792,13 @@ class TtMinistral3Attention:
             # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
             k_rows = None if rows is None else rows[:2]
             q_rows = None if rows is None else rows[2:4]
-            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows)
-            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows)
+            q_core_bytes = (
+                2 * int(q.shape[0]) * int(q.shape[1]) * int(q.shape[2]) * int(q.shape[3]) // (grid.x * grid.y)
+            )
+            rope_l1 = heads_l1 and q_core_bytes <= self.PREFILL_ROPE_OUT_L1_BYTES
+            rope_mem = ttnn.L1_MEMORY_CONFIG if rope_l1 else None
+            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows, rope_mem)
+            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows, rope_mem)
         k = rope_k(k, cos, sin)
         if q_tables is not None:
             q = rope_q(q, *q_tables)  # llama-4 scale already folded into the shared q tables
@@ -854,6 +863,11 @@ class TtMinistral3Attention:
                 compute_kernel_config=self.prefill_sdpa_cfg,
                 memory_config=sdpa_mem,
             )
+        if (
+            self.meta_rope and rope_l1
+        ):  # the L1 RoPE outputs (PREFILL_ROPE_OUT_L1_BYTES), read by SDPA and the cache fill
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
         heads = attn
         concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
         if self.concat_heads is not None and self.concat_heads.supports(attn):
