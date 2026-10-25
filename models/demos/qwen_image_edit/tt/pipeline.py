@@ -253,7 +253,11 @@ class QwenImageEditTT:
         # limb linears as one C++ program: both limbs' products accumulated in the float32 DEST from one multicast
         # stream of the weight (long-K ones, K >= N: whole output rows per core; wide ones, K < N: each grid column
         # its own slice of the output columns)
-        _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(hi, lo, w, ttnn.DRAM_MEMORY_CONFIG)
+        # every one as whole output rows per core from one weight stream: the wide ones' (K < N: attention out, FF
+        # down) per-grid-column groups measured 2x slower for the same work (512 x 1536 x 3072: 8.5 vs FF up's 4.1 ms)
+        _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(
+            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False
+        )
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
         # and the three limb products + two adds as one kernel over the full grid (P's rows read once per row block)

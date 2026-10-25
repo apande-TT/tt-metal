@@ -30,9 +30,10 @@ def _largest_divisor(n, cap):
     return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def fused_limb_linear(hi, lo, w, mem):
+def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
-    or None when the shapes do not fit the kernel (the caller then runs the stock matmuls)."""
+    or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
+    wide output (K < N) also runs as one group of whole output rows per core, like a long-K one."""
     if w.dtype != ttnn.bfloat16 or hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16:
         return None
     hs, ws = [int(d) for d in hi.padded_shape], [int(d) for d in w.padded_shape]
@@ -48,7 +49,7 @@ def fused_limb_linear(hi, lo, w, mem):
     # column groups: a wide output (K < N) splits its columns over the grid columns, each grid column taking its
     # own slice of the weight from its own sender, so a core's work (and the weight it is sent) shrinks with N;
     # a long-K one (K >= N) is one group, every core taking whole output rows
-    groups = cols if k_t < n_t and n_t % cols == 0 else 1
+    groups = cols if wide_groups and k_t < n_t and n_t % cols == 0 else 1
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
     nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
     kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (2 slots in cb 1)
