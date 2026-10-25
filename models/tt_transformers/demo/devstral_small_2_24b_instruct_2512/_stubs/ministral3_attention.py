@@ -129,6 +129,8 @@ class TtMinistral3Attention:
     # many bytes per core: the RoPEs read q / k from L1 and write DRAM, and v is copied to DRAM for the cache fill and
     # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
     PREFILL_HEADS_L1_BYTES = 512 * 1024
+    # structural (run 8): the prefill QKV written in the head layouts by its own output writer (minimal_mm heads_out)
+    PREFILL_QKV_HEADS_OUT = True
     # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
     # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
     PREFILL_QKV_L1_BYTES = 400 * 1024
@@ -764,28 +766,48 @@ class TtMinistral3Attention:
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
 
-        qkv = self._prefill_mm(
-            minimal_mm,
-            x,
-            self.wqkv,
-            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
-            compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-        )
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.local_heads,
-            num_kv_heads=self.local_kv_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
-        )
-        if qkv_l1:
-            ttnn.deallocate(qkv)
-        if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
-            heads_in = (q, k)
-            v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
-            ttnn.deallocate(v_l1)
+        qkv_cfg = self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE)
+        if (
+            self.PREFILL_QKV_HEADS_OUT
+            and qkv_cfg is not None
+            and minimal_mm.supported(x, self.wqkv, self.prefill_proj_cfg)
+        ):
+            # the QKV written straight into nlp_create_qkv_heads' q / k / v layouts (minimal_mm heads_out): q / k in L1
+            # (PREFILL_HEADS_L1_BYTES) for the RoPEs, v in DRAM -- no split program, no v copy out of L1
+            qk_mem = ttnn.L1_MEMORY_CONFIG if heads_l1 else ttnn.DRAM_MEMORY_CONFIG
+            q, k, v = minimal_mm.matmul(
+                x,
+                self.wqkv,
+                qkv_cfg,
+                self.prefill_proj_cfg,
+                dtype=ttnn.bfloat16,
+                heads_out=(self.local_heads, self.local_kv_heads, qk_mem, ttnn.DRAM_MEMORY_CONFIG),
+            )
+            if heads_l1:
+                heads_in = (q, k)
+        else:
+            qkv = self._prefill_mm(
+                minimal_mm,
+                x,
+                self.wqkv,
+                config=qkv_cfg,
+                compute_kernel_config=self.prefill_proj_cfg,
+                memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
+                dtype=ttnn.bfloat16,
+            )
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv,
+                num_heads=self.local_heads,
+                num_kv_heads=self.local_kv_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
+            )
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+            if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
+                heads_in = (q, k)
+                v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(v_l1)
         rope_k = rope_q = self._rope
         if self.meta_rope:
             # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
