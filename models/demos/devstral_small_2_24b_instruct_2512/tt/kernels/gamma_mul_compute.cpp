@@ -26,6 +26,31 @@ void kernel_main() {
     constexpr uint32_t GW = get_compile_time_arg_val(0);  // this core's columns (= tiles a DEST acquire)
     constexpr uint32_t cb_y = 0, cb_g = 1, cb_out = 2, cb_gb = 6;
 
+#ifdef FPU_MUL
+    // (fidelity try) y * gamma on the FPU: the unpacker broadcasts gamma's row 0 (srcB) under each y tile (srcA);
+    // HiFi4 multiplies the full bf16 significands into the fp32 DEST, the packer narrows to bf16
+    compute_kernel_hw_startup(cb_y, cb_g, cb_out);
+    mul_bcast_rows_init(cb_y, cb_g);
+    cb_wait_front(cb_g, GW);
+    for (uint32_t r = 0; r < nrows; ++r) {
+        cb_wait_front(cb_y, GW);
+        cb_reserve_back(cb_out, GW);
+        tile_regs_acquire();
+        for (uint32_t j = 0; j < GW; ++j) {
+            mul_tiles_bcast_rows(cb_y, cb_g, j, j, j);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        for (uint32_t j = 0; j < GW; ++j) {
+            pack_tile(j, cb_out);
+        }
+        tile_regs_release();
+        cb_push_back(cb_out, GW);
+        cb_pop_front(cb_y, GW);
+    }
+    cb_pop_front(cb_g, GW);
+    return;
+#endif
     compute_kernel_hw_startup(cb_y, cb_out);
     copy_init(cb_y);
     mul_binary_tile_init();

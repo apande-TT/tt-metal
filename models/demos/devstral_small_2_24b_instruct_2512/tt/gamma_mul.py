@@ -7,7 +7,8 @@ program, which per output tile re-reads gamma's tile, row-broadcasts it into a C
 (copy_tile both into a 16-bit DEST, mul_binary_tile: fp32 product, RNE to bf16, zero inputs give +0), one tile a DEST
 acquire. Here each core owns CHUNK columns over a band of rows, reads and broadcasts its CHUNK gamma tiles ONCE and multiplies
 a row's CHUNK tiles a DEST acquire --
-the same unpacks, broadcast and SFPU multiply (fp32 DEST off, approx off): bit-identical."""
+the same unpacks, broadcast and SFPU multiply (fp32 DEST off, approx off): bit-identical. With FPU_MUL the multiply runs
+on the FPU instead (exact HiFi4 products in an fp32 DEST, narrowed to bf16 by the packer)."""
 
 from __future__ import annotations
 
@@ -18,6 +19,9 @@ import ttnn
 _KDIR = Path(__file__).resolve().parent / "kernels"
 CB_Y, CB_G, CB_OUT, CB_GB = 0, 1, 2, 6
 CHUNK = 4  # columns a core (= output tiles a DEST acquire; 16-bit half-sync DEST: 8 slots = 4 x (y, gamma))
+# fidelity try (run 8): the multiply on the FPU (ELWMUL with gamma's row broadcast by the unpacker, HiFi4 = exact
+# bf16 x bf16 products in an fp32 DEST, packed to bf16) instead of the SFPU (fp32 product, RNE to bf16)
+FPU_MUL = True
 
 
 def supports(y, gamma) -> bool:
@@ -57,7 +61,9 @@ def scale(y, gamma, memory_config):
         fmt = ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.bfloat16, page_size=2048)
         return ttnn.CBDescriptor(total_size=pages * 2048, core_ranges=cores, format_descriptors=[fmt])
 
-    cbs = [cb(CB_Y, 2 * gw), cb(CB_G, 2), cb(CB_OUT, 2 * gw), cb(CB_GB, gw)]
+    cbs = [cb(CB_Y, 2 * gw), cb(CB_G, gw if FPU_MUL else 2), cb(CB_OUT, 2 * gw)]
+    if not FPU_MUL:
+        cbs += [cb(CB_GB, gw)]
     ya, ga, oa = y.buffer_address(), gamma.buffer_address(), out.buffer_address()
     acc_y = list(ttnn.TensorAccessorArgs(y).get_compile_time_args())
     acc_g = list(ttnn.TensorAccessorArgs(gamma).get_compile_time_args())
@@ -77,7 +83,7 @@ def scale(y, gamma, memory_config):
         th0 += nrows
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
-    cfg.fp32_dest_acc_en = False
+    cfg.fp32_dest_acc_en = FPU_MUL
     cfg.math_approx_mode = False
     cfg.dst_full_sync_en = False
     kernels = [
@@ -104,6 +110,7 @@ def scale(y, gamma, memory_config):
             compile_time_args=[gw],
             runtime_args=rc,
             config=cfg,
+            defines=[("FPU_MUL", "1")] if FPU_MUL else [],
         ),
     ]
     ttnn.generic_op([y, gamma, out], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
