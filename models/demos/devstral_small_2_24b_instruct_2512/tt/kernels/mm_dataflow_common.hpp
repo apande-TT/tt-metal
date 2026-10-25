@@ -7,6 +7,11 @@
 //   IN1_TRANSPOSED: in1 tile (k, n) is read from tile (n, k) of a stored (N x K) tensor (the compute unpacks it
 //                   transposed), so in1 = x^T without a transpose op;
 //   OUT_TRANSPOSED: output block tile (m, n) is written to tile (n, m) (the compute packs each tile transposed).
+// and one output remap for matmul(..., heads_out=) (the prefill QKV written in nlp_create_qkv_heads' layouts):
+//   OUT_HEADS: the N_chunks = 3 outputs are q (OUT_HEADS_NQ heads), k and v (OUT_HEADS_NKV heads each), each
+//              (B, H, S, HD); output tile (m, n) with m = b * OUT_HEADS_ST + st and n = h * OUT_HEADS_HDT + d (h over
+//              the q, then k, then v heads) goes to page ((b * H + h') * OUT_HEADS_ST + st) * OUT_HEADS_HDT + d of
+//              its tensor -- where nlp_create_qkv_heads would have copied it.
 
 #pragma once
 
@@ -422,6 +427,26 @@ FORCE_INLINE void write_tile_to_chunk(
      ...);
 }
 
+#ifdef OUT_HEADS
+// (OUT_HEADS) the output tensor (0 = q, 1 = k, 2 = v) and page of output tile (m, n)
+FORCE_INLINE void heads_target(uint32_t m, uint32_t n, uint32_t& chunk, uint32_t& page) {
+    const uint32_t b = m / OUT_HEADS_ST, st = m % OUT_HEADS_ST;
+    const uint32_t h = n / OUT_HEADS_HDT, d = n % OUT_HEADS_HDT;
+    uint32_t hc = h, nh = OUT_HEADS_NQ;
+    chunk = 0;
+    if (h >= OUT_HEADS_NQ + OUT_HEADS_NKV) {
+        chunk = 2;
+        hc = h - OUT_HEADS_NQ - OUT_HEADS_NKV;
+        nh = OUT_HEADS_NKV;
+    } else if (h >= OUT_HEADS_NQ) {
+        chunk = 1;
+        hc = h - OUT_HEADS_NQ;
+        nh = OUT_HEADS_NKV;
+    }
+    page = ((b * nh + hc) * OUT_HEADS_ST + st) * OUT_HEADS_HDT + d;
+}
+#endif
+
 /**
  * Write a block of output to a potentially padded tensor.
  * Skip writing when M >= logical_M or N >= logical_N
@@ -460,6 +485,16 @@ void write_block_sync_split(
         uint32_t tile_idx_in_chunk = tile_idx_in_chunk_start;
 
         for (uint32_t j = d1_start; j < d1_end; j++, tile_idx_in_chunk++) {
+#ifdef OUT_HEADS
+            if (j < OUT_HEADS_NT) {
+                uint32_t hchunk, hpage;
+                heads_target(i, j, hchunk, hpage);
+                write_tile_to_chunk(
+                    noc, accessors, hchunk, hpage, read_ptr, tile_size_bytes, std::index_sequence_for<Accessors...>{});
+            }
+            read_ptr += tile_size_bytes;
+            continue;
+#endif
             // If we've reached the end of the current chunk, move to the next one
             if (tile_idx_in_chunk >= chunk_shape.logical_d1) {
                 tile_idx_in_chunk = 0;
@@ -525,6 +560,23 @@ void write_block_sync_granular_split(
             uint32_t tile_idx_in_chunk = tile_idx_in_chunk_start;
 
             for (uint32_t n_tile_id = d1_start; n_tile_id < d1_end; n_tile_id++, tile_idx_in_chunk++) {
+#ifdef OUT_HEADS
+                if (n_tile_id >= OUT_HEADS_NT) {
+                    break;
+                }
+                uint32_t hchunk, hpage;
+                heads_target(m_tile, n_tile_id, hchunk, hpage);
+                write_tile_to_chunk(
+                    noc,
+                    accessors,
+                    hchunk,
+                    hpage,
+                    out_read_ptr,
+                    tile_size_bytes,
+                    std::index_sequence_for<Accessors...>{});
+                out_read_ptr += tile_size_bytes;
+                continue;
+#endif
                 // If we've reached the end of the current chunk, move to the next one
                 if (tile_idx_in_chunk >= chunk_shape.logical_d1) {
                     tile_idx_in_chunk = 0;

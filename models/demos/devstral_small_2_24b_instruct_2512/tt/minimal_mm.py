@@ -196,6 +196,7 @@ def matmul(
     swapped=False,
     orient=None,
     deep_k_ok=True,
+    heads_out=None,
 ):
     """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
@@ -209,9 +210,14 @@ def matmul(
     lands in srcB and the activation in srcA: a block-float8 weight's 7-bit significands fit srcB's one 7-bit
     multiplier pass, so HiFi2 (srcA's two 5-bit passes x srcB's first) multiplies the full operands -- the products
     HiFi4 forms with the weight in srcA, at half the multiplier passes.
-    orient (True / False): force the grid split (True: M along the grid's x axis)."""
+    orient (True / False): force the grid split (True: M along the grid's x axis).
+    heads_out ((nq, nkv, qk_memory_config, v_memory_config)): return (q, k, v) in nlp_create_qkv_heads' layouts
+    ((B, nq | nkv, S, HD), HD = N / (nq + 2 nkv)) instead of the (B, 1, S, N) product -- the output writer drops each
+    tile where that split would have copied it (kernels/mm_dataflow_common.hpp OUT_HEADS), so neither the split
+    program nor a full-width product is needed; same tiles, same matmul."""
     assert residual is None or not fuse_swiglu
     assert not swapped or (residual is None and not fuse_swiglu and in0_heads is None)
+    assert heads_out is None or (residual is None and not fuse_swiglu and not swapped)
     device = x.device()
     grid = config.compute_with_storage_grid_size
     gx, gy = int(grid.x), int(grid.y)
@@ -295,7 +301,19 @@ def matmul(
     out_written = out_block // 2 if fuse_swiglu else out_block
 
     out_shape = xs[:-1] + [M if swapped else N // 2 if fuse_swiglu else N]
-    out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)
+    if heads_out is not None:
+        nq, nkv, qk_mem, v_mem = heads_out
+        S = int(xs[-2])
+        B = M // S
+        HD = N // (nq + 2 * nkv)
+        assert S % T == 0 and HD % T == 0 and HD * (nq + 2 * nkv) == N
+        outs = [
+            ttnn.allocate_tensor_on_device(ttnn.Shape([B, h, S, HD]), dtype, ttnn.TILE_LAYOUT, device, mem)
+            for h, mem in ((nq, qk_mem), (nkv, qk_mem), (nkv, v_mem))
+        ]
+    else:
+        outs = [ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)]
+    out = outs[0]
 
     core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))])
     rng = lambda a, b, c, d: ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))])
@@ -347,22 +365,25 @@ def matmul(
         cbs += [cb(6, N_block, _TILE_BYTES[residual.dtype], residual.dtype)]
 
     acc = lambda t: list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    out_ct = [a for t in outs for a in acc(t)]
     res_ct = [] if residual is None else acc(residual) + acc(residual)
     head = [M_tiles, padded_M, K_tiles, padded_K, N_tiles, padded_N, M_block, K_block, N_block]
     head += [M_blocks_per_core, N_blocks_per_core]
     in0_ct = lambda injector: (
         head
-        + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector, 1, N_tiles]
+        + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector]
+        + [len(outs), N_tiles]
         + [in1_tile]
         + acc(in0)
-        + acc(out)
+        + out_ct
         + res_ct
     )
     in1_ct = lambda injector: (
         head
-        + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector, 1, N_tiles]
+        + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector]
+        + [len(outs), N_tiles]
         + acc(in1)
-        + acc(out)
+        + out_ct
         + res_ct
     )
 
@@ -377,7 +398,8 @@ def matmul(
             phys[c] = (int(p.x), int(p.y))
         return phys[c]
 
-    x_addr, w_addr, o_addr = in0.buffer_address(), in1.buffer_address(), out.buffer_address()
+    x_addr, w_addr = in0.buffer_address(), in1.buffer_address()
+    o_addrs = [t.buffer_address() for t in outs]
     # FUSE_TERNARY runtime args (before the output address): a, b (broadcast row), broadcast flag
     tern = [] if residual is None else [residual.buffer_address(), residual.buffer_address(), 1]
     rt_in0_s, rt_in0_r, rt_in1_s, rt_in1_r, rt_c = [], [], [], [], []
@@ -408,10 +430,10 @@ def matmul(
                 defer,
                 max_defer,
                 *tern,
-                o_addr,
+                *o_addrs,
             ]
             a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
-            a1 += [o_addr]
+            a1 += o_addrs
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
             rt_c.append(
@@ -446,6 +468,16 @@ def matmul(
         defines = defines + [("DEFER_INJECTOR", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
+    if heads_out is not None:
+        defines = defines + [
+            ("OUT_HEADS", "1"),
+            ("OUT_HEADS_NQ", str(nq)),
+            ("OUT_HEADS_NKV", str(nkv)),
+            ("OUT_HEADS_ST", str(S // T)),
+            ("OUT_HEADS_HDT", str(HD // T)),
+            ("OUT_HEADS_NT", str(N_tiles)),
+        ]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
     if swapped:
         cdefines += [("MM_IN1_TRANSPOSE", "1")]
         defines = defines + [("IN1_TRANSPOSED", "1"), ("OUT_TRANSPOSED", "1")]
@@ -482,6 +514,6 @@ def matmul(
         kern(in1_src, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
     ]
-    ios = [in0, in1, out] if residual is None else [x, w, residual, out]
+    ios = [in0, in1, *outs] if residual is None else [x, w, residual, out]
     ttnn.generic_op(ios, ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
-    return out
+    return tuple(outs) if heads_out is not None else out
