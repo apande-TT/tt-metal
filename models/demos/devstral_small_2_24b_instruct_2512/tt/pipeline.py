@@ -410,6 +410,10 @@ PLANNED_TP = 4
 #                     0 of a tile, the compute folds them as ttnn.sum's accurate SFPU reduce does (copy, add_binary_tile
 #                     in device order) before the rsqrt chain: 416 rows expand + sum + scale 16 + 10 + 71 -> 78 us, 128
 #                     rows 9 + 5 + 36 -> 39 us, two programs fewer a norm, bit-identical.
+#   ... with the scale's multiply + RNE run a whole 3-tile chunk per SFPU call at compile-time DEST offsets
+#                     (norm_scale.FUSED_RNE_N: the broadcast row loaded once for 3 tiles, one sfpu start / done a
+#                     chunk; the op is SFPU-bound, 33 us without the multiply): 416 rows 78 -> 71 us, 128 rows 39 ->
+#                     36 us a norm, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

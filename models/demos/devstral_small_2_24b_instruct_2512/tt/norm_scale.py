@@ -20,6 +20,8 @@ CB_X, CB_R, CB_OUT, CB_RB, CB_F, CB_ROWS = 0, 1, 2, 6, 7, 3
 CHUNK = 3  # x tiles a DEST acquire (fp32 half-sync DEST holds 4: CHUNK + the broadcast factor)
 # cpp try 2 (run 8): the multiply and the bf16 rounding in one SFPU pass (kernels/norm_scale_compute.cpp FUSED_RNE)
 FUSED_RNE = True
+# cpp try (run 8): ... the whole 3-tile chunk in one SFPU call with compile-time DEST offsets (FUSED_RNE_N)
+FUSED_RNE_N = True
 
 
 def _cores(grid):
@@ -136,6 +138,7 @@ def scale(x_l1, r, chain=None, nd=0):
             runtime_args=[(c, []) for c in cores],
             config=cfg,
             defines=([("FUSED_RNE", "1")] if FUSED_RNE else [])
+            + ([("FUSED_RNE_N", "1")] if FUSED_RNE and FUSED_RNE_N and CHUNK == 3 else [])
             + ([("NORM_CHAIN", "1")] if chain else [])
             + ([("FUSED_SUM", "1")] if nd else []),
         ),

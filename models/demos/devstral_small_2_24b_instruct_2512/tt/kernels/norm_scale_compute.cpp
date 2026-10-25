@@ -56,6 +56,34 @@ inline void ns_mul_rne(const uint32_t in0, const uint32_t in1, const uint32_t ou
         sfpi::dst_reg++;
     }
 }
+
+// ns_mul_rne for a whole chunk in ONE call (FUSED_RNE_N, cpp try 1 on the fused norm scale): the N x tiles sit in DEST
+// slots 0 .. N-1 and the broadcast factor in slot B, all compile-time offsets (no runtime-built SFPLOAD / SFPSTORE),
+// each broadcast row loaded once for the N tiles, and one sfpu start / done a chunk instead of one a tile. The same
+// multiply and RNE on every element: bit-identical.
+template <int N, int B>
+inline void ns_mul_rne_n(const uint32_t, const uint32_t, const uint32_t) {
+    constexpr uint32_t T = 32;
+    const sfpi::vUInt c_one = 1;
+    const sfpi::vUInt c_half = 0x7fff;
+    const sfpi::vUInt c_hi = 0xffff0000;
+#pragma GCC unroll 8
+    for (int d = 0; d < 8; d++) {
+        sfpi::vFloat b = sfpi::dst_reg[B * T];
+#pragma GCC unroll 4
+        for (int i = 0; i < N; i++) {
+            sfpi::vFloat a = sfpi::dst_reg[i * T];
+            sfpi::vFloat p = a * b;
+            sfpi::vUInt u = sfpi::as<sfpi::vUInt>(p);
+            sfpi::vUInt lsb = (u >> 16) & c_one;
+            u = u + c_half;
+            u = u + lsb;
+            u = u & c_hi;
+            sfpi::dst_reg[i * T] = sfpi::as<sfpi::vFloat>(u);
+        }
+        sfpi::dst_reg++;
+    }
+}
 }  // namespace ckernel::sfpu
 #endif
 
@@ -158,7 +186,16 @@ void kernel_main() {
             copy_init(cb_rb);
             copy_tile(cb_rb, 0, dst_b);
             mul_binary_tile_init();
-#ifdef FUSED_RNE
+#if defined(FUSED_RNE_N)
+            static_assert(CHUNK == 3, "FUSED_RNE_N is written for 3-tile chunks");
+            if (n == 3) {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (3, 3), 0, dst_b, 0, VectorMode::RC)));
+            } else if (n == 2) {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (2, 3), 0, dst_b, 0, VectorMode::RC)));
+            } else {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (1, 3), 0, dst_b, 0, VectorMode::RC)));
+            }
+#elif defined(FUSED_RNE)
             for (uint32_t i = 0; i < n; ++i) {
                 MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne, (8), i, dst_b, i, VectorMode::RC)));
             }
