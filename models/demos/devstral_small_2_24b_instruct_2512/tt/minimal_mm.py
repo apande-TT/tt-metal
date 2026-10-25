@@ -50,8 +50,13 @@ SKIP_PADDING = True
 # the intermediate CB holds two blocks and every writer defers its block write to that K step or later. Only where the
 # doubled intermediate fits L1 (SWIGLU_OVERLAP_L1_BYTES of circular buffers).
 SWIGLU_OVERLAP = True
-EPI_DONE_FRAC = 0.5
+# (0.5: 416-row gate/up 9205 us; 0.75: 9070; 0.9: 9210 a call)
+EPI_DONE_FRAC = 0.75
 SWIGLU_OVERLAP_L1_BYTES = 1_240_000
+# ... and with an L1 input or product (the vision MLP: its L1 residual, input and product sit beside the CBs) where the
+# circular buffers, doubled intermediate included, stay within this many bytes (the non-overlapped 6 x 14-tile vision
+# blocks' 870 KB fit; 2 x 14-tile blocks with two intermediates take 567 KB)
+SWIGLU_OVERLAP_L1_IO_BYTES = 880_000
 # SWIGLU_DEEP_K: under SWIGLU_OVERLAP the PACK thread runs a pair's SFPU pass (~1344 cycles) between two 1 x 4
 # subblocks, but an 8-deep K block makes a subblock only ~1024 cycles at HiFi2, so MATH waits for its DEST half every
 # pair (~0.7 us a pair exposed). 16-deep K blocks give the pass a whole subblock; M blocks of at most
@@ -197,8 +202,13 @@ def matmul(
     orient=None,
     deep_k_ok=True,
     heads_out=None,
+    n_seg=None,
 ):
-    """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
+    """n_seg (tiles, under each core's N range): N blocks of config.N_block_size within two segments of the core's
+    range, [0, n_seg) and the rest, walked K-forward and K-backward -- the K-block summation order every tile gets from
+    blocks [n_seg | rest] (the readers reverse K on every other N block to reuse in0), so the smaller blocks are
+    bit-identical to that split (kernels/mm_dm_in0.cpp, mm_dm_in1_out.cpp, mm_compute.cpp N_SEG_TILES).
+    residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
     does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output.
     in0_heads (True, supports_heads): x is an attention output (B, NH, S, HD) multiplied as its head concat
@@ -291,6 +301,10 @@ def matmul(
     K_blocks = padded_K // K_block
     M_blocks_per_core = -(-M_per_core // M_block)
     N_blocks_per_core = -(-N_per_core // N_block)
+    if n_seg:
+        assert not deep_k and in0_heads is None and not swapped and 0 < n_seg < N_per_core
+        assert not fuse_swiglu or n_seg % 2 == 0
+        N_blocks_per_core = -(-n_seg // N_block) + -(-(N_per_core - n_seg) // N_block)
 
     in0_tile, in1_tile = _TILE_BYTES[in0.dtype], _TILE_BYTES[in1.dtype]
     out_tile = _TILE_BYTES[dtype]
@@ -346,10 +360,13 @@ def matmul(
         and fp32_acc
         and in0_heads is None
         and K_blocks >= 2
-        and cb_bytes + 2 * out_block * interm_tile <= SWIGLU_OVERLAP_L1_BYTES
-        # an L1 input or product (the vision MLP) leaves no room for the second intermediate block
-        and x.memory_config().buffer_type == ttnn.BufferType.DRAM
-        and memory_config.buffer_type == ttnn.BufferType.DRAM
+        and cb_bytes + 2 * out_block * interm_tile
+        <= (
+            SWIGLU_OVERLAP_L1_BYTES
+            if x.memory_config().buffer_type == ttnn.BufferType.DRAM
+            and memory_config.buffer_type == ttnn.BufferType.DRAM
+            else SWIGLU_OVERLAP_L1_IO_BYTES
+        )
     )
     epi_done_k = min(max(1, int(K_blocks * EPI_DONE_FRAC)), K_blocks - 1) if overlap else 0
     cbs = [
@@ -481,6 +498,10 @@ def matmul(
     if swapped:
         cdefines += [("MM_IN1_TRANSPOSE", "1")]
         defines = defines + [("IN1_TRANSPOSED", "1"), ("OUT_TRANSPOSED", "1")]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
+    if n_seg:
+        cdefines += [("N_SEG_TILES", str(n_seg))]
+        defines = defines + [("N_SEG_TILES", str(n_seg))]
         in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
 
     dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)

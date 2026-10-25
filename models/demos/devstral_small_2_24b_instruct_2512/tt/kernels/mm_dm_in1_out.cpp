@@ -248,8 +248,20 @@ void kernel_main() {
         k_forward = true;
 
         for (uint32_t n_block_iter = 0; n_block_iter < N_blocks_per_core; n_block_iter++) {
+#ifdef N_SEG_TILES
+            // N blocks within two segments of the core's N range, K-forward then K-backward (see mm_dm_in0.cpp)
+            constexpr uint32_t n_seg_blocks0 = (N_SEG_TILES + N_block_tiles - 1) / N_block_tiles;
+            const bool n_seg1 = n_block_iter >= n_seg_blocks0;
+            uint32_t n_tile =
+                N_start_tile +
+                (n_seg1 ? N_SEG_TILES + (n_block_iter - n_seg_blocks0) * N_block_tiles : n_block_iter * N_block_tiles);
+            uint32_t n_tile_end = std::min(
+                n_tile + N_block_tiles, n_seg1 ? N_end_tile : std::min(N_start_tile + N_SEG_TILES, N_end_tile));
+            k_forward = !n_seg1;
+#else
             uint32_t n_tile = N_start_tile + n_block_iter * N_block_tiles;
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
+#endif
             uint32_t current_N_block_tiles = n_tile_end - n_tile;
             uint32_t current_N_tiles_bytes = current_N_block_tiles * in1_tile_size;
             bool is_last_block = (m_block_iter == M_blocks_per_core - 1) && (n_block_iter == (N_blocks_per_core - 1));

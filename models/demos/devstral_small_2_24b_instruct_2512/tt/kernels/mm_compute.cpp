@@ -504,8 +504,20 @@ void kernel_main() {
         uint32_t current_subblock_h = std::min(current_M_block_tiles, subblock_h);
 
         for (uint32_t n_block_iter = 0; n_block_iter < N_blocks_per_core; n_block_iter++) {
+#ifdef N_SEG_TILES
+            // N blocks within two segments of the core's N range (the readers walk K forward in the first, backward
+            // in the second; in0 is reused only between them, see mm_dm_in0.cpp)
+            constexpr uint32_t n_seg_blocks0 = (N_SEG_TILES + N_block_tiles - 1) / N_block_tiles;
+            const bool n_seg1 = n_block_iter >= n_seg_blocks0;
+            uint32_t n_tile =
+                N_start_tile +
+                (n_seg1 ? N_SEG_TILES + (n_block_iter - n_seg_blocks0) * N_block_tiles : n_block_iter * N_block_tiles);
+            uint32_t n_tile_end = std::min(
+                n_tile + N_block_tiles, n_seg1 ? N_end_tile : std::min(N_start_tile + N_SEG_TILES, N_end_tile));
+#else
             uint32_t n_tile = N_start_tile + n_block_iter * N_block_tiles;
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
+#endif
             uint32_t current_N_block_tiles = n_tile_end - n_tile;
             uint32_t current_subblock_w = std::min(current_N_block_tiles, subblock_w);
             // the tiles the block computes: SKIP_PADDING drops its rows / columns past the real extents
@@ -585,6 +597,9 @@ void kernel_main() {
                 if (k_block == K_num_blocks - 1) {
                     if (n_block_iter < N_blocks_per_core - 1) {
                         reuse_in0_block = true;  // striding N next: in0 is reused
+#ifdef N_SEG_TILES
+                        reuse_in0_block = n_block_iter + 1 == n_seg_blocks0;
+#endif
                     }
                 }
                 if (!reuse_in0_block) {

@@ -287,8 +287,22 @@ void kernel_main() {
         reuse_block = false;
         k_forward = true;
         for (uint32_t n_block_iter = 0; n_block_iter < N_blocks_per_core; n_block_iter++) {
+#ifdef N_SEG_TILES
+            // N blocks within two segments of the core's N range: [0, N_SEG_TILES) walked K-forward, the rest
+            // K-backward -- the K-block order a two-block split [N_SEG_TILES | rest] gives every tile; in0 is reused
+            // only where the direction flips
+            constexpr uint32_t n_seg_blocks0 = (N_SEG_TILES + N_block_tiles - 1) / N_block_tiles;
+            const bool n_seg1 = n_block_iter >= n_seg_blocks0;
+            uint32_t n_tile =
+                N_start_tile +
+                (n_seg1 ? N_SEG_TILES + (n_block_iter - n_seg_blocks0) * N_block_tiles : n_block_iter * N_block_tiles);
+            uint32_t n_tile_end = std::min(
+                n_tile + N_block_tiles, n_seg1 ? N_end_tile : std::min(N_start_tile + N_SEG_TILES, N_end_tile));
+            k_forward = !n_seg1;
+#else
             uint32_t n_tile = N_start_tile + n_block_iter * N_block_tiles;
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
+#endif
             bool is_last_block = (m_block_iter == M_blocks_per_core - 1) && (n_block_iter == (N_blocks_per_core - 1));
             bool not_first_block = (n_block_iter > 0 || m_block_iter > 0);
 
@@ -478,6 +492,9 @@ void kernel_main() {
             k_forward = !k_forward;
             // We get reuse on in0 when striding N block
             reuse_block = true;
+#ifdef N_SEG_TILES
+            reuse_block = n_block_iter + 1 == n_seg_blocks0;
+#endif
 
             defer_write_m_tile = out_m_tile;
             defer_write_m_tile_end = out_m_tile_end;

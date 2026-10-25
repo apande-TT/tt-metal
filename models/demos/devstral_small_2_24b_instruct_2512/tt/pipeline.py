@@ -272,6 +272,12 @@ PLANNED_TP = 4
 #                     a two-block fp32 intermediate and every writer (injectors too, kernels/mm_dm_in*.cpp) deferring
 #                     its block write to K step K_blocks / 2 or later: 416-row gate/up 9.57 -> 9.21 ms/layer,
 #                     bit-identical (DRAM in / out only: the vision MLP's L1 tensors leave no room for the second block).
+#                     ... the vision MLP too (ministral3_m_l_p.GATE_UP_L1_OVERLAP_N, minimal_mm n_seg=): its 14 + 12-tile
+#                     N blocks split into 8 + 6 | 8 + 4 (two fp32 intermediates in 567 -> 778 KB of CBs, under the old
+#                     870), the readers walking K forward over the first segment and backward over the second -- each
+#                     tile's K-block order as before (kernels N_SEG_TILES); epilogues drained by K step 3 of 4
+#                     (EPI_DONE_FRAC 0.75; 416-row text gate/up 9205 -> 9070 us): vision gate/up 260.7 -> 229 us a
+#                     layer, trace encode 22.19 -> 21.44 ms, bit-identical.
 #   minimal_mm grid split by per-core work (tt/minimal_mm.py transposed): M along x / N along y or the other way round,
 #                     whichever hands each core >= 5% fewer output tiles (stock: M > N). Flips only the vision gate/up
 #                     (168 -> 156 tiles a core), o_proj and the patch projection (24 -> 21); the stubs size their blocks to
