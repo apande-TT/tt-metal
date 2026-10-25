@@ -123,6 +123,13 @@ class TtMinistral3MLP:
     # grid try (run 8): the fused gate/up's N block may be 14 tiles when that tiles each core's N range in fewer blocks
     # than 12 (the data-parallel vision MLP's 26-tile range: 14 + 12 instead of 12 + 12 + a 2-tile block)
     GATE_UP_N14 = True
+    # An L1-input fused gate/up with an L1 product (the vision MLP) whose N range runs in two blocks (14 + 12) splits
+    # each of them into N blocks of at most this many tiles (8 + 6, 8 + 4; 2 x 2 subblocks): small enough that
+    # tt/minimal_mm.py's SWIGLU_OVERLAP fits its two fp32 intermediates beside the L1 tensors, so each block's SwiGLU
+    # epilogue runs under the next block's matmul. The readers walk K backwards on every other N block (to reuse in0),
+    # so the smaller blocks keep the two old blocks' K directions (minimal_mm n_seg=): bit-identical. 0: off.
+    # (M blocks of 2 or 3 tiles under the old N blocks instead: 245 us a layer vs 260.)
+    GATE_UP_L1_OVERLAP_N = 8
     # The TP text MLP's short-prompt (<= 128 tile rows) down as tt/minimal_mm.matmul(..., swapped=True): the weight in
     # srcB (a bf16 copy of the bf8 weight, transposed once at load: exact), so HiFi2 multiplies the full operands.
     SHORT_DOWN_SWAPPED = True
@@ -431,10 +438,9 @@ class TtMinistral3MLP:
         )
         return self._reduce(out)
 
-    def _gate_up_n_block(self, x, grid):
-        """N block of the fused gate/up: 12 tiles, or the whole per-core N range when that is smaller. minimal_matmul
-        hands each core 2 * ceil(pairs / cores) weight tiles along N (the grid's y axis when M > N), and a block wider
-        than that range is computed padded: the vision MLP's 8-tile range ran 12-tile blocks (half of them padding)."""
+    def _gate_up_n_range(self, x, grid):
+        """Each core's N tile range in the fused gate/up: minimal_matmul hands it 2 * ceil(pairs / cores) weight tiles
+        along N (the grid's y axis when it splits transposed, else x)."""
         shape = tuple(int(d) for d in x.shape)
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
@@ -443,7 +449,12 @@ class TtMinistral3MLP:
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
 
         n_cores = grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y, swiglu=True) else grid.x
-        n_core = 2 * -(-(nt // 2) // n_cores)
+        return 2 * -(-(nt // 2) // n_cores)
+
+    def _gate_up_n_block(self, x, grid):
+        """N block of the fused gate/up: 12 tiles, or the whole per-core N range when that is smaller (a block wider
+        than that range is computed padded: the vision MLP's 8-tile range ran 12-tile blocks, half of them padding)."""
+        n_core = self._gate_up_n_range(x, grid)
         if n_core <= 12:
             return n_core
         if self.GATE_UP_N14 and -(-n_core // 14) < -(-n_core // 12) and (n_core % 14) % 2 == 0:
@@ -473,13 +484,19 @@ class TtMinistral3MLP:
         m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid, swiglu=True)
         m_gu = min(range(min(8, m_rng), max(1, min(8, m_rng) // 2) - 1, -1), key=lambda b: -(-m_rng // b) * b - m_rng)
         n_gu = self._gate_up_n_block(x, grid)
+        sub_h, sub_w = (1, 4) if n_gu % 4 == 0 else (2 if m_gu % 2 == 0 else 1, 2)
+        n_seg, ov_n = None, self.GATE_UP_L1_OVERLAP_N
+        if ov_n and x_l1 and inter_l1 and PREFILL_MM_PROGRAM and ov_n < n_gu < self._gate_up_n_range(x, grid):
+            # the old blocks' boundary becomes the K-direction segment of ov_n-tile blocks (2 x 2 subblocks: 8 + 6)
+            n_seg, n_gu = n_gu, ov_n
+            sub_h, sub_w = (2 if m_gu % 2 == 0 else 1, 2)
         gu_cfg = ttnn.MinimalMatmulConfig(
             M_block_size=m_gu,
             # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
             K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
             N_block_size=n_gu,
-            subblock_h=1 if n_gu % 4 == 0 else 2 if m_gu % 2 == 0 else 1,
-            subblock_w=4 if n_gu % 4 == 0 else 2,
+            subblock_h=sub_h,
+            subblock_w=sub_w,
             compute_with_storage_grid_size=grid,
         )
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
@@ -493,7 +510,7 @@ class TtMinistral3MLP:
         )
         if PREFILL_MM_PROGRAM and minimal_mm.supported(x, self.w_gate_up, self.gate_up_cfg, fuse_swiglu=True):
             # the same program with silu * up as one SFPU pass (tt/minimal_mm.py), bit-identical
-            m = minimal_mm.matmul(x, self.w_gate_up, deep_k_ok=self.gu_deep_k, **gu_kw)
+            m = minimal_mm.matmul(x, self.w_gate_up, deep_k_ok=self.gu_deep_k, n_seg=n_seg, **gu_kw)
         else:
             m = ttnn.experimental.minimal_matmul(x, self.w_gate_up, **gu_kw)
         if x_l1:  # the caller's norm output, read only here (see TtAttention)
