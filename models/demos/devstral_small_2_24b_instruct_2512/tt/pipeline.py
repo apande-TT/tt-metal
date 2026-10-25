@@ -248,6 +248,9 @@ PLANNED_TP = 4
 #                     no mul_binary_tile +0 fix-up, a third of each product's SFPU instructions; finite operands, so
 #                     only zeros' signs can differ and SDPA's sums cannot see them): 43.0 -> 33.6 us a layer, trace
 #                     encode 21.27 -> 21.00 ms, PCC unchanged.
+#   pixtral_vision_model: the patch embeddings, ln_pre (norm + gamma multiply) and the first layer's fp32 residual cast
+#                     in L1 (PRE_L1_BYTES; each freed by its reader, the bf16 copy before the layers), not DRAM: ln_pre
+#                     28.8 + 32.4 -> 18.6 + 17.1 us. (The projector's unfold / merge outputs in L1: -3 us, not kept.)
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
