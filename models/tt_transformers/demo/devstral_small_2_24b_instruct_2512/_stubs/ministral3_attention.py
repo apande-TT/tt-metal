@@ -94,6 +94,10 @@ class TtMinistral3Attention:
     # That K / V append as tt/kv_append.py's program (cpp try 1, run 8): the new rows packed to bfloat8_b and written
     # straight into the cache tiles (exponent groups + mantissa face rows), not untilized / patched / re-tilized.
     DECODE_KV_APPEND = True
+    # cpp try (run 8): the append reads each user's position from the step's gathered cos table in L1 (tt/rope_gather.py
+    # stashes it in a row the RoPE never reads) instead of from the DRAM cur_pos
+    DECODE_KV_POS_L1 = True
+    _pos_stash = None
     # Decode o_proj as the MLP down's C++ streaming program (tt/down_decode.py: the concatenated heads multicast once,
     # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
     # partials left in L1 for the reduce-scatter.
@@ -465,6 +469,9 @@ class TtMinistral3Attention:
         batch = gather.batch
         cfg = self._batch_shard_cfg(2 * batch, self.head_dim)
         cos, sin = gather(cur_pos, cos_tab, sin_tab, cfg)
+        type(
+            self
+        )._pos_stash = cos  # (DECODE_KV_POS_L1: the gather stashed cur_pos in this table, see tt/rope_gather.py)
         trans = self.trans_mat_qk
         if batch < self.MAX_DECODE_BATCH:
             trans = ttnn.slice(trans, (0, 0, 0, 0), (1, 1, 2 * batch * ttnn.TILE_SIZE, ttnn.TILE_SIZE))
@@ -984,7 +991,8 @@ class TtMinistral3Attention:
             from models.demos.devstral_small_2_24b_instruct_2512.tt import kv_append
 
             if self.DECODE_KV_APPEND and kv_append.supports(k_cache, k, v_cache, v, cur_pos):
-                kv_append.append(k_cache, k, v_cache, v, cur_pos)
+                stash = cos if self.DECODE_KV_POS_L1 and cos is type(self)._pos_stash else None
+                kv_append.append(k_cache, k, v_cache, v, cur_pos, pos_src=stash)
             else:
                 ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
             ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
