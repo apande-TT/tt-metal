@@ -120,6 +120,9 @@ class TtMinistral3MLP:
     # A short prompt's (<= 128 tile rows) down projection runs on the full grid with blocks cut to each core's exact
     # M / N ranges (see _forward) instead of the 80-core grid of whole 16 x 16-tile blocks.
     SHORT_DOWN_FULL_GRID = True
+    # grid try (run 8): the fused gate/up's N block may be 14 tiles when that tiles each core's N range in fewer blocks
+    # than 12 (the data-parallel vision MLP's 26-tile range: 14 + 12 instead of 12 + 12 + a 2-tile block)
+    GATE_UP_N14 = True
     # The TP text MLP's short-prompt (<= 128 tile rows) down as tt/minimal_mm.matmul(..., swapped=True): the weight in
     # srcB (a bf16 copy of the bf8 weight, transposed once at load: exact), so HiFi2 multiplies the full operands.
     SHORT_DOWN_SWAPPED = True
@@ -441,7 +444,11 @@ class TtMinistral3MLP:
 
         n_cores = grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y, swiglu=True) else grid.x
         n_core = 2 * -(-(nt // 2) // n_cores)
-        return n_core if n_core < 12 else 12
+        if n_core <= 12:
+            return n_core
+        if self.GATE_UP_N14 and -(-n_core // 14) < -(-n_core // 12) and (n_core % 14) % 2 == 0:
+            return 14
+        return 12
 
     @staticmethod
     def _m_range(mt, nt, grid, swiglu=False):
