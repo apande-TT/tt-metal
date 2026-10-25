@@ -26,6 +26,16 @@ def fused_block_sum(g, n, part, mem):
     return _sum_program([g], out, n, "reader_sum_blocks.cpp", reader_ct)
 
 
+def fused_block_sum_bias(g, n, part, mem, bias_rows):
+    """fused_block_sum + bias: the sum of g's n blocks, then + bias_rows [32, N] float32 (the bias row replicated
+    over a tile's rows) -- the same SFPU float32 adds in the same order as ttnn.add(fused_block_sum(...), bias)."""
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(part), ttnn.float32, ttnn.TILE_LAYOUT, g.device(), mem)
+    reader_ct = [_tiles(out), n, int(out.padded_shape[-1]) // 32]
+    for t in (g, bias_rows):
+        reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    return _sum_program([g, bias_rows], out, n + 1, "reader_sum_blocks_bias.cpp", reader_ct)
+
+
 def fused_sum_bias(a, b, bias_rows, mem):
     """(a + b) + bias for float32 TILE a, b of one shape [..., N] and bias_rows [32, N] float32 (the bias row
     replicated over a tile's rows): the limb products' sum and the bias add of a precise linear in one pass,

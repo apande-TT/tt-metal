@@ -37,7 +37,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_sum_bias
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_bias, fused_sum_bias
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
@@ -239,6 +239,8 @@ class QwenImageEditTT:
         _tr_ccl.A2A_REDUCE = True
         _tr_ccl.A2A_SUM_L1 = True  # with its per-source slices and their sum in L1
         _tr_ccl.A2A_SUM_FN = fused_block_sum  # the local sum of the n source blocks as one C++ kernel
+        # and with the row-parallel layer's bias added in that same pass (before the all_gather, not after it)
+        _tr_ccl.A2A_SUM_BIAS_FN = fused_block_sum_bias
         # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
         _tr_precise.SPLIT_FN = fused_split_bf16
         _te_attention.SPLIT_FN = fused_split_bf16
