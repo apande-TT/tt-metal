@@ -239,6 +239,11 @@ PLANNED_TP = 4
 #                     The L1 casts of both norm outputs to bf16 run as tt/local_cast.py (LOCAL_CAST: every core casts
 #                     the pages of its own L1 bank with ttnn.typecast's compute, rounding loop unrolled; bit-identical):
 #                     10.3 -> 7.2 us a cast, 48 an encode.
+#                     ... and then each norm + cast as ONE program (attention.NORM_CAST, tt/norm_cast.py, kernels/
+#                     norm_cast_*.cpp): the stock interleaved rms_norm compute (layernorm.cpp RMSNORM + FUSE_GAMMA, its
+#                     compute_kernel_lib calls on classic CBs of the same formats, the reader's truncated-bf16 eps /
+#                     row-0 scaler / unit gamma tiles) with typecast's rounding before a bf16 pack: 24 + 7.2 -> 29.5 us,
+#                     two programs fewer a layer, trace encode 21.44 -> 21.27 ms, bit-identical.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
