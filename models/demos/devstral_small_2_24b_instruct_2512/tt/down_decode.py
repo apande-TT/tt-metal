@@ -55,6 +55,9 @@ class StreamDownDecode:
     # (2 tiles a RISC: 8 cores for K = 32 tiles; 1 a RISC on 16 cores ran +75 us a token)
     HEADS_GATHER = True
     HEADS_TILES = 2
+    # cpp try (run 8): no producer cores -- RISCV_0 of the first 2 K stream cores each gathers half an x tile while its
+    # first weight push is in flight (gate_up_stream.cpp GU_HEADS), so the program keeps the stream's 81 cores
+    HEADS_ON_STREAM = True
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -167,7 +170,11 @@ class StreamDownDecode:
             and hd % ttnn.TILE_SIZE == 0
             and h * hd == self.kt * ttnn.TILE_SIZE
             and self.kt % (2 * self.HEADS_TILES) == 0
-            and len(self.free_xy) >= self.kt // (2 * self.HEADS_TILES)
+            and (
+                len(self.core_xy) >= 2 * self.kt
+                if self.HEADS_ON_STREAM
+                else len(self.free_xy) >= self.kt // (2 * self.HEADS_TILES)
+            )
             and x.dtype == ttnn.bfloat16
             and x.layout == ttnn.TILE_LAYOUT
             and mem.buffer_type == ttnn.BufferType.L1
@@ -245,7 +252,8 @@ class StreamDownDecode:
         SEM_READY, SEM_VALID, SEM_GATHER, CB_SCRATCH = 0, 1, 2, 3
         everyone, gather_xy = self.all, []
         tpr = self.HEADS_TILES
-        if heads:  # the producers: the first free cores, HEADS_TILES x tiles a RISC, as row runs
+        on_stream = heads and self.HEADS_ON_STREAM
+        if heads and not on_stream:  # the producers: the first free cores, HEADS_TILES x tiles a RISC, as row runs
             gather_xy = self.free_xy[: kt // (2 * tpr)]
             runs = []
             for x, y in gather_xy:
@@ -275,7 +283,15 @@ class StreamDownDecode:
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
         # one weight column a push (nc = 1); the OWNER (RISCV_1) writes the core's output tiles
-        if heads:
+        if on_stream:  # one face pair a gathering stream RISC
+            cbs.append(
+                ttnn.CBDescriptor(
+                    total_size=x_tile // 2,
+                    core_ranges=self.cores,
+                    format_descriptors=fmt(CB_SCRATCH, x_tile // 2, ttnn.bfloat16),
+                )
+            )
+        elif heads:
             cbs.append(
                 ttnn.CBDescriptor(
                     total_size=2 * tpr * x_tile,
@@ -283,6 +299,7 @@ class StreamDownDecode:
                     format_descriptors=fmt(CB_SCRATCH, x_tile, ttnn.bfloat16),
                 )
             )
+        if heads:
             kernels = dual_noc_sender_kernels(
                 self.device,
                 self.sender,
@@ -294,10 +311,10 @@ class StreamDownDecode:
                 None,
                 self.rects,
                 [],
-                gather=(kt // tpr, SEM_GATHER),
+                gather=(2 * kt if on_stream else kt // tpr, SEM_GATHER),
             )
             _, b, h, hd = shape
-            kernels += [
+            kernels += [] if on_stream else [
                 self._kernel(
                     "heads_gather.cpp",
                     gather_set,
@@ -325,9 +342,19 @@ class StreamDownDecode:
                 for c in idx
             ]
             one = [] if w == 2 else [("GU_PSTEP", "2")]
+            hct, hdef, hrt = [], [], lambda j: [[] for _ in idx]
+            if on_stream:  # GU_HEADS: RISCV_0 of core c < 2 K gathers half c % 2 of x tile c // 2
+                hct = [shape[-1] // ttnn.TILE_SIZE, shape[1], CB_SCRATCH, SEM_GATHER] + acc(m)
+                hdef = [("GU_HEADS", "1")]
+                hrt = lambda j: [[m.buffer_address(), c if j == 0 and c < 2 * kt else 0xFFFFFFFF] for c in idx]
+            rtj = lambda j: [(xy, args + extra) for (xy, args), extra in zip(rt(j), hrt(j))]
             kernels += [
-                self._kernel("gate_up_stream.cpp", cores, ct(1, 0) + acc(self.w, out), rt(0), dm0, one + nsend),
-                self._kernel("gate_up_stream.cpp", cores, ct(2, 1) + acc(self.w, out), rt(1), dm1, one + nsend),
+                self._kernel(
+                    "gate_up_stream.cpp", cores, ct(1, 0) + acc(self.w, out) + hct, rtj(0), dm0, one + nsend + hdef
+                ),
+                self._kernel(
+                    "gate_up_stream.cpp", cores, ct(2, 1) + acc(self.w, out) + hct, rtj(1), dm1, one + nsend + hdef
+                ),
                 self._kernel(
                     "down_compute.cpp", cores, [kt, rb], [], self.cfg, [] if w == 2 else [("DOWN_ONE_COL", "1")]
                 ),
