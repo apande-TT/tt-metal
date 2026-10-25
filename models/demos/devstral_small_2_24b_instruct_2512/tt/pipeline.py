@@ -425,6 +425,7 @@ PLANNED_TP = 4
 #   prefill final norm's gamma multiply on the FPU at HiFi4 (gamma_mul.FPU_MUL: exact products in fp32 DEST, packed to
 #                     bf16) instead of the SFPU: 91 -> 51 us at 416 rows, PCC unchanged.
 #   prompt K / V cast to the cache dtype on the fill's 64-core slab grid in L1 (ministral3_attention.PREFILL_KV_CAST_ON_SLABS).
+#   prefill logits kept as the lm_head vocab shards (PREFILL_LOGITS_SHARDED, VocabShards like decode's): no logits all_gather.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
@@ -1516,6 +1517,9 @@ class DevstralPipeline:
     # The vision tower and projector run data-parallel over the mesh (full weights on every device, each device its own
     # images, one all_gather of the projector output) instead of tensor-parallel (two fp32 all_reduces per layer).
     VISION_DATA_PARALLEL = True
+    # structural (run 8): prefill's logits kept as the lm_head vocab shards like decode's (VocabShards; the sampler
+    # reads lm_head.local) -- no full-row all_gather of the prompt's last-row logits
+    PREFILL_LOGITS_SHARDED = True
 
     def __init__(
         self,
@@ -1764,9 +1768,11 @@ class DevstralPipeline:
         # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
         # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
         r = dev["real_len"] - 1
+        # (PREFILL_LOGITS_SHARDED) each device's vocab shard only, when the sampler takes the shard top-k path
+        gather = not (self.PREFILL_LOGITS_SHARDED and self._tp() > 1 and self._shard_base is not None)
         if self._last_row is not None and LastRow.supports(hidden):
             # every user's row R straight out of its tiles into the tiled LM-head input (tt/last_row.py)
-            return hidden, self.lm_head(self._last_row(hidden, r))
+            return hidden, self._prefill_logits(self._last_row(hidden, r), gather)
         r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
         block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
         if "last_rows" in dev:
@@ -1777,8 +1783,17 @@ class DevstralPipeline:
             last = ttnn.embedding(dev["last_rows"], rows, layout=ttnn.TILE_LAYOUT)  # (1, B, D)
         else:
             last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
-        logits = self.lm_head(ttnn.reshape(last, (1, 1, b, d)))
-        return hidden, logits
+        return hidden, self._prefill_logits(ttnn.reshape(last, (1, 1, b, d)), gather)
+
+    def _prefill_logits(self, x, gather):
+        """The lm_head of the prompt's last rows: gathered, or the vocab shards wrapped as VocabShards (sample() and
+        host_read take either)."""
+        logits = self.lm_head(x, gather=gather)
+        if gather:
+            return logits
+        if tuple(logits.shape) != self._shard_shape:  # (the sampler's shard path would not apply)
+            return ttnn.all_gather(logits, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        return VocabShards(logits)
 
     def sample(self, logits, state):
         """On-device seeded sampling (Gumbel-max over the top-K of logits / T), EOS bookkeeping, write-back.
@@ -1786,7 +1801,7 @@ class DevstralPipeline:
         Writes the next input ids into state["tok"] and the finished mask into state["unfinished"] IN PLACE and
         returns the (1, 1, B, 1) uint32 ids the model itself drew (before pad substitution)."""
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
-        vals, idx = self._topk(logits)
+        vals, idx = self._topk(logits.tensor if isinstance(logits, VocabShards) else logits)
         if vals.dtype == ttnn.float32:  # MergeTopK already emitted the scores (value / temperature)
             scores = vals
         else:
@@ -1972,7 +1987,7 @@ class DevstralPipeline:
         dev = self._stage["prefill"]
         hidden, logits = self.forward_prefill(dev, self.embed_prompt(dev))
         self.sample(logits, dev["state"])
-        return logits
+        return logits.tensor if isinstance(logits, VocabShards) else logits
 
     def prefill_trace_items(self):
         """Prompt rows the text layers process in one call: B x the padded prompt length."""
