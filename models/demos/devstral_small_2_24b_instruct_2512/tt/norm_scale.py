@@ -17,7 +17,10 @@ import ttnn
 
 _KDIR = Path(__file__).resolve().parent / "kernels"
 CB_X, CB_R, CB_OUT, CB_RB, CB_F, CB_ROWS = 0, 1, 2, 6, 7, 3
-CHUNK = 3  # x tiles a DEST acquire (fp32 half-sync DEST holds 4: CHUNK + the broadcast factor)
+# cpp try 3 (run 8): full-sync fp32 DEST (8 slots) with 7 x tiles a DEST acquire + the broadcast factor, so the factor
+# tile is unpacked once per 7 tiles instead of per 3 (FULL_SYNC_CHUNK7)
+FULL_SYNC_CHUNK7 = True
+CHUNK = 7 if FULL_SYNC_CHUNK7 else 3  # x tiles a DEST acquire (half-sync fp32 DEST holds 4: CHUNK + the factor)
 # cpp try 2 (run 8): the multiply and the bf16 rounding in one SFPU pass (kernels/norm_scale_compute.cpp FUSED_RNE)
 FUSED_RNE = True
 # cpp try (run 8): ... the whole 3-tile chunk in one SFPU call with compile-time DEST offsets (FUSED_RNE_N)
@@ -113,6 +116,7 @@ def scale(x_l1, r, chain=None, nd=0):
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
+    cfg.dst_full_sync_en = FULL_SYNC_CHUNK7
     cfg.math_approx_mode = False  # (as the unary program: rsqrt is exact-mode)
     modes = [ttnn.UnpackToDestMode.Default] * 64
     for c in (CB_X, CB_R, CB_RB, CB_F):
@@ -138,7 +142,8 @@ def scale(x_l1, r, chain=None, nd=0):
             runtime_args=[(c, []) for c in cores],
             config=cfg,
             defines=([("FUSED_RNE", "1")] if FUSED_RNE else [])
-            + ([("FUSED_RNE_N", "1")] if FUSED_RNE and FUSED_RNE_N and CHUNK == 3 else [])
+            + ([("FUSED_RNE_N", "1")] if FUSED_RNE and FUSED_RNE_N else [])
+            + ([("FULL_SYNC_CHUNK7", "1")] if FULL_SYNC_CHUNK7 else [])
             + ([("NORM_CHAIN", "1")] if chain else [])
             + ([("FUSED_SUM", "1")] if nd else []),
         ),

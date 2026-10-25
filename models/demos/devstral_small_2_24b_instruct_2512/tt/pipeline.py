@@ -414,6 +414,8 @@ PLANNED_TP = 4
 #                     (norm_scale.FUSED_RNE_N: the broadcast row loaded once for 3 tiles, one sfpu start / done a
 #                     chunk; the op is SFPU-bound, 33 us without the multiply): 416 rows 78 -> 71 us, 128 rows 39 ->
 #                     36 us a norm, bit-identical.
+#   ... in 7-tile chunks on a full-sync fp32 DEST (norm_scale.FULL_SYNC_CHUNK7: the factor tile unpacked once per 7
+#                     x tiles instead of per 3): 416 rows 71 -> 68.5 us, 128 rows 36 -> 34 us a norm, bit-identical.
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,

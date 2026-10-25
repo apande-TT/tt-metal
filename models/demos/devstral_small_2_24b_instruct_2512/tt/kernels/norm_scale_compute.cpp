@@ -70,7 +70,7 @@ inline void ns_mul_rne_n(const uint32_t, const uint32_t, const uint32_t) {
 #pragma GCC unroll 8
     for (int d = 0; d < 8; d++) {
         sfpi::vFloat b = sfpi::dst_reg[B * T];
-#pragma GCC unroll 4
+#pragma GCC unroll 7
         for (int i = 0; i < N; i++) {
             sfpi::vFloat a = sfpi::dst_reg[i * T];
             sfpi::vFloat p = a * b;
@@ -186,7 +186,19 @@ void kernel_main() {
             copy_init(cb_rb);
             copy_tile(cb_rb, 0, dst_b);
             mul_binary_tile_init();
-#if defined(FUSED_RNE_N)
+#if defined(FUSED_RNE_N) && defined(FULL_SYNC_CHUNK7)
+            // (cpp try 3: full-sync DEST, 7 x tiles + the factor in slot 7; 40 = 5 x 7 + 5)
+            static_assert(CHUNK == 7, "FULL_SYNC_CHUNK7 is written for 7-tile chunks");
+            if (n == 7) {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (7, 7), 0, dst_b, 0, VectorMode::RC)));
+            } else if (n == 5) {
+                MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (5, 7), 0, dst_b, 0, VectorMode::RC)));
+            } else {
+                for (uint32_t i = 0; i < n; ++i) {
+                    MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne, (8), i, dst_b, i, VectorMode::RC)));
+                }
+            }
+#elif defined(FUSED_RNE_N)
             static_assert(CHUNK == 3, "FUSED_RNE_N is written for 3-tile chunks");
             if (n == 3) {
                 MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, ns_mul_rne_n, (3, 3), 0, dst_b, 0, VectorMode::RC)));
