@@ -36,6 +36,9 @@ void kernel_main() {
     noc_async_read(s_pos.get_noc_addr(0), l_pos, POS_BYTES);
     noc_async_read_barrier();
     const uint32_t p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l_pos)[b];
+    // the position itself in row 1 of the first cos tile (bytes 32..35: a row the RoPE's row broadcast never reads),
+    // where the step's K / V append reads it from L1 (tt/kv_append.py pos_src) instead of from DRAM
+    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cos_out)[8] = p;
     noc_async_read(s_cos.get_noc_addr(p), l_cos, ROW);
     noc_async_read(s_sin.get_noc_addr(p), l_sin, ROW);
     noc_async_read_barrier();

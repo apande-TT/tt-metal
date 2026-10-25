@@ -61,9 +61,11 @@ def supports(k_cache, k, v_cache, v, cur_pos) -> bool:
         return False
 
 
-def append(k_cache, k, v_cache, v, cur_pos):
+def append(k_cache, k, v_cache, v, cur_pos, pos_src=None):
     """ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos), non-paged:
-    row cur_pos[b] of every kv head of user b takes k's / v's row h of the core holding user b."""
+    row cur_pos[b] of every kv head of user b takes k's / v's row h of the core holding user b.
+    pos_src: the step's (1, 2B, 1, head_dim) height-sharded cos table from tt/rope_gather.py, whose core B + b holds
+    cur_pos[b] in row 1 of its first tile -- read from there (L1) instead of the DRAM cur_pos."""
     b, nkv, cap, hd = (int(k_cache.padded_shape[i]) for i in range(4))
     wt, st = hd // ttnn.TILE_SIZE, cap // ttnn.TILE_SIZE
     idx_bytes = b * 4
@@ -81,6 +83,12 @@ def append(k_cache, k, v_cache, v, cur_pos):
             cbs.append(ttnn.CBDescriptor(total_size=size, core_ranges=crs, format_descriptors=[f]))
         acc = [a for x in (cache, cur_pos) for a in ttnn.TensorAccessorArgs(x).get_compile_time_args()]
         rt = [(c, [cache.buffer_address(), cur_pos.buffer_address(), i]) for i, c in enumerate(cores)]
+        if pos_src is not None:
+            pos_cores = _cores(pos_src.memory_config().shard_spec.grid)
+            dev = pos_src.device()
+            for i, (c, args) in enumerate(rt):
+                pc = dev.worker_core_from_logical_core(ttnn.CoreCoord(*pos_cores[b + i]))
+                args += [int(pc.x), int(pc.y), pos_src.buffer_address() + 32]
         for r in range(nrisc):
             kernels.append(
                 ttnn.KernelDescriptor(
@@ -89,6 +97,7 @@ def append(k_cache, k, v_cache, v, cur_pos):
                     core_ranges=crs,
                     compile_time_args=[wt, r, nrisc, nkv, st, cb_in, CB_BF8, CB_SCR, idx_bytes, r * scr_risc] + acc,
                     runtime_args=rt,
+                    defines=[("POS_L1", "1")] if pos_src is not None else [],
                     config=ttnn.DataMovementConfigDescriptor(
                         processor=ttnn.DataMovementProcessor.RISCV_0 if r == 0 else ttnn.DataMovementProcessor.RISCV_1,
                         noc=ttnn.NOC.NOC_0 if r == 0 else ttnn.NOC.NOC_1,

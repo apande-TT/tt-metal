@@ -33,7 +33,7 @@ void kernel_main() {
     constexpr auto a_cache = TensorAccessorArgs<10>();
     constexpr auto a_idx = TensorAccessorArgs<a_cache.next_compile_time_args_offset()>();
     const auto s_cache = TensorAccessor(a_cache, cache_addr);
-    const auto s_idx = TensorAccessor(a_idx, idx_addr);
+    [[maybe_unused]] const auto s_idx = TensorAccessor(a_idx, idx_addr);
 
     constexpr uint32_t BF8_TILE = 1088, EXP = 64, FACE = 256;
     if constexpr (HEAD0 == 0) {
@@ -45,9 +45,16 @@ void kernel_main() {
     const uint32_t scr = ((get_write_ptr(CB_SCR) + SCR_OFF + 63) & ~63u);
     const uint32_t l_idx = scr;
     const uint32_t l_exp = scr + ((IDX_BYTES + 63) & ~63u);
+#ifdef POS_L1
+    // (POS_L1) this user's position from row 1 of its k row's cos tile, stashed there by tt/rope_gather.py this step
+    noc_async_read(get_noc_addr(get_arg_val<uint32_t>(3), get_arg_val<uint32_t>(4), get_arg_val<uint32_t>(5)), l_idx, 16);
+    noc_async_read_barrier();
+    const uint32_t u = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l_idx)[0];
+#else
     noc_async_read(s_idx.get_noc_addr(0), l_idx, IDX_BYTES);
     noc_async_read_barrier();
     const uint32_t u = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l_idx)[b];
+#endif
     if (u == 0xFFFFFFFFu) {
         return;
     }
