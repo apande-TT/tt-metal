@@ -131,6 +131,9 @@ class TtMinistral3Attention:
     PREFILL_HEADS_L1_BYTES = 512 * 1024
     # structural (run 8): the prefill QKV written in the head layouts by its own output writer (minimal_mm heads_out)
     PREFILL_QKV_HEADS_OUT = True
+    # grid try (run 8): the prompt K / V cast to the cache dtype on the fill's slab grid (one (user, kv head) slab of S
+    # rows a core, in L1) after the reshard, instead of on the interleaved split DRAM -> DRAM before it
+    PREFILL_KV_CAST_ON_SLABS = True
     # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
     # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
     PREFILL_QKV_L1_BYTES = 400 * 1024
@@ -708,7 +711,8 @@ class TtMinistral3Attention:
         b, h, s, d = kv.shape
         slots = b * h
         grid = self.device.compute_with_storage_grid_size()
-        if kv.dtype != cache.dtype:  # e.g. a block-float8 cache
+        cast_on_slabs = self.PREFILL_KV_CAST_ON_SLABS and slots <= grid.x * grid.y
+        if kv.dtype != cache.dtype and not cast_on_slabs:  # e.g. a block-float8 cache
             kv = ttnn.typecast(kv, cache.dtype)
         if slots > grid.x * grid.y:
             s_cap = cache.shape[2]
@@ -724,6 +728,9 @@ class TtMinistral3Attention:
             use_height_and_width_as_shard_shape=True,
         )
         kv = ttnn.to_memory_config(ttnn.reshape(kv, (1, slots, s, d)), slab_cfg)
+        if kv.dtype != cache.dtype:  # (cast_on_slabs) each core casts its own slab in L1
+            kv_in, kv = kv, ttnn.typecast(kv, cache.dtype, memory_config=slab_cfg)
+            ttnn.deallocate(kv_in)
         ttnn.fill_cache(ttnn.reshape(cache, (1, slots, cache.shape[2], d)), kv, 0)
 
     def __call__(
