@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import ttnn
 from models.demos.devstral_small_2_24b_instruct_2512.mesh import DEFAULT_MESH, close_mesh, open_mesh
@@ -32,6 +33,9 @@ PERF_DECODE_LAYERS = int(_pl_decode) if (_pl_decode.isdigit() and int(_pl_decode
 _MESH_SHAPE = resolve_mesh_shape(default_rows=DEFAULT_MESH[0], default_cols=DEFAULT_MESH[1])
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 _TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", str(P.TRACE_REGION_SIZE)))
+# The pipeline's on-device top-k program names stock kernels / include dirs repo-relative, and the JIT resolves
+# compiler include paths against the CWD -- so the test runs from the tt-metal root, as the demo does.
+_REPO_ROOT = Path(os.environ.get("TT_METAL_HOME") or Path(__file__).resolve().parents[5])
 
 
 def _build_for_perf(dev):
@@ -56,11 +60,16 @@ def _isl_prompt_ids():
 
 def test_text_generation_perf():
     # Self-opened mesh, exactly as the demo: open_mesh(trace_region_size=...) on the resolved shape.
-    device = open_mesh(trace_region_size=_TRACE_REGION if _PERF_TRACE else 0, mesh_shape=_MESH_SHAPE)
+    _cwd = os.getcwd()
+    os.chdir(_REPO_ROOT)
     try:
-        _run(device)
+        device = open_mesh(trace_region_size=_TRACE_REGION if _PERF_TRACE else 0, mesh_shape=_MESH_SHAPE)
+        try:
+            _run(device)
+        finally:
+            close_mesh(device)
     finally:
-        close_mesh(device)
+        os.chdir(_cwd)
 
 
 def _run(device):
