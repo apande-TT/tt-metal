@@ -57,6 +57,9 @@ class TtMinistral3RMSNorm:
     DECODE_SHARDED_NO_WEIGHT = True
     # The sharded prefill final norm's normed rows and gamma product land in L1 for its all_gather (shard tries, run 8).
     FINAL_GAMMA_OUT_L1 = True
+    # cpp try (run 8): ... that gamma multiply as tt/gamma_mul.py's program (binary_ng's SFPU row-broadcast multiply
+    # with gamma broadcast once a core and 4 tiles a DEST acquire; bit-identical)
+    FINAL_GAMMA_CPP = True
 
     def __init__(self, canonical_instance, gamma=None, gamma_rows=None, unit_weight=False) -> None:
         self._impl = canonical_instance
@@ -205,7 +208,12 @@ class TtMinistral3RMSNorm:
             x, r, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG if self.FINAL_GAMMA_OUT_L1 else None
         )
         if self.FINAL_GAMMA_OUT_L1:
-            g = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import gamma_mul
+
+            if self.FINAL_GAMMA_CPP and gamma_mul.supports(y, gamma_shard):
+                g = gamma_mul.scale(y, gamma_shard, ttnn.L1_MEMORY_CONFIG)
+            else:
+                g = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
             ttnn.deallocate(y)
             out = ttnn.all_gather(g, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
             ttnn.deallocate(g)
