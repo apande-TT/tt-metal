@@ -253,6 +253,9 @@ PLANNED_TP = 4
 #                     28.8 + 32.4 -> 18.6 + 17.1 us. (The projector's unfold / merge outputs in L1: -3 us, not kept.)
 #   tt/norm_cast.py GAMMA_PASS False: the vision norms' unit-gamma multiply (it only truncates x * r to the SrcA bits
 #                     the multiplier reads) folded into the bf16 rounding step, no fp32 x * r round trip.
+#   tt/sdpa_prefill.py EXP_NO_OVF / SCALE_IMM: the softmax exponent's SFPU pass (SFPU-issue-bound: 59 of the vision
+#                     SDPA's 108 us) without the overflow arm softmax inputs never reach, the bf16-exact vision scale as
+#                     an immediate and two polynomial constants held in the freed LREGs: 31 -> 25 instructions a row.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms

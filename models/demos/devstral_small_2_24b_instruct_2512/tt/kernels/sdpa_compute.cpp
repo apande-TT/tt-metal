@@ -49,15 +49,31 @@ inline void sdpa_scaled_exp_init() {
 
 // calculate_binop_with_scalar<MUL> (val * parameter) followed by calculate_exponential<false, fp32, false> on the
 // product (_sfpu_exp_fp32_accurate_<false>, written out op for op), in one pass over the tile's rows.
+//
+// SDPA_SCALE_IMM (a scale a bf16 holds exactly, e.g. head_dim 64's 0.125): the scale multiply takes it as an immediate
+// (SFPMULI, the same fp32 product), which leaves two LREGs to hold the polynomial constants the loop otherwise re-loads
+// with two SFPLOADIs each every row. SDPA_EXP_NO_OVF: softmax exponents are (s - rowmax) * scale <= ~0 (the bf16 row
+// max can sit an ulp under s), so the overflow arm (e >= 255: y * inf) never runs and is dropped with its compare; the
+// underflow arm (e < 1: 0) stays. Same values on every input the softmax produces.
 template <int ITERATIONS>
 inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
+#ifndef SDPA_SCALE_IMM
     const sfpi::vFloat parameter = Converter::as_float(param);
+#endif
     const sfpi::vFloat c_log2e = 1.442695f;
     const sfpi::vFloat c_p1 = 8.37312452e-3f;
+#ifdef SDPA_SCALE_IMM
+    const sfpi::vFloat c_p2 = 4.16695364e-2f;
+    const sfpi::vFloat c_p4 = 4.99999851e-1f;
+#endif
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat val = sfpi::dst_reg[0];
+#ifdef SDPA_SCALE_IMM
+        sfpi::vFloat a = val * SDPA_SCALE_IMM;
+#else
         sfpi::vFloat a = val * parameter;
+#endif
         sfpi::vInt i, e;
         sfpi::vFloat f, r, j, y;
         sfpi::vSMag16 sm;
@@ -68,13 +84,27 @@ inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
         f = j * sfpi::vConstFloatPrgm1 + a;
         f = j * sfpi::vConstFloatPrgm2 + f;
         r = r * f + c_p1;
+#ifdef SDPA_SCALE_IMM
+        r = r * f + c_p2;
+#else
         r = r * f + 4.16695364e-2f;
+#endif
         r = r * f + sfpi::vConstFloatPrgm0;  // 1.66664720e-1f, set by the caller for this pass
+#ifdef SDPA_SCALE_IMM
+        r = r * f + c_p4;
+#else
         r = r * f + 4.99999851e-1f;
+#endif
         i = sfpi::abs(sfpi::as<sfpi::vInt>(sm));
         y = r * f + 1.0f;
         i = sfpi::as<sfpi::vInt>(sfpi::copysgn(sfpi::as<sfpi::vFloat>(i), j));
         r = y * f + 1.0f;
+#ifdef SDPA_EXP_NO_OVF
+        e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
+        y = sfpi::setexp(r, e);
+        v_if(sfpi::nearby(e < 1)) { y = 0.0f; }
+        v_endif;
+#else
         y *= std::numeric_limits<float>::infinity();
         e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
         v_if(sfpi::nearby(e < 255)) {
@@ -83,6 +113,7 @@ inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
             v_endif;
         }
         v_endif;
+#endif
         sfpi::dst_reg[0] = y;
         sfpi::dst_reg++;
     }
