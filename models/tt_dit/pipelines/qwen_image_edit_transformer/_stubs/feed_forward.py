@@ -78,7 +78,7 @@ class TtQwenFeedForward:
                 h = ttnn.gelu(pre, variant=self.variant, **kw)
                 y = _precise.linear(h, self.w2)
             if self.tp > 1:
-                y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
+                return _ccl.all_reduce(y, self.device, axis=self.tp_axis, bias=self.b2)
             return ttnn.add(y, self.b2)
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)

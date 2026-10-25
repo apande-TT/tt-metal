@@ -149,6 +149,10 @@ A2A_SUM_L1 = False  # the all_to_all's per-source slices and their float32 sum i
 # optional replacement for the all_to_all reduce's local sum of its n source blocks: a callable
 # (g, n, part, memory_config) -> sum, e.g. a fused kernel; None: n slices + n - 1 ttnn.add calls
 A2A_SUM_FN = None
+# the same local sum with the row-parallel layer's bias added after it (all_reduce(..., bias=)): a callable
+# (g, n, part, memory_config, bias) -> sum + bias, so the bias rides the all_gather instead of a full-tensor add
+# after it; None: the bias is added to the gathered sum
+A2A_SUM_BIAS_FN = None
 
 
 def _a2a_split_dim(lead, n):
@@ -161,7 +165,8 @@ def _a2a_split_dim(lead, n):
     return None
 
 
-def _a2a_sum(y, ax, n):
+def _a2a_sum(y, ax, n, bias=None):
+    """bias (needs A2A_SUM_BIAS_FN): added to the local sum, before the all_gather."""
     shape = list(y.shape)
     lead = [1] * (4 - len(shape)) + shape  # 4D for the all_to_all
     d = _a2a_split_dim(lead, n)
@@ -174,7 +179,9 @@ def _a2a_sum(y, ax, n):
     part = list(g.shape)
     part[0] //= n
     kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if A2A_SUM_L1 else {}
-    if A2A_SUM_FN is not None:
+    if bias is not None:
+        out = A2A_SUM_BIAS_FN(g, n, part, kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG), bias)
+    elif A2A_SUM_FN is not None:
         out = A2A_SUM_FN(g, n, part, kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG))
     else:
         out = None
@@ -188,6 +195,11 @@ def _a2a_sum(y, ax, n):
     return ttnn.reshape(out, shape)
 
 
+def _a2a_ok(y, n):
+    shape = list(y.shape)
+    return A2A_REDUCE and 2 <= len(shape) <= 4 and _a2a_split_dim([1] * (4 - len(shape)) + shape, n) is not None
+
+
 def _gather_sum(y, device, ax):
     """Exact float32 reduce over mesh axis `ax`: gather every partial on a new leading dim, then add."""
     n = tuple(device.shape)[ax]
@@ -195,7 +207,7 @@ def _gather_sum(y, device, ax):
     nbytes = 4 if y.dtype == ttnn.float32 else 2
     for s in shape:
         nbytes *= s
-    if A2A_REDUCE and 2 <= len(shape) <= 4 and _a2a_split_dim([1] * (4 - len(shape)) + shape, n) is not None:
+    if _a2a_ok(y, n):
         return _a2a_sum(y, ax, n)
     if L1_GATHER_BYTES and len(shape) >= 2 and shape[-2] % 32 == 0 and n * nbytes * 32 // shape[-2] <= L1_GATHER_BYTES:
         return _gather_sum_l1(y, ax, n, nbytes)
@@ -215,12 +227,27 @@ def _gather_sum(y, device, ax):
     return ttnn.concat(outs, dim=len(shape) - 2)
 
 
-def all_reduce(y, device, axis=_CURRENT):
+def all_reduce(y, device, axis=_CURRENT, bias=None):
     """Sum of the partials over the TP devices (exact float32, see module docstring). `axis` is the
-    port's captured TP axis (default: the current build axis)."""
-    for ax in mesh_axes(device, axis):
+    port's captured TP axis (default: the current build axis). bias: added to the sum (ttnn.add(sum, bias));
+    folded into the all_to_all reduce's local sum when A2A_SUM_BIAS_FN can take it."""
+    axes = mesh_axes(device, axis)
+    fold = (
+        bias is not None
+        and A2A_SUM_BIAS_FN is not None
+        and len(axes) == 1
+        and bias.dtype == ttnn.float32
+        and y.dtype == ttnn.float32
+        and int(bias.padded_shape[-1]) == int(y.padded_shape[-1])
+        and _a2a_ok(y, tuple(device.shape)[axes[0]])
+    )
+    if fold:
+        from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
+
+        return _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], bias=_precise._bias_rows(bias))
+    for ax in axes:
         y = _gather_sum(y, device, ax)
-    return y
+    return y if bias is None else ttnn.add(y, bias)
 
 
 def all_gather(y, device, dim=-1, axis=_CURRENT):

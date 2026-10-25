@@ -302,7 +302,7 @@ class TtQwenJointAttention:
         else:
             y = ttnn.linear(x, w, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
-            y = _ccl.all_reduce(y, self.device, axis=self.tp_axis)
+            return _ccl.all_reduce(y, self.device, axis=self.tp_axis, bias=b)
         return ttnn.add(y, b)
 
     # ---- forward -------------------------------------------------------------------------------
