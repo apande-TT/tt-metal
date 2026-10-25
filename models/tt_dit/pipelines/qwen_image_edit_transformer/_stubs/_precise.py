@@ -63,6 +63,9 @@ LIMB_LINEAR_FN = None
 # LIMB_LINEAR_FN that also adds a float32 bias in the same pass: (hi, lo, w, bias_rows [32, N]) -> (hi@w + lo@w) + bias,
 # or None when it cannot (the caller then adds the bias separately); None: the bias is always a separate add
 LIMB_LINEAR_BIAS_FN = None
+# the exact QK^T's q / k limbs split straight into L1 for EXACT_QK_FN (its reader re-reads k's rows per q row block);
+# False: in the input's memory (DRAM)
+EXACT_QK_LIMBS_L1 = False
 
 
 # optional replacement for the hi/lo split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a fused
@@ -70,10 +73,10 @@ LIMB_LINEAR_BIAS_FN = None
 SPLIT_FN = None
 
 
-def split_bf16(x):
+def split_bf16(x, mem=None):
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
     if SPLIT_FN is not None and x32.layout == ttnn.TILE_LAYOUT and x32.is_sharded() is False:
-        return SPLIT_FN(x32)
+        return SPLIT_FN(x32) if mem is None else SPLIT_FN(x32, mem)
     hi = ttnn.typecast(x32, ttnn.bfloat16)
     lo = ttnn.typecast(ttnn.subtract(x32, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
     return hi, lo
@@ -184,10 +187,12 @@ def exact_matmul_bt(a, b, b_rep=None):
     (term, lane) block, so each tile dot keeps <= 4 nonzeros and stays exact; the blocks are summed in
     the float32 accumulator, as the adds did."""
     cfg = precise_config()
-    ah, al = split_bf16(a)
+    fused = EXACT_QK_FN is not None and b_rep is None
+    lmem = ttnn.L1_MEMORY_CONFIG if fused and EXACT_QK_LIMBS_L1 else None
+    ah, al = split_bf16(a, lmem)
     k = a.shape[-1]
-    if EXACT_QK_FN is not None and b_rep is None:
-        y = EXACT_QK_FN((ah, al), split_bf16(b), [[_lane_of(i, p) for i in range(k)] for p in PATTERNS])
+    if fused:
+        y = EXACT_QK_FN((ah, al), split_bf16(b, lmem), [[_lane_of(i, p) for i in range(k)] for p in PATTERNS])
         if y is not None:
             return y
     if not FOLD_LANES:
