@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 
 import ttnn
 from models.demos.devstral_small_2_24b_instruct_2512.demo.inputs import IMAGE_PROMPT, load_image
 from models.demos.devstral_small_2_24b_instruct_2512.mesh import DEFAULT_MESH, close_mesh, open_mesh
 from models.demos.devstral_small_2_24b_instruct_2512.tt import pipeline as P
+from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape  # noqa: F401
 
 PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
 PERF_ISL_TOKENS = int(os.environ.get("TT_PERF_ISL_TOKENS", "128"))
@@ -30,45 +30,29 @@ PERF_PREFILL_LAYERS = int(_pl_prefill) if (_pl_prefill.isdigit() and int(_pl_pre
 _pl_decode = (os.environ.get("TT_PERF_DECODE_LAYERS") or "").strip()
 PERF_DECODE_LAYERS = int(_pl_decode) if (_pl_decode.isdigit() and int(_pl_decode) > 0) else None
 
-from models.experimental.perf_automation.agent.perf_adapter import resolve_batch, resolve_mesh_shape  # noqa: E402,F401
-
-# The demo self-opens a 1x4 mesh (mesh.DEFAULT_MESH) through mesh.open_mesh; that is the source shape.
 _MESH_SHAPE = resolve_mesh_shape(default_rows=DEFAULT_MESH[0], default_cols=DEFAULT_MESH[1])
-
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
-# The demo opens with trace_region_size=P.TRACE_REGION_SIZE (open_mesh always uses 1 CQ and enables fabric
-# only when the mesh spans more than one chip).
 _TRACE_REGION = int(os.environ.get("TT_PERF_TRACE_REGION", str(P.TRACE_REGION_SIZE)))
 
 
-def _build_args():
-    return dict(
+def _build_for_perf(dev):
+    return P.build_pipeline(
+        dev,
         layers=PERF_LAYERS,
         encode_layers=PERF_ENCODE_LAYERS,
         prefill_layers=PERF_PREFILL_LAYERS,
         decode_layers=PERF_DECODE_LAYERS,
-        batch=PERF_BATCH or None,  # 0 = ask the pipeline (its own declared batch)
+        batch=PERF_BATCH or None,
     )
 
 
-# The pipeline's on-device sampler builds generic_op top-k kernels whose compiler_include_paths are
-# repo-relative ("ttnn/cpp/..."), resolved against the CWD -- so the run must sit at the tt-metal root, as the
-# demo's `python -m models.demos...` invocation does.
-_REPO_ROOT = Path(os.environ.get("TT_METAL_HOME") or Path(__file__).resolve().parents[5])
-
-
 def test_image_text_to_text_perf():
-    _cwd = os.getcwd()
-    os.chdir(_REPO_ROOT)
+    # Self-opened mesh, exactly as the demo: open_mesh(trace_region_size=...) on the resolved shape.
+    device = open_mesh(trace_region_size=_TRACE_REGION if _PERF_TRACE else 0, mesh_shape=_MESH_SHAPE)
     try:
-        # Self-opened mesh, exactly as the demo: open_mesh(trace_region_size=...) on the resolved shape.
-        device = open_mesh(trace_region_size=_TRACE_REGION if _PERF_TRACE else 0, mesh_shape=_MESH_SHAPE)
-        try:
-            _run(device)
-        finally:
-            close_mesh(device)
+        _run(device)
     finally:
-        os.chdir(_cwd)
+        close_mesh(device)
 
 
 def _run(device):
@@ -89,8 +73,7 @@ def _run(device):
 
             return inner
 
-        # Build + encode exactly as demo_image_text_to_text.main() does.
-        pipe = P.build_pipeline(device, **_build_args())
+        pipe = _build_for_perf(device)
         processor = P.load_processor()
         seeds = list(range(pipe.batch))
         req = P.encode_request(
@@ -105,12 +88,12 @@ def _run(device):
         for _mod in [_m for _m in _mods if _m is not None]:
             for _n in dir(_mod):
                 _op = getattr(_mod, _n, None)
-                if type(_op).__name__ == "FastOperation":  # every dispatched ttnn op, by type
+                if type(_op).__name__ == "FastOperation":
                     _orig.append((_mod, _n, _op))
                     setattr(_mod, _n, _draining(_op))
         _fw0 = time.monotonic()
         try:
-            # run_image_text_to_text's body, bounded: vision encode -> merged prefill -> token 0, then decode
+            # image + prompt -> encode -> merged prefill -> sample token 0, then bounded decode
             state = pipe.decode_prefill(req)
             for _ in range(_EAGER_OSL_TOKENS - 1):
                 state = pipe.decode_step(state)
@@ -130,9 +113,6 @@ def _run(device):
         from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
         from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
         from models.experimental.perf_automation.agent.trace_replay import measure_adapter
-
-        def _build_for_perf(dev):
-            return P.build_pipeline(dev, **_build_args())
 
         _prompt_ids = prompt_ids_for_isl(P.load_processor().tokenizer, PERF_ISL_TOKENS)
         print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
