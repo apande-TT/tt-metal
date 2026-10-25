@@ -244,6 +244,10 @@ PLANNED_TP = 4
 #                     compute_kernel_lib calls on classic CBs of the same formats, the reader's truncated-bf16 eps /
 #                     row-0 scaler / unit gamma tiles) with typecast's rounding before a bf16 pack: 24 + 7.2 -> 29.5 us,
 #                     two programs fewer a layer, trace encode 21.44 -> 21.27 ms, bit-identical.
+#   vision head split + RoPE products keep the multiply's own sign of an exact zero (tt/heads_rope.py ROPE_SIGNED_ZEROS:
+#                     no mul_binary_tile +0 fix-up, a third of each product's SFPU instructions; finite operands, so
+#                     only zeros' signs can differ and SDPA's sums cannot see them): 43.0 -> 33.6 us a layer, trace
+#                     encode 21.27 -> 21.00 ms, PCC unchanged.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
