@@ -60,6 +60,9 @@ LO_FIDELITY = None
 # optional fn(hi, lo, w) -> hi @ w + lo @ w (float32) as one call, e.g. a fused kernel, or None when it does not
 # fit (the two stock matmuls then run); the bias is added after it
 LIMB_LINEAR_FN = None
+# LIMB_LINEAR_FN that also adds a float32 bias in the same pass: (hi, lo, w, bias_rows [32, N]) -> (hi@w + lo@w) + bias,
+# or None when it cannot (the caller then adds the bias separately); None: the bias is always a separate add
+LIMB_LINEAR_BIAS_FN = None
 
 
 # optional replacement for the hi/lo split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a fused
@@ -81,6 +84,16 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     (hi, lo) from split_bf16 when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
     hi, lo = split_bf16(x) if parts is None else parts
+    if (
+        LIMB_LINEAR_BIAS_FN is not None
+        and LO_FIDELITY is None
+        and bias is not None
+        and bias.dtype == ttnn.float32
+        and math.prod(int(d) for d in list(bias.shape)[:-1]) == 1  # one bias row broadcast over the rows
+    ):
+        y = LIMB_LINEAR_BIAS_FN(hi, lo, w, _bias_rows(bias))
+        if y is not None:
+            return y
     y = LIMB_LINEAR_FN(hi, lo, w) if LIMB_LINEAR_FN is not None and LO_FIDELITY is None else None
     if y is not None:
         return (
