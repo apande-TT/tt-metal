@@ -209,6 +209,7 @@ class QwenImageEditTT:
         # and its three lane patterns + median as one C++ kernel (lane copies made per row block, each pattern
         # accumulated in DEST in the folded K order): no folded query operand, masks or [Sq, Sk] estimates
         _tr_precise.EXACT_QK_FN = _exact_qk
+        _tr_precise.EXACT_QK_LIMBS_L1 = True  # with q / k's limbs split straight into L1
         # one lane pattern (no median of three): the median only outvotes a rare power-of-two glitch
         _tr_precise.PATTERNS = ("strided",)
         # projections of one activation (q/k/v, ada-norm scale/shift) share its hi/lo split, and the image and
