@@ -1045,6 +1045,11 @@ class TtMinistral3Attention:
             # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
+        if self.stream_o is not None and self.decode_all_reduce is not None and self.stream_o.heads_ok(attn):
+            # the o_proj stream concatenates the heads itself, straight out of SDPA's tiles (StreamDownDecode heads=True)
+            p = self.stream_o(attn, memory_config=self.decode_all_reduce.mem, heads=True)
+            ttnn.deallocate(attn)
+            return p if self.defer_decode_reduce else self.decode_all_reduce(p)
         if self.concat_heads_decode is not None and self.concat_heads_decode.supports(attn):
             # (1, 1, B, heads * head_dim) L1-interleaved in one copy program, read straight out of SDPA's tiles
             heads, attn = attn, self.concat_heads_decode(attn)
