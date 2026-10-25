@@ -36,6 +36,12 @@ INTERM_DTYPE = ttnn.float32
 EPS_TILE = (ttnn.bfloat16, "eps", 1)
 SCALER_TILE = (ttnn.bfloat16, 1.0, 0)
 GAMMA_TILE = (ttnn.bfloat16, 1.0, 2)
+# The unit-gamma multiply only truncates x * r to what the multiplier reads of SrcA (1 hidden + 9 mantissa bits):
+# False folds that truncation into the compute's bf16 rounding step (NO_GAMMA_PASS, SRCA_MASK) -- no gamma tiles, no
+# fp32 x * r round trip through the fusion CB, one FPU pass fewer a tile.
+GAMMA_PASS = False
+SRCA_MASK = 0xFFFFC000  # TF32 (fp32 truncated into SrcA) less its last bit: the multiplier phases read 1 + 4 + 5 bits
+SKIP_FILL = 3  # norm_cast_dm.cpp: a constant tile the reader does not write
 
 
 def _bits(dtype, v: float) -> int:
@@ -86,13 +92,13 @@ class NormCast:
             cb(CB_IN, wt_full, ttnn.float32),
             cb(CB_SCALER, 1, SCALER_TILE[0]),
             cb(CB_EPS, 1, EPS_TILE[0]),
-            cb(CB_GAMMA, wt_full, GAMMA_TILE[0]),
             cb(CB_OUT, 2 * blk, ttnn.bfloat16),
             cb(CB_EX2, 1, INTERM_DTYPE),
             cb(CB_XMM2, wt_full, INTERM_DTYPE),  # the whole row's x^2 is packed before the reduce reads it
             cb(CB_EX2PE, 1, INTERM_DTYPE),
-            cb(CB_FUSION, 2 * blk, INTERM_DTYPE),
         ]
+        if GAMMA_PASS:
+            cbs += [cb(CB_GAMMA, wt_full, GAMMA_TILE[0]), cb(CB_FUSION, 2 * blk, INTERM_DTYPE)]
         ccfg = ttnn.ComputeConfigDescriptor()
         ccfg.math_fidelity = ttnn.MathFidelity.HiFi4
         ccfg.fp32_dest_acc_en = True
@@ -112,7 +118,7 @@ class NormCast:
             r0 += n
         acc = lambda t: list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         consts = [CB_EPS, datum(EPS_TILE[0]), EPS_TILE[2], CB_SCALER, datum(SCALER_TILE[0]), SCALER_TILE[2]]
-        consts += [CB_GAMMA, datum(GAMMA_TILE[0]), GAMMA_TILE[2]]
+        consts += [CB_GAMMA, datum(GAMMA_TILE[0]), GAMMA_TILE[2] if GAMMA_PASS else SKIP_FILL]
         dm = lambda role, risc, noc, cbi, page, t, rt, extra_ct: ttnn.KernelDescriptor(
             kernel_source=_DM,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -129,6 +135,7 @@ class NormCast:
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores,
                 compile_time_args=[Wt, blk, W, FLOAT32_REDUCTION],
+                defines=[] if GAMMA_PASS else [("NO_GAMMA_PASS", "1"), ("SRCA_MASK", f"{SRCA_MASK:#x}u")],
                 runtime_args=rc,
                 config=ccfg,
             ),

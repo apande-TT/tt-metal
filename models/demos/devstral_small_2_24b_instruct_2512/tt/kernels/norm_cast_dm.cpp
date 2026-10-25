@@ -14,7 +14,7 @@
 // (the stock reduce scaler); COL0 -- the tile zeroed, column 0 of every face = value (the stock eps tile holds it in
 // column 0 of faces 0 / 2; columns 16 + only feed rsqrt lanes nothing reads); TOP_ROW -- row 0 of faces 0 / 1 only, the
 // rest left as it is (the only datums a row-broadcast operand reads: the stock gamma tile).
-enum Fill : uint32_t { ROW0 = 0, COL0 = 1, TOP_ROW = 2 };
+enum Fill : uint32_t { ROW0 = 0, COL0 = 1, TOP_ROW = 2, SKIP = 3 };  // SKIP: no tile (the gamma without its pass)
 
 template <uint32_t DATUM>
 inline void fill_tile(uint32_t l1, uint32_t value, Fill how) {
@@ -83,16 +83,18 @@ void kernel_main() {
             fill_tile<2>(get_write_ptr(CB_SCALER), sc_bits, static_cast<Fill>(SC_FILL));
         }
         cb_push_back(CB_SCALER, 1);
-        cb_reserve_back(CB_GAMMA, Wt);
-        for (uint32_t i = 0; i < Wt; ++i) {
-            const uint32_t l1 = get_write_ptr(CB_GAMMA) + i * 1024 * G_DATUM;
-            if constexpr (G_DATUM == 4) {
-                fill_tile<4>(l1, g_bits, static_cast<Fill>(G_FILL));
-            } else {
-                fill_tile<2>(l1, g_bits, static_cast<Fill>(G_FILL));
+        if constexpr (G_FILL != SKIP) {
+            cb_reserve_back(CB_GAMMA, Wt);
+            for (uint32_t i = 0; i < Wt; ++i) {
+                const uint32_t l1 = get_write_ptr(CB_GAMMA) + i * 1024 * G_DATUM;
+                if constexpr (G_DATUM == 4) {
+                    fill_tile<4>(l1, g_bits, static_cast<Fill>(G_FILL));
+                } else {
+                    fill_tile<2>(l1, g_bits, static_cast<Fill>(G_FILL));
+                }
             }
+            cb_push_back(CB_GAMMA, Wt);
         }
-        cb_push_back(CB_GAMMA, Wt);
 
         for (uint32_t r = row0; r < row0 + nrows; ++r) {
             for (uint32_t k = 0; k < Wt; k += BLOCK) {
