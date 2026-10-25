@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Writer of the two-limb linear (limb_linear.cpp): each mb x nb float32 output block of cb 16 (tile r * nb + c)
-// to y[row0 + r, n0 + nblk * nb + c], per work unit in the compute kernel's order.
+// to y[row0 + r, n0 + nblk * nb + c], per work unit in the compute kernel's order. With a bias (has_bias), it
+// first reads the block's nb float32 bias tiles (bias rows [32, N], tile n0 + nblk * nb + c) into cb 2.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -22,16 +23,29 @@ void kernel_main() {
     constexpr uint32_t units = get_compile_time_arg_val(4);
     constexpr uint32_t unit_stride = get_compile_time_arg_val(5);
     constexpr auto y_args = TensorAccessorArgs<6>();
+    constexpr bool has_bias = get_compile_time_arg_val(y_args.next_compile_time_args_offset()) != 0;
+    constexpr auto b_args = TensorAccessorArgs<y_args.next_compile_time_args_offset() + 1>();
+    const uint32_t b_addr = get_arg_val<uint32_t>(3);
 
     constexpr uint32_t cb_out = 16;
     const uint32_t page = get_local_cb_interface(cb_out).fifo_page_size;
     const auto y = TensorAccessor(y_args, y_addr);
+    const auto b = TensorAccessor(b_args, b_addr);
 
     Noc noc;
     DataflowBuffer dout(cb_out);
+    DataflowBuffer dbias(2);
     for (uint32_t i = 0; i < units; ++i) {
         const uint32_t row0 = (first_unit + i * unit_stride) * mb;
         for (uint32_t nblk = 0; nblk < Ntg / nb; ++nblk) {
+            if constexpr (has_bias) {
+                dbias.reserve_back(nb);
+                for (uint32_t c = 0; c < nb; ++c) {
+                    noc.async_read(b, dbias, page, {.page_id = n0 + nblk * nb + c}, {.offset_bytes = c * page});
+                }
+                noc.async_read_barrier();
+                dbias.push_back(nb);
+            }
             dout.wait_front(mb * nb);
             for (uint32_t r = 0; r < mb; ++r) {
                 for (uint32_t c = 0; c < nb; ++c) {

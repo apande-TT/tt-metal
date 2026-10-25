@@ -30,14 +30,20 @@ def _largest_divisor(n, cap):
     return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
+def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
-    wide output (K < N) also runs as one group of whole output rows per core, like a long-K one."""
+    wide output (K < N) also runs as one group of whole output rows per core, like a long-K one. bias_rows: float32
+    [32, N] (the bias row replicated over a tile's rows), added to the product in the same pass:
+    (hi @ w + lo @ w) + b, the separate float32 bias add's order."""
     if w.dtype != ttnn.bfloat16 or hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16:
         return None
     hs, ws = [int(d) for d in hi.padded_shape], [int(d) for d in w.padded_shape]
     if math.prod(ws[:-2]) != 1 or hs[-1] != ws[-2] or [int(d) for d in lo.padded_shape] != hs:
+        return None
+    if bias_rows is not None and (
+        bias_rows.dtype != ttnn.float32 or [int(d) for d in bias_rows.padded_shape] != [_TILE, ws[-1]]
+    ):
         return None
     rows, k_t, n_t = math.prod(hs[:-1]) // _TILE, hs[-1] // _TILE, ws[-1] // _TILE
     mb = 1
@@ -82,6 +88,8 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
         _cb(1, ttnn.bfloat16, 2048, 2 * kc * nb),
         _cb(16, ttnn.float32, 4096, 2 * mb * nb),
     ]
+    if bias_rows is not None:
+        cbs.append(_cb(2, ttnn.float32, 4096, 2 * nb))
     sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_cores, initial_value=0) for i in (0, 1)]
     rd_rt, wr_rt, sd_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     for g, sender in enumerate(senders):
@@ -91,7 +99,7 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
             for x in range(x0, x0 + gw):
                 first = y * gw + x - x0
                 rd_rt[x][y] = [hi.buffer_address(), lo.buffer_address(), first, sender_phys.x, sender_phys.y]
-                wr_rt[x][y] = [out.buffer_address(), first, g * n_g]
+                wr_rt[x][y] = [out.buffer_address(), first, g * n_g, 0 if bias_rows is None else bias_rows.buffer_address()]
         start = device.worker_core_from_logical_core(ttnn.CoreCoord(x0, 0))
         end = device.worker_core_from_logical_core(ttnn.CoreCoord(x0 + gw - 1, rect_rows - 1))
         sd_rt[sender.x][sender.y] = [w.buffer_address(), start.x, start.y, end.x, end.y, g * n_g]
@@ -100,6 +108,10 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
+    if bias_rows is not None:
+        modes = [ttnn.UnpackToDestMode.Default] * 32
+        modes[2] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the bias tiles unpacked to DEST as float32
+        cfg.unpack_to_dest_mode = modes
     rd_ct = [k_t, n_g, mb, nb, kc, units, n_cores]
     rd_ct += list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
     rd_ct += list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
@@ -118,7 +130,9 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
             compile_time_args=[n_t, n_g, mb, nb, units, n_cores]
-            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+            + [int(bias_rows is not None)]
+            + list(ttnn.TensorAccessorArgs(out if bias_rows is None else bias_rows).get_compile_time_args()),
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -135,10 +149,11 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True):
             kernel_source=os.path.join(_KERNELS, "limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
-            compile_time_args=[k_t, n_g, mb, nb, kc, units],
+            compile_time_args=[k_t, n_g, mb, nb, kc, units, int(bias_rows is not None)],
             runtime_args=ttnn.RuntimeArgs(),
             config=cfg,
         ),
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-    return ttnn.generic_op([hi, lo, w, out], prog)
+    io = [hi, lo, w] + ([] if bias_rows is None else [bias_rows]) + [out]
+    return ttnn.generic_op(io, prog)

@@ -260,6 +260,10 @@ class QwenImageEditTT:
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(
             hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False
         )
+        # and a column-parallel one's float32 bias added in that same pass (no separate bias add over the output)
+        _tr_precise.LIMB_LINEAR_BIAS_FN = lambda hi, lo, w, bias_rows: fused_limb_linear(
+            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False, bias_rows=bias_rows
+        )
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
         # and the three limb products + two adds as one kernel over the full grid (P's rows read once per row block)

@@ -7,7 +7,9 @@
 // limbs, each into its own float32 DEST tiles (hi: tile i, lo: tile mb * nb + i), so the weight is streamed once
 // for both limbs and each product's whole K reduction stays in DEST in K order -- the fp32 sum the stock matmul
 // forms (its partial reloads are UnpackToDestFp32, exact). The two products are then added with the SFPU
-// float32 add (round to nearest even), the add of the separate-matmul path, so the result is the same.
+// float32 add (round to nearest even), the add of the separate-matmul path, so the result is the same. With a
+// bias (has_bias), the block's float32 bias tiles (cb 2, the bias row replicated over a tile's rows) are then
+// unpacked to DEST as float32 and added the same way: (hi @ w + lo @ w) + b, the separate bias add's order.
 
 #include <cstdint>
 
@@ -16,7 +18,9 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/reg_api.h"
+#include "api/compute/tile_move_copy.h"
 #include "api/dataflow/circular_buffer.h"
 
 void kernel_main() {
@@ -26,13 +30,16 @@ void kernel_main() {
     constexpr uint32_t nb = get_compile_time_arg_val(3);
     constexpr uint32_t kc = get_compile_time_arg_val(4);
     constexpr uint32_t units = get_compile_time_arg_val(5);
+    constexpr bool has_bias = get_compile_time_arg_val(6) != 0;
 
     constexpr uint32_t cb_a = 0;
     constexpr uint32_t cb_w = 1;
+    constexpr uint32_t cb_bias = 2;
     constexpr uint32_t cb_out = 16;
     CircularBuffer a(cb_a);
     CircularBuffer w(cb_w);
     CircularBuffer out(cb_out);
+    CircularBuffer bias(cb_bias);
 
     constexpr uint32_t lo_dst = mb * nb;
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_a, cb_w, cb_out);
@@ -57,6 +64,22 @@ void kernel_main() {
             add_binary_tile_init();
             for (uint32_t i = 0; i < mb * nb; ++i) {
                 add_binary_tile<ckernel::DstRoundingMode::NearestEven>(i, lo_dst + i, i);
+            }
+            if constexpr (has_bias) {
+                bias.wait_front(nb);
+                reconfig_data_format_srca(cb_w, cb_bias);
+                copy_init(cb_bias);
+                for (uint32_t r = 0; r < mb; ++r) {
+                    for (uint32_t c = 0; c < nb; ++c) {
+                        copy_tile(cb_bias, c, lo_dst + r * nb + c);
+                    }
+                }
+                add_binary_tile_init();
+                for (uint32_t i = 0; i < mb * nb; ++i) {
+                    add_binary_tile<ckernel::DstRoundingMode::NearestEven>(i, lo_dst + i, i);
+                }
+                bias.pop_front(nb);
+                reconfig_data_format_srca(cb_bias, cb_w);
             }
             tile_regs_commit();
             tile_regs_wait();
