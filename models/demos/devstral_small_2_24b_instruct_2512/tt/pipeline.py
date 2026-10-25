@@ -426,6 +426,7 @@ PLANNED_TP = 4
 #                     bf16) instead of the SFPU: 91 -> 51 us at 416 rows, PCC unchanged.
 #   prompt K / V cast to the cache dtype on the fill's 64-core slab grid in L1 (ministral3_attention.PREFILL_KV_CAST_ON_SLABS).
 #   prefill logits kept as the lm_head vocab shards (PREFILL_LOGITS_SHARDED, VocabShards like decode's): no logits all_gather.
+#   fused gate/up N block 14 when it tiles a core's N range in fewer blocks than 12 (ministral3_m_l_p.GATE_UP_N14; vision MLP).
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
