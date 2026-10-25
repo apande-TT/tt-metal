@@ -79,6 +79,18 @@ SWIGLU_FP32_EPILOGUE = False
 ORIENT_MIN_WORK = True
 ORIENT_MIN_GAIN = 0.05
 
+# The in0 / in1 blocks travel the grid as a forwarding chain (each core receives a block from the previous core of its
+# row / column and writes it on to the next). Stock: store-and-forward of the whole K block, so a chain's last core
+# gets its first block only after every hop has moved all of it -- the vision QKV's 144 KB weight blocks down 9 hops.
+# CHUNKED_FWD: each block moves in chunks of about FWD_CHUNK_BYTES (whole rows: M rows of in0, K rows of in1), every
+# core passing a chunk on as soon as it lands (kernels/mm_dm_in0.cpp, mm_dm_in1_out.cpp CHUNKED_FWD). The CB contents
+# the compute reads are the same tiles in the same slots, so the products are unchanged. Only where the activation has
+# at most FWD_MAX_ROWS tile rows: the short vision / 128-row matmuls, whose few K blocks the chain's fill time weighs on
+# (vision QKV 132 -> 125, o_proj 65 -> 55, down 123 -> 107 us), not the 416-row prompt's long ones (+0.3-3.5%).
+CHUNKED_FWD = True
+FWD_CHUNK_BYTES = 16 * 1024
+FWD_MAX_ROWS = 128
+
 
 def transposed(m_tiles, n_tiles, gx, gy, swiglu=False):
     """Whether minimal_matmul (this module's program) splits M along the grid's x axis (and N along y)."""
@@ -503,6 +515,13 @@ def matmul(
         cdefines += [("N_SEG_TILES", str(n_seg))]
         defines = defines + [("N_SEG_TILES", str(n_seg))]
         in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
+    if CHUNKED_FWD and (N_tiles if swapped else M_tiles) <= FWD_MAX_ROWS:
+        # (in0_heads: the copy's chunk reads remap the heads layout themselves, IN0_NH / IN0_ST / IN0_HDT)
+        # (at most 15 chunks a block: the injector tags chunk c's reads with NOC transaction id c + 1)
+        rows0 = max(1, FWD_CHUNK_BYTES // (K_block * in0_tile), -(-M_block // 15))
+        rows1 = max(1, FWD_CHUNK_BYTES // (N_block * in1_tile), -(-K_block // 15))
+        defines = defines + [("CHUNKED_FWD", "1"), ("FWD_IN0_ROWS", str(rows0)), ("FWD_IN1_ROWS", str(rows1))]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)
 
     dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
     kern = lambda src, cores, ct, rt, cfg, d: ttnn.KernelDescriptor(

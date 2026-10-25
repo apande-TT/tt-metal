@@ -4,7 +4,8 @@
 
 // tt/minimal_mm.py: a copy of minimal_matmul's dm_in1_sender_out.cpp whose injector cores may defer their output block's write too
 // (DEFER_INJECTOR: the SWIGLU_OVERLAP compute finishes a block's SwiGLU epilogue during the next block, so no core can
-// write a block right after its own K loop). Otherwise the stock kernel.
+// write a block right after its own K loop), and CHUNKED_FWD (mm_dataflow_common.hpp): each block is passed along the
+// forwarding chain FWD_IN1_ROWS K rows at a time. Otherwise the stock kernel.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -330,6 +331,68 @@ void kernel_main() {
                 cb_in1.reserve_back(in1_block_num_tiles);
 
                 uint32_t in1_start_address = cb_in1.get_write_ptr();
+#ifdef CHUNKED_FWD
+                // the block in chunks of FWD_IN1_ROWS K rows: the receiver semaphore counts the chunks landed (the
+                // upstream core relays the count after each chunk's write), and each chunk goes on downstream at once
+                {
+                    constexpr uint32_t R = FWD_IN1_ROWS;
+                    constexpr uint32_t n_fwd = (K_block_tiles + R - 1) / R;
+                    static_assert(n_fwd <= 15, "a chunk a NOC transaction id");
+                    if constexpr (is_injector_core) {
+                        // every chunk's reads issued at once, chunk c tagged with transaction id c + 1
+                        for (uint32_t c = 0; c < n_fwd; c++) {
+                            issue_in1_rows<N_block_tiles>(
+                                in1_reader,
+                                in1_shape,
+                                cb_in1_id,
+                                in1_tile_size,
+                                k_block * K_block_tiles,
+                                c * R,
+                                std::min(c * R + R, K_block_tiles),
+                                n_tile,
+                                n_tile_end,
+                                c + 1);
+                        }
+                    } else {
+                        in1_receiver_semaphore.set(INVALID);
+                        in1_sender_semaphore.up(noc, in1_sender_noc_x, in1_sender_noc_y, 1);
+                    }
+                    for (uint32_t c = 0; c < n_fwd; c++) {
+                        const uint32_t r0 = c * R;
+                        const uint32_t r1 = std::min(r0 + R, K_block_tiles);
+                        if constexpr (is_injector_core) {
+                            wait_rows(c + 1);
+                        } else {
+                            in1_receiver_semaphore.wait_min(c + 1);
+                        }
+                        if (c + 1 == n_fwd) {
+                            cb_in1.push_back(in1_block_num_tiles);
+                        }
+                        if (!is_sink_core) {
+                            if (c == 0) {
+                                in1_sender_semaphore.wait(1);
+                                in1_sender_semaphore.set(0);
+                            }
+                            for (uint32_t r = r0; r < r1; r++) {
+                                const uint32_t a = in1_start_address + r * full_N_tiles_bytes;
+                                noc.async_write(
+                                    CoreLocalMem<uint32_t>(a),
+                                    UnicastEndpoint{},
+                                    current_N_tiles_bytes,
+                                    {},
+                                    {.noc_x = in1_dest_noc_x, .noc_y = in1_dest_noc_y, .addr = a});
+                            }
+                            noc.async_writes_flushed();  // (also retires the previous count relay's source read)
+                            in1_valid_semaphore.set(c + 1);
+                            in1_valid_semaphore.relay_unicast(
+                                noc, in1_receiver_semaphore, in1_dest_noc_x, in1_dest_noc_y);
+                        }
+                    }
+                    if constexpr (is_injector_core) {
+                        noc_async_read_set_trid(0);
+                    }
+                }
+#else
                 if constexpr (is_injector_core) {
 #ifdef FUSE_AG
                     if (is_injector_core) {
@@ -381,6 +444,7 @@ void kernel_main() {
 
                     in1_valid_semaphore.relay_unicast(noc, in1_receiver_semaphore, in1_dest_noc_x, in1_dest_noc_y);
                 }
+#endif  // CHUNKED_FWD
 #ifdef SRS_FUSE_OP_SIGNALER
                 if constexpr (is_output_writer) {
                     // Synchronize and signal strided reduce scatter readers after

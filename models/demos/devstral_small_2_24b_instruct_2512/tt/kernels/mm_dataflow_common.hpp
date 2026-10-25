@@ -202,6 +202,114 @@ void read_in1_block_sync(
     noc.write_zeros_l1_barrier();
 }
 
+#ifdef CHUNKED_FWD
+// CHUNKED_FWD (tt/minimal_mm.py CHUNKED_FWD): the injector reads a block a few rows at a time and every core of the
+// forwarding chain passes each row chunk on as soon as it lands, instead of storing and forwarding the whole block --
+// the same tiles in the same CB slots, so the compute is unchanged. These issue the reads of rows [r0, r1) of a block
+// (into the CB slots read_in0_block_sync / read_in1_block_sync would put them in) tagged with NOC transaction id trid,
+// so the injector issues a whole block at once and waits for it chunk by chunk (wait_rows).
+
+// in0 block rows [r0, r1) (tile rows m0 + r0 .. of the M x K view; K_block_tiles tiles a row). IN0_NH: in0 is a heads-
+// layout (B, NH, S, HD) attention output read as its head concat (tile (i, j) at ((b * NH + h) * ST + s) * HDT + d).
+template <uint32_t K_block_tiles, typename TensorAccessorType>
+void issue_in0_rows(
+    const TensorAccessorType& tensor_accessor,
+    const TensorShape2D& shape,
+    uint32_t cb_id,
+    uint32_t tile_size_bytes,
+    uint32_t m0,
+    uint32_t r0,
+    uint32_t r1,
+    uint32_t d1_start,
+    uint32_t d1_end,
+    uint32_t trid) {
+    Noc noc;
+    CircularBuffer cb(cb_id);
+    const uint32_t cb_base_write_ptr = cb.get_write_ptr();
+    uint32_t write_ptr = cb_base_write_ptr + r0 * K_block_tiles * tile_size_bytes;
+    for (uint32_t i = m0 + r0; i < m0 + r1; i++) {
+        if (i >= shape.logical_d0) {
+            break;
+        }
+#ifdef IN0_NH
+        const uint32_t row_base = (i / IN0_ST) * IN0_NH * IN0_ST + (i % IN0_ST);  // (b * NH) * ST + s
+#endif
+        for (uint32_t j = d1_start; j < d1_end; j++) {
+            if (j < shape.logical_d1) {
+#ifdef IN0_NH
+                const uint32_t tile_id = (row_base + (j / IN0_HDT) * IN0_ST) * IN0_HDT + (j % IN0_HDT);
+#else
+                const uint32_t tile_id = i * shape.logical_d1 + j;
+#endif
+                noc.async_read<NocOptions::TXN_ID>(
+                    tensor_accessor,
+                    CoreLocalMem<uint32_t>(write_ptr),
+                    tile_size_bytes,
+                    {.page_id = tile_id},
+                    {},
+                    {.trid = trid});
+            } else {
+                fill_zeros_async(noc, cb, tile_size_bytes, write_ptr - cb_base_write_ptr);
+            }
+            write_ptr += tile_size_bytes;
+        }
+        write_ptr += (K_block_tiles - (d1_end - d1_start)) * tile_size_bytes;
+    }
+}
+
+// in1 block rows [r0, r1) (K tiles k0 + r0 ..; N_block_tiles tiles a row)
+template <uint32_t N_block_tiles, typename TensorAccessorType>
+void issue_in1_rows(
+    const TensorAccessorType& tensor_accessor,
+    const TensorShape2D& shape,
+    uint32_t cb_id,
+    uint32_t tile_size_bytes,
+    uint32_t k0,
+    uint32_t r0,
+    uint32_t r1,
+    uint32_t d1_start,
+    uint32_t d1_end,
+    uint32_t trid) {
+    Noc noc;
+    CircularBuffer cb(cb_id);
+    const uint32_t cb_base_write_ptr = cb.get_write_ptr();
+    uint32_t write_ptr = cb_base_write_ptr + r0 * N_block_tiles * tile_size_bytes;
+    for (uint32_t i = k0 + r0; i < k0 + r1; i++) {
+        for (uint32_t j = d1_start; j < d1_end; j++) {
+            if (j >= shape.logical_d1) {
+                write_ptr += tile_size_bytes;
+                continue;
+            }
+            if (i < shape.logical_d0) {
+#ifdef IN1_TRANSPOSED
+                uint32_t tile_id = j * shape.logical_d0 + i;
+#else
+                uint32_t tile_id = i * shape.logical_d1 + j;
+#endif
+                noc.async_read<NocOptions::TXN_ID>(
+                    tensor_accessor,
+                    CoreLocalMem<uint32_t>(write_ptr),
+                    tile_size_bytes,
+                    {.page_id = tile_id},
+                    {},
+                    {.trid = trid});
+            } else {
+                fill_zeros_async(noc, cb, tile_size_bytes, write_ptr - cb_base_write_ptr);
+            }
+            write_ptr += tile_size_bytes;
+        }
+        write_ptr += (N_block_tiles - (d1_end - d1_start)) * tile_size_bytes;
+    }
+}
+
+// The chunk-tagged reads above: wait for chunk `trid`'s tiles (and any zero fills) before it is forwarded / pushed.
+inline void wait_rows(uint32_t trid) {
+    Noc noc;
+    noc.async_read_barrier<NocOptions::TXN_ID>({.trid = trid});
+    noc.write_zeros_l1_barrier();
+}
+#endif  // CHUNKED_FWD
+
 /**
  * Write a block of output to a potentially padded tensor.
  * Skip writing when M >= logical_M or N >= logical_N
