@@ -424,6 +424,7 @@ PLANNED_TP = 4
 #   prefill QKV written in the q / k / v head layouts (ministral3_attention.PREFILL_QKV_HEADS_OUT, minimal_mm heads_out).
 #   prefill final norm's gamma multiply on the FPU at HiFi4 (gamma_mul.FPU_MUL: exact products in fp32 DEST, packed to
 #                     bf16) instead of the SFPU: 91 -> 51 us at 416 rows, PCC unchanged.
+#   prompt K / V cast to the cache dtype on the fill's 64-core slab grid in L1 (ministral3_attention.PREFILL_KV_CAST_ON_SLABS).
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
 #                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
