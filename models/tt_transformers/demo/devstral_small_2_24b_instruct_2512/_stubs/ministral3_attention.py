@@ -277,7 +277,12 @@ class TtMinistral3Attention:
         # (tt/down_decode.py, bit-identical to the 1D-multicast matmul); then no interleaved decode copy is made.
         self.stream_o = None
         if self.DECODE_OPROJ_STREAM and tp > 1 and self.DECODE_REDUCE_DTYPE == ttnn.bfloat16:
-            from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode as _SDD
+
+            class StreamDownDecode(_SDD):
+                # grid (run 8): the o_proj's 160 columns over 80 cores, exactly 2 each (10 a DRAM bank) instead of
+                # the down's 104 (2 or 1 each): the same products, and the freed cores let trace overlap its neighbours
+                SPREAD_CORES = 80
 
             w_o = torch_module.o_proj.weight.T  # (Hq * hd, D): device d multiplies the rows of its own heads
             if StreamDownDecode.supports(device, int(w_o.shape[0]) // tp, int(w_o.shape[1]), DECODE_WEIGHT_DTYPE):
