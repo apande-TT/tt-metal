@@ -53,6 +53,9 @@ class TtAttention:
     # The L1 casts of the norm outputs to bf16 run as tt/local_cast.py (every core casts the pages of its own L1 bank;
     # ttnn.typecast's compute, bit-identical) instead of ttnn.typecast (one page at a time across the chip).
     LOCAL_CAST = True
+    # Each norm + bf16 cast pair as ONE program (tt/norm_cast.py: the stock interleaved rms_norm compute with
+    # typecast's rounding applied before the pack, bit-identical): no fp32 norm output, no cast program.
+    NORM_CAST = True
 
     def __init__(self, device, torch_module, mlp_cls=None) -> None:
         self.device = device
@@ -106,7 +109,9 @@ class TtAttention:
                 x, ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG if 0 < n_bytes <= self.RESIDUAL_L1_BYTES else None
             )
         l1 = self.FOLD_NORM_GAMMA and self.MATMUL_INPUT_DTYPE == ttnn.float32 and n_bytes <= self.FFN_NORM_L1_BYTES
-        if l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
+        if l1 and self.QKV_INPUT_DTYPE == ttnn.bfloat16 and self._norm_cast_ok(self.attention_norm, x):
+            n = self._norm_cast(self.attention_norm, x)
+        elif l1 and self.QKV_INPUT_DTYPE not in (None, ttnn.float32):
             n32 = self.attention_norm(x, memory_config=ttnn.L1_MEMORY_CONFIG)
             n = self._l1_cast(n32, self.QKV_INPUT_DTYPE)
             ttnn.deallocate(n32)
@@ -122,12 +127,15 @@ class TtAttention:
             a = self.attention(n, attention_mask=mask, position_embeddings=(cos, sin))
             h = ttnn.add(x, a, memory_config=res_mem)
             self._free_l1(a, x)
-        n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
-        if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
-            n32, n = n, self._l1_cast(n, self.GATE_UP_INPUT_DTYPE)
-            ttnn.deallocate(n32)
+        if l1 and self.GATE_UP_INPUT_DTYPE == ttnn.bfloat16 and self._norm_cast_ok(self.ffn_norm, h):
+            n = self._norm_cast(self.ffn_norm, h)
         else:
-            n = self._mm_in(n)
+            n = self.ffn_norm(h, memory_config=ttnn.L1_MEMORY_CONFIG if l1 else None)
+            if l1 and self.GATE_UP_INPUT_DTYPE not in (None, n.dtype):
+                n32, n = n, self._l1_cast(n, self.GATE_UP_INPUT_DTYPE)
+                ttnn.deallocate(n32)
+            else:
+                n = self._mm_in(n)
         if self.FUSE_RESIDUAL_ADDS:
             out = self.feed_forward(n, residual=h)
             self._free_l1(h)
@@ -138,6 +146,22 @@ class TtAttention:
         if len(in_shape) == 3:
             return ttnn.reshape(out, in_shape)
         return out
+
+    def _norm_cast_ok(self, norm, x) -> bool:
+        """Whether norm(x) + the bf16 cast can run as tt/norm_cast.py (unit-gamma norm of an L1 fp32 4-D input)."""
+        if not self.NORM_CAST or norm.gamma is not None or len(tuple(x.shape)) != 4:
+            return False
+        from models.demos.devstral_small_2_24b_instruct_2512.tt.norm_cast import NormCast
+
+        return NormCast.supports(x)
+
+    def _norm_cast(self, norm, x):
+        """bf16(norm(x)) in L1, one program (tt/norm_cast.py)."""
+        if getattr(self, "_norm_cast_prog", None) is None:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.norm_cast import NormCast
+
+            self._norm_cast_prog = NormCast(self.device)
+        return self._norm_cast_prog(x, norm._impl.eps)
 
     def _l1_cast(self, t, dtype):
         """t (L1) cast to dtype, the result in L1."""
