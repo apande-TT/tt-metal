@@ -427,6 +427,8 @@ PLANNED_TP = 4
 #   prompt K / V cast to the cache dtype on the fill's 64-core slab grid in L1 (ministral3_attention.PREFILL_KV_CAST_ON_SLABS).
 #   prefill logits kept as the lm_head vocab shards (PREFILL_LOGITS_SHARDED, VocabShards like decode's): no logits all_gather.
 #   decode K / V append reads each position from the step's gathered cos table in L1 (ministral3_attention.DECODE_KV_POS_L1).
+#   decode o_proj stream on 80 cores, 2 columns each (ministral3_attention StreamDownDecode SPREAD_CORES = 80): kernel
+#                     time unchanged, trace decode 12.757 -> 12.684 ms (the freed cores overlap its neighbours).
 #   fused gate/up N block 14 when it tiles a core's N range in fewer blocks than 12 (ministral3_m_l_p.GATE_UP_N14; vision MLP).
 #   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
 #                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
