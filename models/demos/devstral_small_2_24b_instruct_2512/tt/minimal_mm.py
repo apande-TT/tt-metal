@@ -10,6 +10,7 @@ output stage (see mm_compute.cpp): the fused SwiGLU runs silu and the up multipl
 a block (416-row text gate/up 9844 -> 9722 us, vision 245 -> 234 us), bit-identical to the stock op.
 
 Call matmul(x, w, config, compute_kernel_config, ...) exactly as ttnn.experimental.minimal_matmul (config required)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -49,8 +50,26 @@ SKIP_PADDING = True
 # the intermediate CB holds two blocks and every writer defers its block write to that K step or later. Only where the
 # doubled intermediate fits L1 (SWIGLU_OVERLAP_L1_BYTES of circular buffers).
 SWIGLU_OVERLAP = True
-EPI_DONE_FRAC = 0.5
+# (0.5: 416-row gate/up 9205 us; 0.75: 9070; 0.9: 9210 a call)
+EPI_DONE_FRAC = 0.75
 SWIGLU_OVERLAP_L1_BYTES = 1_240_000
+# ... and with an L1 input or product (the vision MLP: its L1 residual, input and product sit beside the CBs) where the
+# circular buffers, doubled intermediate included, stay within this many bytes (the non-overlapped 6 x 14-tile vision
+# blocks' 870 KB fit; 2 x 14-tile blocks with two intermediates take 567 KB)
+SWIGLU_OVERLAP_L1_IO_BYTES = 880_000
+# SWIGLU_DEEP_K: under SWIGLU_OVERLAP the PACK thread runs a pair's SFPU pass (~1344 cycles) between two 1 x 4
+# subblocks, but an 8-deep K block makes a subblock only ~1024 cycles at HiFi2, so MATH waits for its DEST half every
+# pair (~0.7 us a pair exposed). 16-deep K blocks give the pass a whole subblock; M blocks of at most
+# SWIGLU_DEEP_M_MAX tiles and SWIGLU_DEEP_N_BLOCK-tile N blocks keep the doubled intermediate within
+# SWIGLU_OVERLAP_L1_BYTES. The fp32 partials are then summed in 16-tile K runs instead of 8 (the epilogue reads them as
+# TF32 either way): not bit-identical.
+SWIGLU_DEEP_K = 16
+SWIGLU_DEEP_N_BLOCK = 8
+SWIGLU_DEEP_M_MAX = 6
+# ... with the epilogue copying the fp32 partials straight to DEST (UnpackToDestFp32) instead of through SrcA as TF32
+# (off: 416-row gate/up 8800 vs 8590 us). Callers opt layers in with matmul(..., deep_k_ok=) (the image prompt's
+# prefill-hidden PCC drops below its 0.995 floor with every text layer deep-K: 0.994431).
+SWIGLU_FP32_EPILOGUE = False
 
 
 # minimal_matmul splits M along the grid's x axis and N along y when M > N, else the other way round. ORIENT_MIN_WORK
@@ -59,6 +78,18 @@ SWIGLU_OVERLAP_L1_BYTES = 1_240_000
 # accumulated over K in the same order. Callers that size blocks to the per-core ranges use transposed() too.
 ORIENT_MIN_WORK = True
 ORIENT_MIN_GAIN = 0.05
+
+# The in0 / in1 blocks travel the grid as a forwarding chain (each core receives a block from the previous core of its
+# row / column and writes it on to the next). Stock: store-and-forward of the whole K block, so a chain's last core
+# gets its first block only after every hop has moved all of it -- the vision QKV's 144 KB weight blocks down 9 hops.
+# CHUNKED_FWD: each block moves in chunks of about FWD_CHUNK_BYTES (whole rows: M rows of in0, K rows of in1), every
+# core passing a chunk on as soon as it lands (kernels/mm_dm_in0.cpp, mm_dm_in1_out.cpp CHUNKED_FWD). The CB contents
+# the compute reads are the same tiles in the same slots, so the products are unchanged. Only where the activation has
+# at most FWD_MAX_ROWS tile rows: the short vision / 128-row matmuls, whose few K blocks the chain's fill time weighs on
+# (vision QKV 132 -> 125, o_proj 65 -> 55, down 123 -> 107 us), not the 416-row prompt's long ones (+0.3-3.5%).
+CHUNKED_FWD = True
+FWD_CHUNK_BYTES = 16 * 1024
+FWD_MAX_ROWS = 128
 
 
 def transposed(m_tiles, n_tiles, gx, gy, swiglu=False):
@@ -179,14 +210,36 @@ def matmul(
     residual=None,
     in0_heads=None,
     stock_orient=False,
+    swapped=False,
+    orient=None,
+    deep_k_ok=True,
+    heads_out=None,
+    n_seg=None,
 ):
-    """residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
+    """n_seg (tiles, under each core's N range): N blocks of config.N_block_size within two segments of the core's
+    range, [0, n_seg) and the rest, walked K-forward and K-backward -- the K-block summation order every tile gets from
+    blocks [n_seg | rest] (the readers reverse K on every other N block to reuse in0), so the smaller blocks are
+    bit-identical to that split (kernels/mm_dm_in0.cpp, mm_dm_in1_out.cpp, mm_compute.cpp N_SEG_TILES).
+    residual (supports_residual): return residual + x @ w, the add folded into the output stage (mm_compute.cpp
     residual_add_block: the stock data-movement kernels' FUSE_TERNARY read brings the residual block in on the RISC that
     does not write the output), bit-identical to ttnn.add(residual, x @ w) on the fp32 output.
     in0_heads (True, supports_heads): x is an attention output (B, NH, S, HD) multiplied as its head concat
     (B, 1, S, NH * HD) -- the in0 reader (kernels/mm_in0_heads.cpp) fetches each tile where nlp_concat_heads would
-    have copied it from, so the concat program is not needed; same tiles, same matmul."""
+    have copied it from, so the concat program is not needed; same tiles, same matmul.
+    swapped (w = the (N x K) TRANSPOSED weight): x @ w^T computed as the program's (w @ x^T)^T -- in0 = w, in1 = x's
+    tiles read in transposed positions and unpacked transposed, each output tile transposed on its way out
+    (kernels/mm_dataflow_common.hpp IN1_TRANSPOSED / OUT_TRANSPOSED, mm_compute.cpp MM_IN1_TRANSPOSE). The weight
+    lands in srcB and the activation in srcA: a block-float8 weight's 7-bit significands fit srcB's one 7-bit
+    multiplier pass, so HiFi2 (srcA's two 5-bit passes x srcB's first) multiplies the full operands -- the products
+    HiFi4 forms with the weight in srcA, at half the multiplier passes.
+    orient (True / False): force the grid split (True: M along the grid's x axis).
+    heads_out ((nq, nkv, qk_memory_config, v_memory_config)): return (q, k, v) in nlp_create_qkv_heads' layouts
+    ((B, nq | nkv, S, HD), HD = N / (nq + 2 nkv)) instead of the (B, 1, S, N) product -- the output writer drops each
+    tile where that split would have copied it (kernels/mm_dataflow_common.hpp OUT_HEADS), so neither the split
+    program nor a full-width product is needed; same tiles, same matmul."""
     assert residual is None or not fuse_swiglu
+    assert not swapped or (residual is None and not fuse_swiglu and in0_heads is None)
+    assert heads_out is None or (residual is None and not fuse_swiglu and not swapped)
     device = x.device()
     grid = config.compute_with_storage_grid_size
     gx, gy = int(grid.x), int(grid.y)
@@ -200,6 +253,11 @@ def matmul(
     for d in xs[:-1]:
         M *= d
     N = int(w.padded_shape[-1])
+    in0, in1 = x, w
+    if swapped:
+        assert int(w.padded_shape[-1]) == K
+        in0, in1 = w, x
+        M, N = int(w.padded_shape[-2]), M
     T = ttnn.TILE_SIZE
     M_tiles, K_tiles, N_tiles = M // T, K // T, N // T
 
@@ -208,6 +266,8 @@ def matmul(
 
     # stock_orient: the stock M > N split (the vision MLP down measured no better transposed)
     transpose = M_tiles > N_tiles if stock_orient else transposed(M_tiles, N_tiles, gx, gy, fuse_swiglu)
+    if orient is not None:
+        transpose = bool(orient)
     dram_read, dram_write = ttnn.NOC.NOC_0, ttnn.NOC.NOC_1  # Blackhole preferred NOCs
     small_noc, small_risc = dram_write, ttnn.DataMovementProcessor.RISCV_1
     large_noc, large_risc = dram_read, ttnn.DataMovementProcessor.RISCV_0
@@ -217,6 +277,28 @@ def matmul(
     in1_par = gy if transpose else gx
 
     padded_M = _round_up(M_tiles, in0_par)
+    deep_k = False
+    if (
+        fuse_swiglu
+        and deep_k_ok
+        and SWIGLU_DEEP_K
+        and SWIGLU_OVERLAP
+        and SWIGLU_PACK_SFPU
+        and fp32_acc
+        and in0_heads is None
+        and (sub_h, sub_w) == (1, 4)
+        and K_tiles % SWIGLU_DEEP_K == 0
+        and K_tiles // SWIGLU_DEEP_K >= 2
+        and (2 * (_round_up(N_tiles // 2, in1_par) // in1_par)) % SWIGLU_DEEP_N_BLOCK == 0
+        and x.memory_config().buffer_type == ttnn.BufferType.DRAM
+        and memory_config.buffer_type == ttnn.BufferType.DRAM
+    ):
+        m_core = padded_M // in0_par
+        mb = min(SWIGLU_DEEP_M_MAX, m_core)
+        # the M block that tiles the core's M range with the least padding (the larger on a tie)
+        M_block = min(range(mb, max(1, mb // 2) - 1, -1), key=lambda b: -(-m_core // b) * b - m_core)
+        K_block, N_block = SWIGLU_DEEP_K, SWIGLU_DEEP_N_BLOCK
+        deep_k = True
     padded_K = _round_up(K_tiles, K_block)
     if fuse_swiglu:
         out_N = N_tiles // 2
@@ -231,8 +313,12 @@ def matmul(
     K_blocks = padded_K // K_block
     M_blocks_per_core = -(-M_per_core // M_block)
     N_blocks_per_core = -(-N_per_core // N_block)
+    if n_seg:
+        assert not deep_k and in0_heads is None and not swapped and 0 < n_seg < N_per_core
+        assert not fuse_swiglu or n_seg % 2 == 0
+        N_blocks_per_core = -(-n_seg // N_block) + -(-(N_per_core - n_seg) // N_block)
 
-    in0_tile, in1_tile = _TILE_BYTES[x.dtype], _TILE_BYTES[w.dtype]
+    in0_tile, in1_tile = _TILE_BYTES[in0.dtype], _TILE_BYTES[in1.dtype]
     out_tile = _TILE_BYTES[dtype]
     interm_dtype = ttnn.float32 if fp32_acc else ttnn.bfloat16
     interm_tile = _TILE_BYTES[interm_dtype]
@@ -240,8 +326,20 @@ def matmul(
     out_block = M_block * N_block
     out_written = out_block // 2 if fuse_swiglu else out_block
 
-    out_shape = xs[:-1] + [N // 2 if fuse_swiglu else N]
-    out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)
+    out_shape = xs[:-1] + [M if swapped else N // 2 if fuse_swiglu else N]
+    if heads_out is not None:
+        nq, nkv, qk_mem, v_mem = heads_out
+        S = int(xs[-2])
+        B = M // S
+        HD = N // (nq + 2 * nkv)
+        assert S % T == 0 and HD % T == 0 and HD * (nq + 2 * nkv) == N
+        outs = [
+            ttnn.allocate_tensor_on_device(ttnn.Shape([B, h, S, HD]), dtype, ttnn.TILE_LAYOUT, device, mem)
+            for h, mem in ((nq, qk_mem), (nkv, qk_mem), (nkv, v_mem))
+        ]
+    else:
+        outs = [ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), dtype, ttnn.TILE_LAYOUT, device, memory_config)]
+    out = outs[0]
 
     core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(gx - 1, gy - 1))])
     rng = lambda a, b, c, d: ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(a, b), ttnn.CoreCoord(c, d))])
@@ -266,7 +364,7 @@ def matmul(
     # reads that K block, so compute -- which packs block i + 1 only after its last K block -- never waits on it. (The
     # vision MLP's 7 x 12-tile SwiGLU block: 86 KB less static L1, which the decode all_reduce's scratch needs.)
     out_bufs = 1
-    cb_bytes = (M_block * K_block * 2 * in0_tile + K_block * N_block * 2 * in1_tile + out_written * out_bufs * out_tile)
+    cb_bytes = M_block * K_block * 2 * in0_tile + K_block * N_block * 2 * in1_tile + out_written * out_bufs * out_tile
     overlap = (
         SWIGLU_OVERLAP
         and fuse_swiglu
@@ -274,15 +372,18 @@ def matmul(
         and fp32_acc
         and in0_heads is None
         and K_blocks >= 2
-        and cb_bytes + 2 * out_block * interm_tile <= SWIGLU_OVERLAP_L1_BYTES
-        # an L1 input or product (the vision MLP) leaves no room for the second intermediate block
-        and x.memory_config().buffer_type == ttnn.BufferType.DRAM
-        and memory_config.buffer_type == ttnn.BufferType.DRAM
+        and cb_bytes + 2 * out_block * interm_tile
+        <= (
+            SWIGLU_OVERLAP_L1_BYTES
+            if x.memory_config().buffer_type == ttnn.BufferType.DRAM
+            and memory_config.buffer_type == ttnn.BufferType.DRAM
+            else SWIGLU_OVERLAP_L1_IO_BYTES
+        )
     )
     epi_done_k = min(max(1, int(K_blocks * EPI_DONE_FRAC)), K_blocks - 1) if overlap else 0
     cbs = [
-        cb(0, M_block * K_block * 2, in0_tile, x.dtype),
-        cb(1, K_block * N_block * 2, in1_tile, w.dtype),
+        cb(0, M_block * K_block * 2, in0_tile, in0.dtype),
+        cb(1, K_block * N_block * 2, in1_tile, in1.dtype),
         cb(2, out_written * out_bufs, out_tile, dtype),
         cb(3, out_block * (2 if overlap else 1), interm_tile, interm_dtype),
     ]
@@ -293,22 +394,25 @@ def matmul(
         cbs += [cb(6, N_block, _TILE_BYTES[residual.dtype], residual.dtype)]
 
     acc = lambda t: list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    out_ct = [a for t in outs for a in acc(t)]
     res_ct = [] if residual is None else acc(residual) + acc(residual)
     head = [M_tiles, padded_M, K_tiles, padded_K, N_tiles, padded_N, M_block, K_block, N_block]
     head += [M_blocks_per_core, N_blocks_per_core]
     in0_ct = lambda injector: (
         head
-        + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector, 1, N_tiles]
+        + [in0_tile, out_tile, in1_tile, S_IN0_SEND, S_IN0_RECV, S_IN0_VALID, int(not transpose), injector]
+        + [len(outs), N_tiles]
         + [in1_tile]
-        + acc(x)
-        + acc(out)
+        + acc(in0)
+        + out_ct
         + res_ct
     )
     in1_ct = lambda injector: (
         head
-        + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector, 1, N_tiles]
-        + acc(w)
-        + acc(out)
+        + [in1_tile, out_tile, in1_tile, S_IN1_SEND, S_IN1_RECV, S_IN1_VALID, int(transpose), injector]
+        + [len(outs), N_tiles]
+        + acc(in1)
+        + out_ct
         + res_ct
     )
 
@@ -323,7 +427,8 @@ def matmul(
             phys[c] = (int(p.x), int(p.y))
         return phys[c]
 
-    x_addr, w_addr, o_addr = x.buffer_address(), w.buffer_address(), out.buffer_address()
+    x_addr, w_addr = in0.buffer_address(), in1.buffer_address()
+    o_addrs = [t.buffer_address() for t in outs]
     # FUSE_TERNARY runtime args (before the output address): a, b (broadcast row), broadcast flag
     tern = [] if residual is None else [residual.buffer_address(), residual.buffer_address(), 1]
     rt_in0_s, rt_in0_r, rt_in1_s, rt_in1_r, rt_c = [], [], [], [], []
@@ -340,13 +445,31 @@ def matmul(
             m0, m1 = M_per_core * in0_idx, M_per_core * (in0_idx + 1)
             n0, n1 = N_per_core * in1_idx, N_per_core * (in1_idx + 1)
             defer = max(min(cy * k_blocks_per_core, K_blocks - 1), epi_done_k)
-            a0 = [x_addr, 0, 0, int(core == o0[-1]), *pxy(next0), *pxy(prev0), m0, m1, n0, n1, defer, max_defer, *tern, o_addr]
+            a0 = [
+                x_addr,
+                0,
+                0,
+                int(core == o0[-1]),
+                *pxy(next0),
+                *pxy(prev0),
+                m0,
+                m1,
+                n0,
+                n1,
+                defer,
+                max_defer,
+                *tern,
+                *o_addrs,
+            ]
             a1 = [w_addr, 0, int(core == o1[-1]), *pxy(next1), *pxy(prev1), m0, m1, n0, n1, defer, max_defer, *tern]
-            a1 += [o_addr]
+            a1 += o_addrs
             (rt_in0_s if in1_idx == 0 else rt_in0_r).append((core, a0))
             (rt_in1_s if in0_idx == 0 else rt_in1_r).append((core, a1))
             rt_c.append(
-                (core, [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else []) + ([epi_done_k] if overlap else []))
+                (
+                    core,
+                    [m0, m1, n0, n1] + ([M_tiles, N_tiles] if skip_padding else []) + ([epi_done_k] if overlap else []),
+                )
             )
 
     defines = [("FUSE_SWIGLU", "1")] if fuse_swiglu else []
@@ -357,7 +480,9 @@ def matmul(
         in0_defines = [("IN0_NH", str(nh)), ("IN0_ST", str(sq // T)), ("IN0_HDT", str(hd // T))]
     if residual is not None:
         defines += [("FUSE_TERNARY", "1")]
-    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))]
+    cdefines = [d for d in defines if d[0] != "FUSE_TERNARY"] + [
+        ("EPI_TILES", str(EPI_TILES if N_block % EPI_TILES == 0 else 1))
+    ]
     cdefines += [("SWIGLU_PAIRS", str(SWIGLU_PAIRS))]
     if fuse_swiglu and SWIGLU_PACK_SFPU:
         cdefines += [("SWIGLU_PACK_SFPU", "1")]
@@ -372,6 +497,31 @@ def matmul(
         defines = defines + [("DEFER_INJECTOR", "1")]
     if residual is not None:
         cdefines += [("FUSE_RESIDUAL", "1")]
+    if heads_out is not None:
+        defines = defines + [
+            ("OUT_HEADS", "1"),
+            ("OUT_HEADS_NQ", str(nq)),
+            ("OUT_HEADS_NKV", str(nkv)),
+            ("OUT_HEADS_ST", str(S // T)),
+            ("OUT_HEADS_HDT", str(HD // T)),
+            ("OUT_HEADS_NT", str(N_tiles)),
+        ]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
+    if swapped:
+        cdefines += [("MM_IN1_TRANSPOSE", "1")]
+        defines = defines + [("IN1_TRANSPOSED", "1"), ("OUT_TRANSPOSED", "1")]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
+    if n_seg:
+        cdefines += [("N_SEG_TILES", str(n_seg))]
+        defines = defines + [("N_SEG_TILES", str(n_seg))]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)  # (the stock kernels unless DEFER_INJECTOR)
+    if CHUNKED_FWD and (N_tiles if swapped else M_tiles) <= FWD_MAX_ROWS:
+        # (in0_heads: the copy's chunk reads remap the heads layout themselves, IN0_NH / IN0_ST / IN0_HDT)
+        # (at most 15 chunks a block: the injector tags chunk c's reads with NOC transaction id c + 1)
+        rows0 = max(1, FWD_CHUNK_BYTES // (K_block * in0_tile), -(-M_block // 15))
+        rows1 = max(1, FWD_CHUNK_BYTES // (N_block * in1_tile), -(-K_block // 15))
+        defines = defines + [("CHUNKED_FWD", "1"), ("FWD_IN0_ROWS", str(rows0)), ("FWD_IN1_ROWS", str(rows1))]
+        in0_src, in1_src = (_DM_IN0_DEFER, _DM_IN1_DEFER)
 
     dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
     kern = lambda src, cores, ct, rt, cfg, d: ttnn.KernelDescriptor(
@@ -392,6 +542,10 @@ def matmul(
         modes = [ttnn.UnpackToDestMode.Default] * 64
         modes[5] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the residual, as binary_ng unpacks a fp32 add's operands
         ccfg.unpack_to_dest_mode = modes
+    if deep_k and SWIGLU_FP32_EPILOGUE:
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        modes[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the SwiGLU reads the fp32 partials whole, not as TF32
+        ccfg.unpack_to_dest_mode = modes
     c_ct = [K_blocks, M_block, K_block, N_block, M_blocks_per_core, N_blocks_per_core, sub_h, sub_w]
     kernels = [
         kern(in0_src, in0_senders, in0_ct(1), rt_in0_s, dm(in0_risc, in0_noc), defines + in0_defines),
@@ -400,6 +554,6 @@ def matmul(
         kern(in1_src, in1_receivers, in1_ct(0), rt_in1_r, dm(in1_risc, in1_noc), defines),
         kern(_COMPUTE, core_grid, c_ct, rt_c, ccfg, cdefines),
     ]
-    ios = [x, w, out] if residual is None else [x, w, residual, out]
+    ios = [in0, in1, *outs] if residual is None else [x, w, residual, out]
     ttnn.generic_op(ios, ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
-    return out
+    return tuple(outs) if heads_out is not None else out

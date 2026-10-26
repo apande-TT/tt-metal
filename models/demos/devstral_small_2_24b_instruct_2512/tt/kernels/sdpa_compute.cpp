@@ -49,15 +49,31 @@ inline void sdpa_scaled_exp_init() {
 
 // calculate_binop_with_scalar<MUL> (val * parameter) followed by calculate_exponential<false, fp32, false> on the
 // product (_sfpu_exp_fp32_accurate_<false>, written out op for op), in one pass over the tile's rows.
+//
+// SDPA_SCALE_IMM (a scale a bf16 holds exactly, e.g. head_dim 64's 0.125): the scale multiply takes it as an immediate
+// (SFPMULI, the same fp32 product), which leaves two LREGs to hold the polynomial constants the loop otherwise re-loads
+// with two SFPLOADIs each every row. SDPA_EXP_NO_OVF: softmax exponents are (s - rowmax) * scale <= ~0 (the bf16 row
+// max can sit an ulp under s), so the overflow arm (e >= 255: y * inf) never runs and is dropped with its compare; the
+// underflow arm (e < 1: 0) stays. Same values on every input the softmax produces.
 template <int ITERATIONS>
 inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
+#ifndef SDPA_SCALE_IMM
     const sfpi::vFloat parameter = Converter::as_float(param);
+#endif
     const sfpi::vFloat c_log2e = 1.442695f;
     const sfpi::vFloat c_p1 = 8.37312452e-3f;
+#ifdef SDPA_SCALE_IMM
+    const sfpi::vFloat c_p2 = 4.16695364e-2f;
+    const sfpi::vFloat c_p4 = 4.99999851e-1f;
+#endif
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat val = sfpi::dst_reg[0];
+#ifdef SDPA_SCALE_IMM
+        sfpi::vFloat a = val * SDPA_SCALE_IMM;
+#else
         sfpi::vFloat a = val * parameter;
+#endif
         sfpi::vInt i, e;
         sfpi::vFloat f, r, j, y;
         sfpi::vSMag16 sm;
@@ -68,13 +84,27 @@ inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
         f = j * sfpi::vConstFloatPrgm1 + a;
         f = j * sfpi::vConstFloatPrgm2 + f;
         r = r * f + c_p1;
+#ifdef SDPA_SCALE_IMM
+        r = r * f + c_p2;
+#else
         r = r * f + 4.16695364e-2f;
+#endif
         r = r * f + sfpi::vConstFloatPrgm0;  // 1.66664720e-1f, set by the caller for this pass
+#ifdef SDPA_SCALE_IMM
+        r = r * f + c_p4;
+#else
         r = r * f + 4.99999851e-1f;
+#endif
         i = sfpi::abs(sfpi::as<sfpi::vInt>(sm));
         y = r * f + 1.0f;
         i = sfpi::as<sfpi::vInt>(sfpi::copysgn(sfpi::as<sfpi::vFloat>(i), j));
         r = y * f + 1.0f;
+#ifdef SDPA_EXP_NO_OVF
+        e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
+        y = sfpi::setexp(r, e);
+        v_if(sfpi::nearby(e < 1)) { y = 0.0f; }
+        v_endif;
+#else
         y *= std::numeric_limits<float>::infinity();
         e = sfpi::exexp(r, sfpi::ExponentMode::Biased) + i;
         v_if(sfpi::nearby(e < 255)) {
@@ -83,6 +113,7 @@ inline void calculate_scaled_exp_hoisted(const std::uint32_t param) {
             v_endif;
         }
         v_endif;
+#endif
         sfpi::dst_reg[0] = y;
         sfpi::dst_reg++;
     }
@@ -160,17 +191,24 @@ ALWI void exp_tile(
 // writer are unchanged.
 namespace sdpa_causal_skip {
 
-// The key columns a Q tile row needs: up to its diagonal tile (k_start 0), within the valid keys, rounded up to whole
-// QK subblocks / exp groups (`round`), at most the chunk's Sk_chunk_t.
+// The key columns of a Q tile row. need(row): exactly up to the diagonal tile (k_start 0) of the last row of the row's
+// P @ V subblock (`group` rows, which all multiply the same key count), within the valid keys -- the width its mask,
+// row max, exp / row sum and P @ V cover (cpp attempt 2, run 8: no longer rounded up to whole exp groups; the last exp
+// group of a row may be partial). qk(row): need(row) rounded up to whole QK subblocks (`round`), the columns the QK
+// matmul computes for the subblock ending at `row` (the extra ones are never read). Both at most Sk_chunk_t.
 struct RowCols {
     uint32_t q_start_tile;
     uint32_t valid_k;
     uint32_t round;
     uint32_t cap;
-    uint32_t operator()(uint32_t row) const {
-        uint32_t w = q_start_tile + row + 1;
+    uint32_t group;
+    uint32_t need(uint32_t row) const {
+        uint32_t w = q_start_tile + row - row % group + group;
         w = w < valid_k ? w : valid_k;
-        w = ((w + round - 1) / round) * round;
+        return w < cap ? w : cap;
+    }
+    uint32_t qk(uint32_t row) const {
+        uint32_t w = ((need(row) + round - 1) / round) * round;
         return w < cap ? w : cap;
     }
 };
@@ -192,7 +230,7 @@ void causal_mask_cols(
     for (uint32_t row = 0; row < num_rows; row++) {
         const uint32_t row_offset = row * stride;
         const uint32_t diag_col = cols_of.q_start_tile + row;
-        const uint32_t cols = cols_of(row);
+        const uint32_t cols = cols_of.need(row);
         if (diag_col < cols) {
             tile_regs_acquire();
             copy_tile(mask_cb, diag_idx, 0);
@@ -223,7 +261,7 @@ void reduce_c_cols(uint32_t out_cb, const RowCols& cols_of, uint32_t stride, uin
     binary_max_tile_init();
     constexpr uint32_t reduce_dst_idx = 0;
     for (uint32_t i = 0; i < real_rows; i++) {
-        const uint32_t cols = cols_of(i);
+        const uint32_t cols = cols_of.need(i);
         reconfig_data_format_srca(in0_cb);
         tile_regs_acquire();
         reduce_init<pool_type, reduce_dim>(in0_cb, scale_cb, out_cb);
@@ -240,7 +278,9 @@ void reduce_c_cols(uint32_t out_cb, const RowCols& cols_of, uint32_t stride, uin
 }
 
 // sub_exp_block_bcast_cols_inplace (accurate exp, RC, in place, with the row-sum reduce) on each row's needed columns
-// of the `cols`-wide rows; the remaining column groups are popped and pushed back untouched (the FIFO walks every tile)
+// of the `cols`-wide rows; the remaining column groups are popped and pushed back untouched (the FIFO walks every tile).
+// A row's last group may be partial: only its needed tiles are computed, packed back and summed. The exp's SFPU init
+// runs once (the FPU bcast subtract between the tiles leaves its config, address mod and constants alone).
 template <uint32_t in0_cb, uint32_t rows, uint32_t scale_fp32>
 void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, const RowCols& cols_of, uint32_t real_rows) {
     CircularBuffer cb_in0(in0_cb);
@@ -259,8 +299,10 @@ void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, const RowC
     uint32_t dst_tiles = cols;
     uint32_t granularity = 1;
 #endif
+    binop_with_scalar_tile_init();
+    exp_tile_init<false, 0x3F800000, InputClamping::ClampToNegative>();
     for (uint32_t i = 0; i < rows; ++i) {
-        const uint32_t w = i < real_rows ? cols_of(i) : 0;
+        const uint32_t w = i < real_rows ? cols_of.need(i) : 0;
         for (uint32_t u = 0; u < granularity; u++) {
             if (u * dst_tiles >= w) {
                 cb_in0.pop_front(dst_tiles);
@@ -268,12 +310,11 @@ void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, const RowC
                 cb_in0.push_back(dst_tiles);
                 continue;
             }
+            const uint32_t n = (w - u * dst_tiles < dst_tiles) ? w - u * dst_tiles : dst_tiles;
             tile_regs_acquire();
-            for (uint32_t j = 0; j < dst_tiles; ++j) {
+            for (uint32_t j = 0; j < n; ++j) {
                 sub_tiles_bcast_cols(in0_cb, in1_cb, j, i, j);
-                binop_with_scalar_tile_init();
                 mul_unary_tile(j, scale_fp32);
-                exp_tile_init<false, 0x3F800000, InputClamping::ClampToNegative>();
                 exp_tile<false, false, InputClamping::ClampToNegative, 32>(j, VectorMode::None);
             }
             tile_regs_commit();
@@ -281,7 +322,7 @@ void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, const RowC
             cb_in0.reserve_back(dst_tiles);
             tile_regs_wait();
             pack_reconfig_data_format(in0_cb);
-            for (uint32_t j = 0; j < dst_tiles; ++j) {
+            for (uint32_t j = 0; j < n; ++j) {
                 pack_tile(j, in0_cb);
             }
             cb_in0.push_back(dst_tiles);
@@ -289,7 +330,7 @@ void sub_exp_cols(uint32_t in1_cb, uint32_t reduce_cb, uint32_t cols, const RowC
             if (u > 0) {
                 PACK((llk_pack_reconfig_l1_acc(1)));
             }
-            for (uint32_t j = 0; j < dst_tiles; ++j) {
+            for (uint32_t j = 0; j < n; ++j) {
                 pack_tile<true>(j, reduce_cb, i);
                 if (u == 0 && j == 0) {
                     PACK((llk_pack_reconfig_l1_acc(1)));
@@ -329,7 +370,7 @@ ALWI void matmul_qk_rows(
     cb_out.reserve_back(M * N);
     for (uint32_t m0 = 0; m0 < real_rows; m0 += subblock_h) {
         cb_in0.wait_front(in0_wait_tiles);
-        const uint32_t cols = cols_of(m0 + subblock_h - 1);
+        const uint32_t cols = cols_of.qk(m0 + subblock_h - 1);
         uint32_t in1_index_offset = 0;
         for (uint32_t n0 = 0; n0 < cols; n0 += subblock_w) {
             tile_regs_acquire();
@@ -389,7 +430,7 @@ ALWI void matmul_pv_rows(
     cb_out.reserve_back(M * N);
     for (uint32_t m0 = 0; m0 < real_rows; m0 += subblock_h) {
         cb_in0.wait_front(in0_wait_tiles);
-        const uint32_t k_count = cols_of(m0 + subblock_h - 1);
+        const uint32_t k_count = cols_of.need(m0 + subblock_h - 1);
         uint32_t in1_index_offset = 0;
         for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; ++in1_subblock) {
             tile_regs_acquire();
@@ -467,20 +508,13 @@ void causal_one_chunk(
     CircularBuffer cb_q_in_obj(cb_q_in);
     CircularBuffer cb_qk_im_obj(cb_qk_im);
     constexpr uint32_t dst_size = compute_kernel_lib::DEST_AUTO_LIMIT;
-#ifdef SUB_EXP_GRANULARITY
-    constexpr uint32_t exp_group = (Sk_chunk_t < SUB_EXP_GRANULARITY) ? Sk_chunk_t : SUB_EXP_GRANULARITY;
-#else
-    constexpr uint32_t exp_group = Sk_chunk_t;
-#endif
-    // column rounding: whole QK subblocks and whole exp groups
-    const uint32_t round = (exp_group % qk_subblock_w == 0)   ? exp_group
-                           : (qk_subblock_w % exp_group == 0) ? qk_subblock_w
-                                                              : qk_subblock_w * exp_group;
+    // QK column rounding: whole QK subblocks (the exp groups may end partial)
+    const uint32_t round = qk_subblock_w;
     for (uint32_t q_iter = iter_q_start; q_iter < iter_q_end; ++q_iter) {
         const uint32_t linear_q_chunk = local_q_start + (q_iter - iter_q_start);
         const uint32_t q_chunk = remap_q_index(linear_q_chunk, q_num_chunks, use_zigzag_balancing) % q_num_chunks;
         const uint32_t q_start_tile = q_chunk * Sq_chunk_t;
-        const RowCols cols_of{q_start_tile, valid_Skt, round, Sk_chunk_t};
+        const RowCols cols_of{q_start_tile, valid_Skt, round, Sk_chunk_t, out_subblock_h};
         // the Q tile rows this chunk holds of the prompt (past them: padding rows the writer never stores)
         uint32_t rr = q_start_tile < valid_Sqt ? valid_Sqt - q_start_tile : 0;
         if (rr > Sq_chunk_t || rr == 0 || rr % qk_subblock_h != 0 || rr % out_subblock_h != 0) {

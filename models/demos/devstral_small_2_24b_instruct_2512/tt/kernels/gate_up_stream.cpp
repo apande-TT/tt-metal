@@ -66,6 +66,23 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(sx, sy, get_semaphore(sem_ready)), 1);
     }
 
+#ifdef GU_HEADS
+    // GU_HEADS (tt/down_decode.py StreamDownDecode heads=True, HEADS_ON_STREAM): this RISC also assembles half of one
+    // x tile -- 16 rows of the decode head concat, row b = row h of SDPA-decode's input tile b * DT + d for x tile
+    // q = h * DT + d -- while its first weight push is in flight, writes it into the sender's x CB (the same L1 address
+    // on every core of the program) and counts on the sender's gather semaphore (gate_up_sender.cpp X_GATHER).
+    // Runtime args GU_RTA + 6, 7: SDPA's output, job = 2 q + half (0xFFFFFFFF: none).
+    constexpr uint32_t HB = o_args.next_compile_time_args_offset();
+    constexpr uint32_t H_DT = get_compile_time_arg_val(HB + 0);    // tiles across a head
+    constexpr uint32_t H_B = get_compile_time_arg_val(HB + 1);     // batch rows
+    constexpr uint32_t H_CB = get_compile_time_arg_val(HB + 2);    // scratch (one face pair)
+    constexpr uint32_t H_SEM = get_compile_time_arg_val(HB + 3);   // the sender's gather count
+    constexpr auto h_args = TensorAccessorArgs<HB + 4>();
+    const auto h_in = TensorAccessor(h_args, get_arg_val<uint32_t>(GU_RTA + 6));
+    const uint32_t h_job = get_arg_val<uint32_t>(GU_RTA + 7);
+    constexpr uint32_t H_ROW = 32, H_FACE = 512;
+#endif
+
     uint32_t push = 0;
     for (uint32_t k0 = 0; k0 < Kt / GU_PSTEP; k0 += RB, ++push) {
         if (!have_x) {
@@ -80,7 +97,33 @@ void kernel_main() {
         cb_reserve_back(cb_w, T);
         noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), T * w_tile);
         page += T * NB * GU_PSTEP;
+#ifdef GU_HEADS
+        const bool h_now = push == 0 && h_job != 0xFFFFFFFF;
+        const uint32_t h_q = h_job / 2, h_half = h_job % 2;
+        const uint32_t h_scratch = get_write_ptr(H_CB);
+        if (h_now) {
+            const uint32_t h = h_q / H_DT, d = h_q % H_DT;
+            const uint32_t src_off = (h / 16) * 2 * H_FACE + (h % 16) * H_ROW;  // head h's face rows in its tile
+            const uint32_t b0 = 16 * h_half, b1 = (b0 + 16 < H_B) ? b0 + 16 : H_B;
+            for (uint32_t b = b0; b < b1; ++b) {
+                const uint64_t src = h_in.get_noc_addr(b * H_DT + d, src_off);
+                const uint32_t dst = h_scratch + (b - b0) * H_ROW;
+                noc_async_read(src, dst, H_ROW);
+                noc_async_read(src + H_FACE, dst + H_FACE, H_ROW);
+            }
+        }
+#endif
         noc_async_read_barrier();
+#ifdef GU_HEADS
+        if (h_now) {
+            const uint32_t sx = get_arg_val<uint32_t>(GU_RTA + 3), sy = get_arg_val<uint32_t>(GU_RTA + 4);
+            const uint32_t off = h_q * 4 * H_FACE + h_half * 2 * H_FACE;
+            noc_async_write(h_scratch, get_noc_addr(sx, sy, get_write_ptr(cb_x) + off), 2 * H_FACE);
+            noc_async_write_barrier();  // the half tile has landed before it is counted
+            noc_semaphore_inc(get_noc_addr(sx, sy, get_semaphore(H_SEM)), 1);
+            noc_async_atomic_barrier();
+        }
+#endif
         cb_push_back(cb_w, T);
     }
 

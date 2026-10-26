@@ -86,7 +86,7 @@ class TtPixtralRMSNorm:
         shape = tuple(x.shape)
         if len(shape) != 4:
             x = ttnn.reshape(x, (1,) * (4 - len(shape)) + shape)
-        if memory_config is not None and self.gamma is None:
+        if memory_config is not None:
             impl = self._impl
             out = ttnn.rms_norm(
                 x,
@@ -95,6 +95,9 @@ class TtPixtralRMSNorm:
                 memory_config=memory_config,
                 compute_kernel_config=impl.compute_kernel_config_hifi2,
             )
+            if self.gamma is not None:  # the separate gamma multiply into the same placement, the norm output freed
+                n, out = out, ttnn.multiply(out, self.gamma, memory_config=memory_config)
+                ttnn.deallocate(n)
             return ttnn.reshape(out, shape)
         out = self._impl(x, mode="prefill")
         if self.gamma is not None:

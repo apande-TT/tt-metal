@@ -31,12 +31,14 @@ Mesh: TP = 4 (1x4). The stubs shard their own weights (ShardTensorToMesh) and al
 internally; embeddings, norms and rotary tables are replicated. Batch B (default 32, $TT_PERF_BATCH) is a
 separate leading axis -- never sharded.
 """
+
 from __future__ import annotations
 
 import functools
 import json
 import math
 import os
+import struct
 import time
 from pathlib import Path
 
@@ -237,6 +239,23 @@ PLANNED_TP = 4
 #                     The L1 casts of both norm outputs to bf16 run as tt/local_cast.py (LOCAL_CAST: every core casts
 #                     the pages of its own L1 bank with ttnn.typecast's compute, rounding loop unrolled; bit-identical):
 #                     10.3 -> 7.2 us a cast, 48 an encode.
+#                     ... and then each norm + cast as ONE program (attention.NORM_CAST, tt/norm_cast.py, kernels/
+#                     norm_cast_*.cpp): the stock interleaved rms_norm compute (layernorm.cpp RMSNORM + FUSE_GAMMA, its
+#                     compute_kernel_lib calls on classic CBs of the same formats, the reader's truncated-bf16 eps /
+#                     row-0 scaler / unit gamma tiles) with typecast's rounding before a bf16 pack: 24 + 7.2 -> 29.5 us,
+#                     two programs fewer a layer, trace encode 21.44 -> 21.27 ms, bit-identical.
+#   vision head split + RoPE products keep the multiply's own sign of an exact zero (tt/heads_rope.py ROPE_SIGNED_ZEROS:
+#                     no mul_binary_tile +0 fix-up, a third of each product's SFPU instructions; finite operands, so
+#                     only zeros' signs can differ and SDPA's sums cannot see them): 43.0 -> 33.6 us a layer, trace
+#                     encode 21.27 -> 21.00 ms, PCC unchanged.
+#   pixtral_vision_model: the patch embeddings, ln_pre (norm + gamma multiply) and the first layer's fp32 residual cast
+#                     in L1 (PRE_L1_BYTES; each freed by its reader, the bf16 copy before the layers), not DRAM: ln_pre
+#                     28.8 + 32.4 -> 18.6 + 17.1 us. (The projector's unfold / merge outputs in L1: -3 us, not kept.)
+#   tt/norm_cast.py GAMMA_PASS False: the vision norms' unit-gamma multiply (it only truncates x * r to the SrcA bits
+#                     the multiplier reads) folded into the bf16 rounding step, no fp32 x * r round trip.
+#   tt/sdpa_prefill.py EXP_NO_OVF / SCALE_IMM: the softmax exponent's SFPU pass (SFPU-issue-bound: 59 of the vision
+#                     SDPA's 108 us) without the overflow arm softmax inputs never reach, the bf16-exact vision scale as
+#                     an immediate and two polynomial constants held in the freed LREGs: 31 -> 25 instructions a row.
 #   ministral3_m_l_p many-row fused gate/up (text prefill + vision): tt/minimal_mm.py, minimal_matmul's own program
 #                     with silu * up as ONE SFPU pass (kernels/mm_compute.cpp), bit-identical.
 #   ministral3_decoder_layer prefill: the residual stays hidden-sharded over the TP mesh: the fp32 adds and the norms
@@ -259,7 +278,8 @@ PLANNED_TP = 4
 #                     (tt/heads_rope.py: per tile, x * cos + partner * signed sin, replaying ttnn.multiply's SFPU and
 #                     ttnn.add's FPU bf16 ops -- bit-identical to the rotate-half chain, no matmul) instead of
 #                     nlp_create_qkv_heads + a rotate-half matmul / multiply / multiply / add per tensor. The vision
-#                     SDPA runs 128-row query chunks (one 256-row key chunk).
+#                     SDPA runs 64-row query chunks (one 256-row key chunk): 512 chunks over 110 cores, at most 5 x 64
+#                     rows a core instead of 3 x 128 (pixtral_attention.Q_CHUNKS).
 #   ministral3_m_l_p prefill fused gate/up: M blocks that tile each core's M range with the least padding (416-row
 #                     prompt: 7 tiles, not 8) and 1 x 4 subblocks -- the SwiGLU epilogue no longer runs padded rows.
 #                     The long-prompt QKV / o_proj take N blocks of each core's narrow N range (QKV: 5 tiles, 4 x 1
@@ -269,6 +289,12 @@ PLANNED_TP = 4
 #                     a two-block fp32 intermediate and every writer (injectors too, kernels/mm_dm_in*.cpp) deferring
 #                     its block write to K step K_blocks / 2 or later: 416-row gate/up 9.57 -> 9.21 ms/layer,
 #                     bit-identical (DRAM in / out only: the vision MLP's L1 tensors leave no room for the second block).
+#                     ... the vision MLP too (ministral3_m_l_p.GATE_UP_L1_OVERLAP_N, minimal_mm n_seg=): its 14 + 12-tile
+#                     N blocks split into 8 + 6 | 8 + 4 (two fp32 intermediates in 567 -> 778 KB of CBs, under the old
+#                     870), the readers walking K forward over the first segment and backward over the second -- each
+#                     tile's K-block order as before (kernels N_SEG_TILES); epilogues drained by K step 3 of 4
+#                     (EPI_DONE_FRAC 0.75; 416-row text gate/up 9205 -> 9070 us): vision gate/up 260.7 -> 229 us a
+#                     layer, trace encode 22.19 -> 21.44 ms, bit-identical.
 #   minimal_mm grid split by per-core work (tt/minimal_mm.py transposed): M along x / N along y or the other way round,
 #                     whichever hands each core >= 5% fewer output tiles (stock: M > N). Flips only the vision gate/up
 #                     (168 -> 156 tiles a core), o_proj and the patch projection (24 -> 21); the stubs size their blocks to
@@ -326,6 +352,127 @@ PLANNED_TP = 4
 #   decode down fold: each partial tile goes straight into its link worker's send buffer and the worker sends every
 #                     shard once its tiles are in (StreamDownDecode.DIRECT_SEND, kernels/ar_send_shards.cpp), not a
 #                     wave's shards read back after the whole wave.
+#   decode gate / up SwiGLU epilogue as ONE fused SFPU pass a pair (kernels/gate_up_compute.cpp gu_silu_mul, the
+#                     prefill's hoisted silu * up): the epilogue is the program's tail after the last weight push
+#                     (bf8 math - unpack 3.0 -> 2.5 us); trace decode 13.022 -> 12.990 ms, bit-identical.
+#   decode vocab top-k as a 4-ary tree (VocabTopK.TREE3): 64 locals -> 16 -> 4 -> final, 3 + 3 + 3 serial tile merges
+#                     instead of 7 + 7 (85 cores): 54.3 -> 51.2 us a call, trace decode 12.990 -> 12.988 ms; the exact
+#                     top-32 of [value | position] keys, bit-identical.
+#   decode sampler's cross-device top-k as ONE gather (VocabTopK.PACKED_OUT + MergeTopK.packed): the final core emits
+#                     its merged packed key tile raw (kernels/topk_final_packed.cpp), a single fp32 all_gather moves
+#                     it, and MergeTopK splits the keys in DEST (stock topk_defuse sweep, INT32 index store) + ORs in
+#                     each device's vocab offset before its merge -- no position gather, typecast or offset add;
+#                     trace decode 12.986 -> 12.977 ms, bit-identical.
+#   prefill SDPA reads only each causal q chunk's K / V rows up to its diagonal (tt/sdpa_prefill.py CAUSAL_READ_SKIP,
+#                     kernels/sdpa_reader.cpp: the stock reader + SDPA_CAUSAL_READ_SKIP; the compute already skipped
+#                     those tiles): 416-row SDPA 529 -> 424 us a call, bit-identical.
+#   prefill final norm on the hidden shards (ministral3_model.SHARDED_FINAL_NORM, ministral3_r_m_s_norm
+#                     _sharded_prefill): stats all_gather + shard norm * the device's gamma columns + ONE gather of the
+#                     bf16 result, instead of gathering the residual and norming + gamma-multiplying the full width on
+#                     every device (4x redundant): device_ms 125.45 -> 122.95.
+#   prefill norm scale multiply natively HEIGHT-SHARDED (ministral3_decoder_layer.PREFILL_NORM_L1_COPY): the residual
+#                     add (add_stats.apply_l1) also writes its fp32 sum into a height-sharded L1 copy (each core its own
+#                     whole tile rows, one local NOC write a block), the norm multiplies from it into bf16 shards for the
+#                     hidden all_gather and frees it: multiply 178 -> 106 us a call, trace prefill 1132.4 -> 1124.6 ms.
+#   prefill SDPA causal rows at EXACT widths (kernels/sdpa_compute.cpp RowCols.need): mask, row max, exp / row sum and
+#                     P @ V stop at the diagonal of the row's P @ V subblock instead of rounding up to whole exp groups
+#                     (partial last exp group), the exp's SFPU init runs once a pass: SDPA 416 424 -> 418 us, 128
+#                     96 -> 86 us, bit-identical.
+#   decode sampler MergeTopK on TWO cores (MergeTopK.SPLIT): the leaf merges the second pair of packed key tiles and
+#                     copies its winner into the root's buffers while the root merges the first pair, then the root
+#                     merges the two winners: 10.0 -> ~7.5 us a token, bit-identical.
+#   decode sampler DrawTail on TWO cores, 8 rows a RISC (DrawTail.SPLIT, kernels/draw_tail.cpp SPLIT8): 64-B aligned
+#                     row segments in and out, each core's 16 ids written once its two RISCs have them: 8.2 -> ~4.6 us a
+#                     token, bit-identical.
+#   prefill norm stats and their all_gather in L1 (add_stats.STATS_L1; the norm frees both right after the sum):
+#                     416-row stats gather 70-76 -> 57-64 us a call, bit-identical.
+#   decode input norm as a generic_op replica of rms_norm's sharded kernel (tt/norm_decode.py, kernels/norm_rep_*.cpp:
+#                     same LLK calls, scalers and two-stage reduce) that packs the bf16 TRUNCATION of the normed row --
+#                     what the HiFi2 QKV multiplies of an fp32 in0 anyway -- so the QKV reads half the activation bytes:
+#                     norm 5.71 -> 6.55 us (factor multicast from the root, MCAST_FACTOR; one arrival semaphore per
+#                     gathered slot so the reduces overlap the arrivals, SLOT_SEMS), QKV 24.2 -> ~21.8 us; trace decode
+#                     12.98 -> 12.95 ms, bit-identical.
+#   decode K / V append as ONE generic_op (ministral3_attention.DECODE_KV_APPEND, tt/kv_append.py,
+#                     kernels/kv_append_*.cpp) instead of paged_fused_update_cache: the new rows packed to bfloat8_b by
+#                     the packer (a bfp8 face row depends only on its 16 values) and spliced straight into the cache
+#                     tiles -- exponent section read, the row's two 16-byte exponent groups and two 16-byte mantissa
+#                     face rows written back, one RISC a kv head -- no untilize / patch / re-tilize of the tile row:
+#                     6.3 -> ~3.9 us a layer, trace decode 12.95 -> 12.77 ms, bit-identical.
+#   prefill norm's per-row factor resharded into the L1 copy's height shards (ministral3_decoder_layer.
+#                     PREFILL_NORM_FACTOR_SHARDED_ROWS, <= 64-row shards): the native sharded scale multiply reads no
+#                     DRAM: 128-row prompt 54.9 -> 42.7 + 1.9 us a call (at 128-row shards it is slower, so not
+#                     there), bit-identical.
+#   prefill norm scale as a generic_op replica of ttnn.multiply's SFPU column-broadcast program
+#                     (ministral3_decoder_layer.PREFILL_NORM_SCALE_CPP, tt/norm_scale.py, kernels/norm_scale_*.cpp):
+#                     the same unpack-to-dest copies, mul_binary_tile and fp32 -> bf16 typecast_tile, 3 x tiles a DEST
+#                     acquire instead of 1, factor tiles read straight from r, and the multiply + bf16 rounding in ONE
+#                     SFPU pass (FUSED_RNE: the typecast's integer RNE applied to the product in a register): 416-row
+#                     prompt 109.8 -> 71.6 us a call, 128-row 44.6 -> 35.2 us, bit-identical.
+#   prefill q / k RoPE outputs in L1 for short prompts (ministral3_attention.PREFILL_ROPE_OUT_L1_BYTES, q <= 96 KB a
+#                     core), read there by the cache fill and SDPA and freed after SDPA: 128-row prompt q RoPE 39.9 ->
+#                     23.1 us, k 13.3 -> 8.7, SDPA 86.0 -> 67.1 us a layer, bit-identical.
+#   prefill norm stats gathered COMPACTED (add_stats.COMPACT_STATS, tt/stats_expand.py): each stats tile's column 0
+#                     (its 32 row sums; the rest is zeros) written as one row of a compact tile, the all_gather moves
+#                     1/32 of the bytes and a DM program rebuilds the exact (..., S, 128) gathered tiles for the sum:
+#                     416 rows 96.5 -> 41.4 + 17.3 us, 128 rows 23.7 -> 8.3 + 9.4 us a call, bit-identical.
+#   prefill final norm's normed rows and gamma product in L1 for its all_gather (ministral3_r_m_s_norm.
+#                     FINAL_GAMMA_OUT_L1): 416 rows x * r 132 -> ~97 us, gamma multiply 205-240 -> ~121 us; 128 rows
+#                     ~49 -> 37 and 68.8 -> 39 us, bit-identical.
+#   prefill residual add + norm stats in ONE DEST pass (add_stats.ONE_PASS, kernels/add_stats_compute.cpp): h, its
+#                     writer copy and h^2 from the same DEST tiles (add_binary_tile, copy_dest_values, square_tile),
+#                     no row buffer of h packed and unpacked twice: 416-row adds ~2340 -> 2239 us a 2-layer slice,
+#                     128-row unchanged (memory bound), bit-identical.
+#   prefill norm row sums and factor r in L1 for the C++ scale (ministral3_decoder_layer.PREFILL_NORM_FACTOR_L1; ~16
+#                     KB a core, both freed once read): 416 rows sum 12 -> ~10.5 us, rsqrt chain 13 -> 6 us, scale 71
+#                     -> 69 us a norm; 128 rows rsqrt 4 -> 3, scale 35 -> 34 us, bit-identical.
+#   prefill norm rsqrt chain folded into the C++ scale (ministral3_decoder_layer.PREFILL_NORM_CHAIN_IN_SCALE,
+#                     norm_scale.scale chain=): each core turns its row sums into factors first (x 1/N, + eps, rsqrt:
+#                     the unary_chain's SFPU calls, on the column-0 faces only), one program fewer a norm: 416 rows
+#                     scale + rsqrt 69 + 6 -> 71 us, 128 rows 34 + 3 -> 36 us, bit-identical.
+#   ... and the compact stats' expand + row sum folded in as well (ministral3_decoder_layer.PREFILL_NORM_FUSED_SUM,
+#                     norm_scale.scale nd=, FUSED_SUM): the reader drops each device's gathered compact row into column
+#                     0 of a tile, the compute folds them as ttnn.sum's accurate SFPU reduce does (copy, add_binary_tile
+#                     in device order) before the rsqrt chain: 416 rows expand + sum + scale 16 + 10 + 71 -> 78 us, 128
+#                     rows 9 + 5 + 36 -> 39 us, two programs fewer a norm, bit-identical.
+#   ... with the scale's multiply + RNE run a whole 3-tile chunk per SFPU call at compile-time DEST offsets
+#                     (norm_scale.FUSED_RNE_N: the broadcast row loaded once for 3 tiles, one sfpu start / done a
+#                     chunk; the op is SFPU-bound, 33 us without the multiply): 416 rows 78 -> 71 us, 128 rows 39 ->
+#                     36 us a norm, bit-identical.
+#   ... in 7-tile chunks on a full-sync fp32 DEST (norm_scale.FULL_SYNC_CHUNK7: the factor tile unpacked once per 7
+#                     x tiles instead of per 3): 416 rows 71 -> 68.5 us, 128 rows 36 -> 34 us a norm, bit-identical.
+#   prefill final norm's gamma multiply as tt/gamma_mul.py (ministral3_r_m_s_norm.FINAL_GAMMA_CPP): binary_ng's SFPU
+#                     row-broadcast multiply re-read and re-broadcast gamma for every output tile, one tile a DEST
+#                     acquire; here each core owns 4 columns over a band of rows, broadcasts its 4 gamma tiles once
+#                     and multiplies a row's 4 tiles an acquire (same calls): 416 rows 121 -> 91 us, 128 rows 39 -> 33
+#                     us, bit-identical.
+#   prefill QKV written in the q / k / v head layouts (ministral3_attention.PREFILL_QKV_HEADS_OUT, minimal_mm heads_out).
+#   prefill final norm's gamma multiply on the FPU at HiFi4 (gamma_mul.FPU_MUL: exact products in fp32 DEST, packed to
+#                     bf16) instead of the SFPU: 91 -> 51 us at 416 rows, PCC unchanged.
+#   prompt K / V cast to the cache dtype on the fill's 64-core slab grid in L1 (ministral3_attention.PREFILL_KV_CAST_ON_SLABS).
+#   prefill logits kept as the lm_head vocab shards (PREFILL_LOGITS_SHARDED, VocabShards like decode's): no logits all_gather.
+#   decode K / V append reads each position from the step's gathered cos table in L1 (ministral3_attention.DECODE_KV_POS_L1).
+#   decode o_proj stream on 80 cores, 2 columns each (ministral3_attention StreamDownDecode SPREAD_CORES = 80): kernel
+#                     time unchanged, trace decode 12.757 -> 12.684 ms (the freed cores overlap its neighbours).
+#   decode head concat inside the o_proj stream program, 2 tiles a producer RISC on 8 cores (StreamDownDecode heads=True).
+#   ... gathered by the stream cores' RISCV_0 during their first push (StreamDownDecode.HEADS_ON_STREAM, GU_HEADS).
+#   fused gate/up N block 14 when it tiles a core's N range in fewer blocks than 12 (ministral3_m_l_p.GATE_UP_N14; vision MLP).
+#   decode input norm (its width shards feed the HiFi2 QKV) WITHOUT the all-ones weight
+#                     (ministral3_r_m_s_norm.DECODE_SHARDED_NO_WEIGHT): rms_norm's FUSE_GAMMA pass only truncated the
+#                     fp32 output to TF32, below what the HiFi2 QKV multiplies of in0: norm 6.28 -> 5.71 us a layer,
+#                     QKV output bit-identical.
+#   short-prompt MLP down on the full grid (ministral3_m_l_p.SHORT_DOWN_FULL_GRID): blocks cut to each core's exact
+#                     13 x 15-tile range (M blocks of 7, 1 x 3 subblocks) over 110 cores instead of whole 16 x 16-tile
+#                     blocks over the 80-core grid.
+#   short-prompt MLP down with its operands swapped (ministral3_m_l_p.SHORT_DOWN_SWAPPED, tt/minimal_mm.py swapped=):
+#                     (w^T @ x^T)^T on a bf16 copy of the bf8 weight, transposed on the host (exact), so the weight sits
+#                     in srcB, whose one 7-bit multiplier pass holds a bf8 significand: HiFi2 forms HiFi4's products
+#                     (srcA's two 5-bit passes cover bf16). x is read in transposed tile positions and unpacked
+#                     transposed, each output tile packed transposed (kernels/mm_dataflow_common.hpp, mm_compute.cpp).
+#                     128-row down 2550 -> 1414 us a call; vs the HiFi4 program PCC 1.000000000, max |diff| 1.2e-4,
+#                     85% of elements bit-identical, mean |err| vs a fp32 product 1.1749e-6 (HiFi4: 1.1766e-6).
+#                     The long (416-row) prompt's down too on the last thirty layers (LONG_DOWN_SWAPPED_LAYERS 10-39):
+#                     the image prompt's chaotic rows amplify a perturbation only through the layers after it.
+#   prefill gate / up in 16-deep K blocks on layers 20-39 (minimal_mm.SWIGLU_DEEP_K, PREFILL_GU_DEEP_K_LAYERS).
 
 
 def kv_capacity_for(tp):
@@ -348,6 +495,9 @@ TRACE_REGION_SIZE = 300_000_000
 
 _TOPK_KERNELS = "ttnn/cpp/ttnn/operations/reduction/topk/device/kernels"
 _TOPK_MID_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_mid.cpp")
+_TOPK_MERGE4_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4.cpp")
+_TOPK_MERGE4_DM_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_merge4_dm.cpp")
+_TOPK_FINAL_PACKED_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "topk_final_packed.cpp")
 _NOISE_LOOKUP_KERNEL = str(Path(__file__).resolve().parent / "kernels" / "noise_lookup.cpp")
 
 
@@ -457,12 +607,15 @@ class DrawTail:
     (1, 1, B, 1) uint32 draw."""
 
     CB = 0
+    # grid try (run 8): two cores, one a 16-row half, each RISC 8 rows of it (kernels/draw_tail.cpp SPLIT8)
+    SPLIT = True
 
     def __init__(self, device, batch, pad_token_id, eos_token_id):
         assert batch == ttnn.TILE_SIZE, batch
         self.device, self.batch = device, batch
         self.pad, self.eos = int(pad_token_id), int(eos_token_id)
         self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        self.cores2 = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))])
 
     @staticmethod
     def supports(scores, ids):
@@ -488,6 +641,25 @@ class DrawTail:
             acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         size = 12 * 1024 + 128  # per RISC: scores / ids face pairs, the unfinished and drawn faces; the id row
         fmt = ttnn.CBFormatDescriptor(buffer_index=self.CB, data_format=ttnn.uint32, page_size=size)
+        if self.SPLIT:
+            cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.cores2, format_descriptors=[fmt])]
+            rt = [t.buffer_address() for t in io]
+            kernels = [
+                ttnn.KernelDescriptor(
+                    kernel_source=_DRAW_TAIL_KERNEL,
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(half, 0), ttnn.CoreCoord(half, 0))]),
+                    compile_time_args=[half, self.pad, self.eos, self.CB] + acc,
+                    runtime_args=[((half, 0), rt)],
+                    config=cfg,
+                    defines=[("SPLIT8", "1"), ("SPLIT8_SUB", str(sub)), ("SPLIT8_SEM", "0")],
+                )
+                for half in (0, 1)
+                for sub, cfg in ((0, ttnn.ReaderConfigDescriptor()), (1, ttnn.WriterConfigDescriptor()))
+            ]
+            sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=self.cores2, initial_value=0)]
+            ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+            return drawn
         cbs = [ttnn.CBDescriptor(total_size=size, core_ranges=self.core, format_descriptors=[fmt])]
         kernels = [
             ttnn.KernelDescriptor(
@@ -527,6 +699,17 @@ class VocabTopK:
     # back into the value and position outputs. Equal values then rank by position (the stock stable order).
     FUSED = True
     PACKED, PACKED_BYTES = ttnn.float32, 4096
+    # TREE3 (fused keys): a 4-ary tree instead of 8 x 8 -- each column's 8 local cores report in two groups of 4 to
+    # 16 first-level middle cores (rows 8 and 9, columns 0..7), those in groups of 4 (a row's columns 0..3 / 4..7) to 4
+    # second-level middle cores (column 8, rows 0..3), and the final core (9, 0) merges those 4: 3 + 3 + 3 serial tile
+    # merges instead of 7 + 7, one more hand-off. Directions alternate across the siblings of every level, as the
+    # 8 x 8 tree's do, so each merge still sees bitonic pairs.
+    TREE3 = True
+    FANIN = 4
+    # PACKED_OUT (TREE3, fused keys; packed()): the final core emits its merged packed key tile RAW (column layout,
+    # float32 pages; kernels/topk_final_packed.cpp) instead of splitting it into value + position tiles, so ONE
+    # tensor crosses the TP gather and MergeTopK.packed splits the keys itself.
+    PACKED_OUT = True
 
     def __init__(self, device, k):
         assert k == 32, "the stock kernels' K=32 layout (one candidate tile per core) is assumed"
@@ -550,6 +733,230 @@ class VocabTopK:
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
         )
 
+    def _tree3(self, x, vals, ids, ht, wt, wt_local, packed_out=False):
+        """TREE3 (fused keys): locals (gx, ly) -> first-level middle (gx, 8 + h) for ly in 4h..4h+3 -> second-level
+        middle (8, j) for the first-level row 8 + j // 2, columns 4 (j % 2)..+3 -> final (9, 0) <- (8, 0..3). The same
+        stock local / final kernels and kernels/topk_mid.cpp, wired by the same gather protocol (semaphores 0/1, 2/3,
+        4/5 for the three hand-offs; a middle core receives on one pair and sends on the next)."""
+        g, n, k, kt, f = self.GROUPS, self.LOCALS, self.k, self.kt, self.FANIN
+        IN, IN_IDX, LT_VAL, LT_IDX, G_VAL, G_IDX, M_VAL, M_IDX, OUT_VAL, OUT_IDX = range(10)
+        P, PB = self.PACKED, self.PACKED_BYTES
+        rng = lambda x0, y0, x1, y1: ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1))
+        one = lambda c: ttnn.CoreRangeSet([rng(*c, *c)])
+        phys = self.phys
+        local_set = ttnn.CoreRangeSet([rng(0, 0, g - 1, n - 1)])
+        mid1_set = ttnn.CoreRangeSet([rng(0, n, g - 1, n + 1)])
+        mid2 = [(g, j) for j in range(4)]
+        mid2_set = ttnn.CoreRangeSet([rng(g, 0, g, 3)])
+        final = (g + 1, 0)
+        final_set = one(final)
+        mids = mid1_set.merge(mid2_set)
+        mid_final = mids.merge(final_set)
+        all_set = local_set.merge(mid_final)
+        sending = local_set.merge(mids)
+        # the gather buffers first on every core (written remotely at the sender's own address of them)
+        cbs = [
+            self._cb(G_VAL, f * kt, P, all_set, PB),
+            self._cb(G_IDX, f * kt, self.VAL, all_set),
+            self._cb(OUT_VAL, 2, P, sending, PB),
+            self._cb(OUT_VAL, 2, P, final_set, PB) if packed_out else self._cb(OUT_VAL, 2, self.VAL, final_set),
+            self._cb(OUT_IDX, 2, self.IDX, all_set),
+            self._cb(IN, 4, self.VAL, local_set),
+            self._cb(IN_IDX, 4, self.IDX, local_set),
+            self._cb(LT_VAL, wt_local, P, local_set, PB),
+            self._cb(M_VAL, f * kt, P, mid_final, PB),
+            self._cb(M_IDX, f * kt, self.IDX, mid_final),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_set, initial_value=0) for i in range(6)]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True
+        modes = [ttnn.UnpackToDestMode.Default] * 64
+        for i in (LT_VAL, G_VAL, M_VAL):
+            modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+        compute_cfg.unpack_to_dest_mode = modes
+        fdefs = [("TOPK_FUSED_STABLE_KEYS", "1")]
+        logk = int(math.log2(k))
+        sort_ct = lambda width_tiles, a, b, c, d: [a, b, c, d, OUT_VAL, OUT_IDX, ht, width_tiles, k, kt, logk]
+        kern = lambda src, cores, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+            **kw,
+        )
+        locals_ = [(gx, ly) for gx in range(g) for ly in range(n)]  # global local index = gx * n + ly
+        logf = int(math.log2(f * kt))
+        mid_ct = sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1]
+        kernels = [
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_create_index_local_topk.cpp",
+                local_set,
+                [IN, IN_IDX, ht, wt_local, wt] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args()),
+                [((cx, cy), [x.buffer_address(), 0, i * wt_local, 0]) for i, (cx, cy) in enumerate(locals_)],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("GENERATE_INDICES", "1")],
+            ),
+            kern(
+                f"{_TOPK_KERNELS}/compute/topk_local.cpp",
+                local_set,
+                sort_ct(wt_local, IN, IN_IDX, LT_VAL, LT_IDX) + [int(math.log2(wt_local)), 1, 1, 1, 1],
+                [((cx, cy), [i % 2]) for i, (cx, cy) in enumerate(locals_)],
+                compute_cfg,
+            ),
+            # both middle levels: a middle core's direction alternates across its siblings (column within its group of
+            # 4 for the first level, j for the second)
+            kern(
+                _TOPK_MID_KERNEL,
+                mids,
+                mid_ct,
+                [((gx, n + h), [gx % 2]) for h in range(2) for gx in range(g)] + [(c, [c[1] % 2]) for c in mid2],
+                compute_cfg,
+                compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+            ),
+            # the second level sends to the final core (semaphores 4/5) ...
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                mid2_set,
+                [4, 5, phys(*final).x, phys(*final).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                [(c, [c[1]]) for c in mid2],
+                ttnn.WriterConfigDescriptor(),
+                defines=fdefs,
+            ),
+            # ... which releases them and collects their 4 results
+            kern(
+                f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                final_set,
+                [4, 5, phys(*mid2[0]).x, phys(*mid2[0]).y, phys(*mid2[-1]).x, phys(*mid2[-1]).y]
+                + [ht, f * kt, f, G_VAL, G_IDX],
+                [],
+                ttnn.ReaderConfigDescriptor(),
+                defines=fdefs,
+            ),
+        ]
+        if packed_out:  # the merged packed keys out raw, one tensor (vals)
+            acc = list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+            kernels += [
+                kern(
+                    _TOPK_FINAL_PACKED_KERNEL,
+                    final_set,
+                    sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
+                    [],
+                    compute_cfg,
+                    compiler_include_paths=[f"{_TOPK_KERNELS}/compute"],
+                ),
+                kern(
+                    _TOPK_MERGE4_DM_KERNEL,
+                    final_set,
+                    [OUT_VAL, OUT_IDX, ht * kt] + acc + acc,
+                    [(final, [vals.buffer_address(), vals.buffer_address()])],
+                    ttnn.WriterConfigDescriptor(),
+                    defines=[("MERGE_TOPK_WRITER", "1"), ("WRITE_ONE", "1")],
+                ),
+            ]
+        else:
+            kernels += [
+                kern(
+                    f"{_TOPK_KERNELS}/compute/topk_final.cpp",
+                    final_set,
+                    sort_ct(f * kt, G_VAL, G_IDX, M_VAL, M_IDX) + [logf, 1, 1, 1, 1],
+                    [],
+                    compute_cfg,
+                ),
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_final_topk.cpp",
+                    final_set,
+                    [OUT_VAL, OUT_IDX, ht, kt]
+                    + list(ttnn.TensorAccessorArgs(vals).get_compile_time_args())
+                    + list(ttnn.TensorAccessorArgs(ids).get_compile_time_args()),
+                    [(final, [vals.buffer_address(), ids.buffer_address()])],
+                    ttnn.WriterConfigDescriptor(),
+                ),
+            ]
+        for gx in range(g):
+            for h in range(2):
+                m1 = (gx, n + h)
+                top, bottom = phys(gx, f * h), phys(gx, f * h + f - 1)
+                group = ttnn.CoreRangeSet([rng(gx, f * h, gx, f * h + f - 1)])
+                # locals (gx, 4h..4h+3) -> first-level middle (gx, 8 + h), semaphores 0/1
+                kernels.append(
+                    kern(
+                        f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                        group,
+                        [0, 1, phys(*m1).x, phys(*m1).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                        [((gx, ly), [ly - f * h]) for ly in range(f * h, f * h + f)],
+                        ttnn.WriterConfigDescriptor(),
+                        defines=fdefs,
+                    )
+                )
+                kernels.append(
+                    kern(
+                        f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                        one(m1),
+                        [0, 1, top.x, top.y, bottom.x, bottom.y, ht, f * kt, f, G_VAL, G_IDX],
+                        [],
+                        ttnn.ReaderConfigDescriptor(),
+                        defines=fdefs,
+                    )
+                )
+        for j, m2 in enumerate(mid2):
+            row, c0 = n + j // 2, f * (j % 2)
+            # first-level middles (c0..c0+3, row) -> second-level middle (8, j), semaphores 2/3
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/writer_local_topk.cpp",
+                    ttnn.CoreRangeSet([rng(c0, row, c0 + f - 1, row)]),
+                    [2, 3, phys(*m2).x, phys(*m2).y, ht, k, kt, OUT_VAL, OUT_IDX, G_VAL, G_IDX],
+                    [((cx, row), [cx - c0]) for cx in range(c0, c0 + f)],
+                    ttnn.WriterConfigDescriptor(),
+                    defines=fdefs,
+                )
+            )
+            top, bottom = phys(c0, row), phys(c0 + f - 1, row)
+            kernels.append(
+                kern(
+                    f"{_TOPK_KERNELS}/dataflow/reader_final_topk.cpp",
+                    one(m2),
+                    [2, 3, top.x, top.y, bottom.x, bottom.y, ht, f * kt, f, G_VAL, G_IDX],
+                    [],
+                    ttnn.ReaderConfigDescriptor(),
+                    defines=fdefs,
+                )
+            )
+        io = [x, vals] if packed_out else [x, vals, ids]
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+
+    def supports_packed(self, x):
+        grid = self.device.compute_with_storage_grid_size()
+        width = int(x.shape[-1])
+        wt = width // 32
+        return (
+            self.PACKED_OUT
+            and self.TREE3
+            and self.FUSED
+            and self.GROUPS == self.LOCALS == 8
+            and grid.x >= 10
+            and grid.y >= 10
+            and int(x.shape[-2]) % 32 == 0
+            and width <= 65536
+            and wt % 64 == 0
+            and (wt // 64) >= 2
+            and (wt // 64) & (wt // 64 - 1) == 0
+        )
+
+    def packed(self, x):
+        """(1, 1, B, k) float32 tensor of the merged packed [bf16 value | u16 position'] keys, column layout (see
+        PACKED_OUT): the top k of each row, as the TREE3 program's final core holds them before its split."""
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        ht, wt = rows // 32, width // 32
+        wt_local = wt // (self.GROUPS * self.LOCALS)
+        keys = ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, rows, self.k)), self.PACKED, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        self._tree3(x, keys, None, ht, wt, wt_local, packed_out=True)
+        return keys
+
     def __call__(self, x):
         g, n, k, kt = self.GROUPS, self.LOCALS, self.k, self.kt
         rows, width = int(x.shape[-2]), int(x.shape[-1])
@@ -564,6 +971,10 @@ class VocabTopK:
         ids = ttnn.allocate_tensor_on_device(
             out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
         )
+        grid = self.device.compute_with_storage_grid_size()
+        if self.TREE3 and self.FUSED and g == n == 8 and grid.x >= 10 and grid.y >= 10:
+            self._tree3(x, vals, ids, ht, wt, wt_local)
+            return vals, ids
 
         # CB ids as in the stock factory. The gather buffers (c_4/c_5) are written remotely at the sender's own
         # address of them, so they go first on every core (same L1 address everywhere). A middle core reads that
@@ -711,6 +1122,239 @@ class VocabTopK:
             )
         ttnn.generic_op([x, vals, ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
         return vals, ids
+
+
+class MergeTopK:
+    """The top-K of the TP gathered VocabTopK lists, (1, 1, B, TP * K) bf16 values + uint32 vocab ids, as ONE
+    single-core program (generic_op, kernels/topk_merge4.cpp).
+
+    ttnn.topk sorts the gathered row from scratch (a full 64-wide bitonic sort per tile); each gathered tile is
+    already a sorted run, so the kernel runs only the merge half of the bitonic algorithm (rebuild / merge /
+    rebuild per pair of runs, then merge / rebuild of the two winners): 28 compare steps instead of 63.
+    kernels/topk_merge4_dm.cpp moves the tiles a pair at a time under one barrier (the stock reader waits out one
+    DRAM round trip per tile).
+
+    scale (the sampler's 1 / temperature): the values leave as fp32 scores value * scale, the sampler's typecast +
+    multiply folded into the program (the same SFPU fp32 multiply, bit-identical); None keeps bf16 values."""
+
+    VAL, IDX = ttnn.bfloat16, ttnn.uint32
+    IN, IN_IDX, MID_VAL, MID_IDX, FIN_VAL, FIN_IDX, OUT_VAL, OUT_IDX = range(8)
+    RMT_VAL, RMT_IDX = 8, 9
+    # grid try (run 8, packed keys): the two first-level pair merges on two cores at once -- the leaf core (0, 1)
+    # merges the second pair and copies its winner into the root's (0, 0) rmt buffers (semaphore 0); the root merges
+    # the first pair, then the two winners. Same steps on the same data: bit-identical.
+    SPLIT = True
+
+    def __init__(self, device, k, scale=None):
+        self.device, self.k = device, k
+        self.core = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))])
+        self.leaf = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 1), ttnn.CoreCoord(0, 1))])
+        self.both = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 1))])
+        self.root_phys = device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
+        self.scale_bits = 0 if scale is None else struct.unpack("<I", struct.pack("<f", scale))[0]
+        self.out_dtype = self.VAL if scale is None else ttnn.float32
+
+    def supports_packed(self, keys):
+        rows, width = int(keys.shape[-2]), int(keys.shape[-1])
+        sw = getattr(self, "shard_width", 0)
+        return (
+            self.k == 32
+            and rows == 32
+            and width == 128
+            and keys.dtype == ttnn.float32
+            and keys.layout == ttnn.TILE_LAYOUT
+            and sw > 0
+            and sw & (sw - 1) == 0
+            and sw <= 65536
+            and 3 * sw < 2**31
+        )
+
+    def packed(self, keys):
+        """The same top-K from the gathered VocabTopK.packed keys (1, 1, 32, TP * 32) float32 (column layout): the
+        kernel splits each key (value word + position, the device's vocab offset OR-ed in) right before the merge."""
+        wt = int(keys.shape[-1]) // 32
+        out_shape = ttnn.Shape((1, 1, int(keys.shape[-2]), self.k))
+        out_vals = ttnn.allocate_tensor_on_device(
+            out_shape, self.out_dtype, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        out_ids = ttnn.allocate_tensor_on_device(
+            out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        V, I = 2048, 4096
+        cbs = [
+            self._cb(self.IN, wt, self.IDX, I),  # raw 32-bit keys
+            self._cb(self.IN_IDX, 1, self.IDX, I),  # unused here
+            self._cb(self.MID_VAL, 2, self.VAL, V),
+            self._cb(self.MID_IDX, 2, self.IDX, I),
+            self._cb(self.FIN_VAL, 1, self.VAL, V),
+            self._cb(self.FIN_IDX, 1, self.IDX, I),
+            self._cb(self.OUT_VAL, 1, self.out_dtype, V if self.out_dtype == self.VAL else I),
+            self._cb(self.OUT_IDX, 1, self.IDX, I),
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True
+        kern = lambda src, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.core,
+            compile_time_args=ct,
+            runtime_args=[((0, 0), rt)],
+            config=cfg,
+            **kw,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        shard_log2 = int(self.shard_width).bit_length() - 1
+        if self.SPLIT and wt == 4:
+            return self._split_packed(keys, out_vals, out_ids, compute_cfg, acc, shard_log2)
+        kernels = [
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.IN, self.IN_IDX, wt] + acc(keys, keys),
+                [keys.buffer_address(), keys.buffer_address()],
+                ttnn.ReaderConfigDescriptor(),
+                defines=[("PACKED_IN", "1")],
+            ),
+            kern(
+                _TOPK_MERGE4_KERNEL,
+                list(range(8)) + [wt // 2, self.scale_bits, shard_log2],
+                [],
+                compute_cfg,
+                defines=[("PACKED_IN", "1")],
+            ),
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                [out_vals.buffer_address(), out_ids.buffer_address()],
+                ttnn.WriterConfigDescriptor(),
+                defines=[("MERGE_TOPK_WRITER", "1")],
+            ),
+        ]
+        ttnn.generic_op([keys, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out_vals, out_ids
+
+    def _split_packed(self, keys, out_vals, out_ids, compute_cfg, acc, shard_log2):
+        V, I = 2048, 4096
+        out_bytes = V if self.out_dtype == self.VAL else I
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=tiles * size,
+                core_ranges=self.both,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=size)],
+            )
+            for index, tiles, dtype, size in (
+                (self.IN, 2, self.IDX, I),  # one pair of raw 32-bit keys
+                (self.IN_IDX, 1, self.IDX, I),  # unused here
+                (self.MID_VAL, 1, self.VAL, V),
+                (self.MID_IDX, 1, self.IDX, I),
+                (self.FIN_VAL, 1, self.VAL, V),
+                (self.FIN_IDX, 1, self.IDX, I),
+                (self.OUT_VAL, 1, self.out_dtype, out_bytes),
+                (self.OUT_IDX, 1, self.IDX, I),
+                (self.RMT_VAL, 1, self.VAL, V),
+                (self.RMT_IDX, 1, self.IDX, I),
+            )
+        ]
+        kern = lambda src, cores, xy, ct, rt, cfg, defs: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ct,
+            runtime_args=[(xy, rt)],
+            config=cfg,
+            defines=defs,
+        )
+        rd = [self.IN, self.IN_IDX, 2] + acc(keys, keys)
+        ka = keys.buffer_address()
+        cct = list(range(8)) + [1, self.scale_bits, shard_log2]
+        pk = ("PACKED_IN", "1")
+        kernels = [
+            kern(_TOPK_MERGE4_DM_KERNEL, self.core, (0, 0), rd, [ka, ka, 0, 0], ttnn.ReaderConfigDescriptor(),
+                 [pk, ("MERGE_SPLIT", "1"), ("MERGE_ROOT", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.leaf, (0, 1), rd, [ka, ka, 2], ttnn.ReaderConfigDescriptor(),
+                 [pk, ("MERGE_SPLIT", "1")]),
+            kern(_TOPK_MERGE4_KERNEL, self.core, (0, 0), cct, [], compute_cfg, [pk, ("MERGE_ROOT", "1")]),
+            kern(_TOPK_MERGE4_KERNEL, self.leaf, (0, 1), cct, [], compute_cfg, [pk, ("MERGE_LEAF", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.core, (0, 0), [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                 [out_vals.buffer_address(), out_ids.buffer_address()], ttnn.WriterConfigDescriptor(),
+                 [("MERGE_TOPK_WRITER", "1")]),
+            kern(_TOPK_MERGE4_DM_KERNEL, self.leaf, (0, 1), [self.MID_VAL, self.MID_IDX, 1] + acc(out_vals, out_ids),
+                 [int(self.root_phys.x), int(self.root_phys.y), 0], ttnn.WriterConfigDescriptor(),
+                 [("MERGE_LEAF_SEND", "1")]),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=self.both, initial_value=0)]
+        ttnn.generic_op([keys, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=sems))
+        return out_vals, out_ids
+
+    def supports(self, vals, ids):
+        rows, width = int(vals.shape[-2]), int(vals.shape[-1])
+        return (
+            self.k == 32
+            and rows == 32
+            and width == 128
+            and vals.dtype == self.VAL
+            and ids.dtype == self.IDX
+            and tuple(ids.shape) == tuple(vals.shape)
+            and vals.layout == ids.layout == ttnn.TILE_LAYOUT
+        )
+
+    def _cb(self, index, tiles, dtype, tile_bytes):
+        return ttnn.CBDescriptor(
+            total_size=tiles * tile_bytes,
+            core_ranges=self.core,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=tile_bytes)],
+        )
+
+    def __call__(self, vals, ids):
+        wt = int(vals.shape[-1]) // 32
+        out_shape = ttnn.Shape((1, 1, int(vals.shape[-2]), self.k))
+        out_vals = ttnn.allocate_tensor_on_device(
+            out_shape, self.out_dtype, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        out_ids = ttnn.allocate_tensor_on_device(
+            out_shape, self.IDX, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        V, I = 2048, 4096  # bf16 / uint32 (and fp32) tile bytes
+        cbs = [
+            self._cb(self.IN, wt, self.VAL, V),
+            self._cb(self.IN_IDX, wt, self.IDX, I),
+            self._cb(self.MID_VAL, 2, self.VAL, V),
+            self._cb(self.MID_IDX, 2, self.IDX, I),
+            self._cb(self.FIN_VAL, 1, self.VAL, V),
+            self._cb(self.FIN_IDX, 1, self.IDX, I),
+            self._cb(self.OUT_VAL, 1, self.out_dtype, V if self.out_dtype == self.VAL else I),
+            self._cb(self.OUT_IDX, 1, self.IDX, I),
+        ]
+        compute_cfg = ttnn.ComputeConfigDescriptor()
+        compute_cfg.fp32_dest_acc_en = True  # uint32 ids ride the swaps in 32-bit DEST (as ttnn.topk)
+        kern = lambda src, ct, rt, cfg, **kw: ttnn.KernelDescriptor(
+            kernel_source=src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=self.core,
+            compile_time_args=ct,
+            runtime_args=[((0, 0), rt)],
+            config=cfg,
+            **kw,
+        )
+        acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+        kernels = [
+            # a pair of gathered tiles (values + ids) in flight under one barrier, as the compute consumes them
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.IN, self.IN_IDX, wt] + acc(vals, ids),
+                [vals.buffer_address(), ids.buffer_address()],
+                ttnn.ReaderConfigDescriptor(),
+            ),
+            kern(_TOPK_MERGE4_KERNEL, list(range(8)) + [wt // 2, self.scale_bits], [], compute_cfg),
+            kern(
+                _TOPK_MERGE4_DM_KERNEL,
+                [self.OUT_VAL, self.OUT_IDX, 1] + acc(out_vals, out_ids),
+                [out_vals.buffer_address(), out_ids.buffer_address()],
+                ttnn.WriterConfigDescriptor(),
+                defines=[("MERGE_TOPK_WRITER", "1")],
+            ),
+        ]
+        ttnn.generic_op([vals, ids, out_vals, out_ids], ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=[]))
+        return out_vals, out_ids
 
 
 # Component name -> the stub class(es) that implement it. Every class here is invoked by the forward chain
@@ -903,6 +1547,9 @@ class DevstralPipeline:
     # The vision tower and projector run data-parallel over the mesh (full weights on every device, each device its own
     # images, one all_gather of the projector output) instead of tensor-parallel (two fp32 all_reduces per layer).
     VISION_DATA_PARALLEL = True
+    # structural (run 8): prefill's logits kept as the lm_head vocab shards like decode's (VocabShards; the sampler
+    # reads lm_head.local) -- no full-row all_gather of the prompt's last-row logits
+    PREFILL_LOGITS_SHARDED = True
 
     def __init__(
         self,
@@ -988,6 +1635,9 @@ class DevstralPipeline:
             vocab = int(tcfg.vocab_size)
             self._shard_shape = (1, 1, self.batch, vocab // tp)
             self._vocab_topk = VocabTopK(device, self.top_k)
+            # the merge also emits the sampler's fp32 scores (value / temperature), see sample()
+            self._merge_topk = MergeTopK(device, self.top_k, scale=1.0 / self.temperature)
+            self._merge_topk.shard_width = vocab // tp  # VocabTopK.packed positions are within a device's shard
             base = (torch.arange(tp, dtype=torch.int32) * (vocab // tp)).repeat_interleave(self.top_k)
             self._shard_base = ttnn.from_torch(
                 base.reshape(1, 1, 1, -1).expand(1, 1, self.batch, -1).contiguous(),
@@ -1148,9 +1798,11 @@ class DevstralPipeline:
         # The last prompt row in two slices: first the tile-aligned 32-row block that holds it (a tiled slice), then
         # the row itself -- a direct unaligned slice untilized the whole (B, S, D) hidden state first.
         r = dev["real_len"] - 1
+        # (PREFILL_LOGITS_SHARDED) each device's vocab shard only, when the sampler takes the shard top-k path
+        gather = not (self.PREFILL_LOGITS_SHARDED and self._tp() > 1 and self._shard_base is not None)
         if self._last_row is not None and LastRow.supports(hidden):
             # every user's row R straight out of its tiles into the tiled LM-head input (tt/last_row.py)
-            return hidden, self.lm_head(self._last_row(hidden, r))
+            return hidden, self._prefill_logits(self._last_row(hidden, r), gather)
         r0 = r // ttnn.TILE_SIZE * ttnn.TILE_SIZE
         block = ttnn.slice(hidden, (0, r0, 0), (b, r0 + ttnn.TILE_SIZE, d))
         if "last_rows" in dev:
@@ -1161,8 +1813,17 @@ class DevstralPipeline:
             last = ttnn.embedding(dev["last_rows"], rows, layout=ttnn.TILE_LAYOUT)  # (1, B, D)
         else:
             last = ttnn.slice(block, (0, r - r0, 0), (b, r - r0 + 1, d))
-        logits = self.lm_head(ttnn.reshape(last, (1, 1, b, d)))
-        return hidden, logits
+        return hidden, self._prefill_logits(ttnn.reshape(last, (1, 1, b, d)), gather)
+
+    def _prefill_logits(self, x, gather):
+        """The lm_head of the prompt's last rows: gathered, or the vocab shards wrapped as VocabShards (sample() and
+        host_read take either)."""
+        logits = self.lm_head(x, gather=gather)
+        if gather:
+            return logits
+        if tuple(logits.shape) != self._shard_shape:  # (the sampler's shard path would not apply)
+            return ttnn.all_gather(logits, dim=3, num_links=1, topology=ttnn.Topology.Linear)
+        return VocabShards(logits)
 
     def sample(self, logits, state):
         """On-device seeded sampling (Gumbel-max over the top-K of logits / T), EOS bookkeeping, write-back.
@@ -1170,8 +1831,11 @@ class DevstralPipeline:
         Writes the next input ids into state["tok"] and the finished mask into state["unfinished"] IN PLACE and
         returns the (1, 1, B, 1) uint32 ids the model itself drew (before pad substitution)."""
         b, k, nb = self.batch, self.top_k, NOISE_BUCKETS
-        vals, idx = self._topk(logits)
-        scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
+        vals, idx = self._topk(logits.tensor if isinstance(logits, VocabShards) else logits)
+        if vals.dtype == ttnn.float32:  # MergeTopK already emitted the scores (value / temperature)
+            scores = vals
+        else:
+            scores = ttnn.multiply(ttnn.typecast(vals, ttnn.float32), 1.0 / self.temperature)
         if self._noise_lookup is not None:  # the candidates' noise in one program, straight from the table
             scores = ttnn.add(scores, self._noise_lookup(state["step"], state["noise"], idx))
         else:
@@ -1218,10 +1882,19 @@ class DevstralPipeline:
             return ttnn.topk(logits, k=k, dim=-1, largest=True, sorted=True)
         # Shard top-k (VocabTopK: 16-bit positions within the shard), gathered, then labelled with vocab ids: the
         # gathered block of device d holds positions in vocab [d * W, (d + 1) * W).
+        if self._vocab_topk.supports_packed(local) and int(local.shape[-1]) == self._merge_topk.shard_width:
+            # ONE gather: each device's packed [value | position] key tile (VocabTopK.packed); MergeTopK.packed splits
+            # the keys and adds the devices' vocab offsets itself (no id gather, typecast or offset add)
+            keys = ttnn.all_gather(self._vocab_topk.packed(local), dim=3, num_links=1, topology=ttnn.Topology.Linear)
+            if self._merge_topk.supports_packed(keys):
+                return self._merge_topk.packed(keys)
         vals, ids = self._vocab_topk(local)
         vals = ttnn.all_gather(vals, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.all_gather(ids, dim=3, num_links=1, topology=ttnn.Topology.Linear)
         ids = ttnn.add(ttnn.typecast(ids, ttnn.uint32), self._shard_base)
+        if self._merge_topk.supports(vals, ids):
+            # the gathered lists are sorted runs: merge them (MergeTopK) instead of sorting the row again
+            return self._merge_topk(vals, ids)
         return ttnn.topk(vals, k=k, dim=-1, largest=True, sorted=True, indices_tensor=ids)
 
     def decode_prefill(self, request):
@@ -1344,7 +2017,7 @@ class DevstralPipeline:
         dev = self._stage["prefill"]
         hidden, logits = self.forward_prefill(dev, self.embed_prompt(dev))
         self.sample(logits, dev["state"])
-        return logits
+        return logits.tensor if isinstance(logits, VocabShards) else logits
 
     def prefill_trace_items(self):
         """Prompt rows the text layers process in one call: B x the padded prompt length."""

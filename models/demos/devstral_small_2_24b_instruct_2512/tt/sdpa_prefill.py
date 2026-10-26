@@ -24,6 +24,10 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 _COMPUTE = str(_KDIR / "sdpa_compute.cpp")
 _DM_DIR = "ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/dataflow/"
 _READER = _DM_DIR + "reader_interleaved.cpp"
+# cpp attempt (run 8): with CAUSAL_SKIP on one K chunk, kernels/sdpa_reader.cpp (the stock reader + SDPA_CAUSAL_READ_SKIP)
+# reads only each Q chunk's K / V rows up to its diagonal -- the tiles the compute skips are never fetched
+_CAUSAL_READER = str(_KDIR / "sdpa_reader.cpp")
+CAUSAL_READ_SKIP = True
 _WRITER = _DM_DIR + "writer_interleaved.cpp"
 
 _TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.float32: 4096, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
@@ -37,6 +41,12 @@ ENABLED = True
 # sdpa_compute.cpp SDPA_CAUSAL_SKIP): the skipped tiles are all -inf before the softmax, exp to exact zeros, and leave
 # every output bit as it was.
 CAUSAL_SKIP = True
+# The softmax exponent's SFPU pass (kernels/sdpa_compute.cpp calculate_scaled_exp_hoisted): EXP_NO_OVF drops the
+# overflow arm softmax inputs (<= ~0) never reach; a scale a bf16 holds exactly (head_dim 64: 0.125) rides as an
+# immediate (SDPA_SCALE_IMM), freeing the LREGs that then hold two polynomial constants re-loaded every row before
+# (31 -> 25 SFPU instructions a row; same values).
+EXP_NO_OVF = True
+SCALE_IMM = True
 
 
 def _subblock(h, w, dst_size, max_h=None):
@@ -137,7 +147,11 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
         ("REDUCE_GRANULARITY", str(_granularity(Sq_chunk_t, dst_size // 2))),
         ("EXP_APPROX_MODE", "1" if program_config.exp_approx_mode else "0"),
     ]
-    compute_defines = defines + (
+    exp_defines = [("SDPA_EXP_NO_OVF", "1")] if EXP_NO_OVF else []
+    scale_bits = struct.unpack("<I", struct.pack("<f", float(scale)))[0]
+    if SCALE_IMM and scale_bits & 0xFFFF == 0:
+        exp_defines.append(("SDPA_SCALE_IMM", f"{struct.unpack('<f', struct.pack('<I', scale_bits))[0]!r}f"))
+    compute_defines = defines + exp_defines + (
         [("SDPA_CAUSAL_SKIP", "1"), ("SDPA_VALID_SQT", str(valid_Sqt))] if is_causal and CAUSAL_SKIP else []
     )
     packed_identity = 0x3F803F80  # two bf16 1.0
@@ -236,8 +250,11 @@ def sdpa(q, k, v, is_causal, scale, program_config, compute_kernel_config, memor
         config=cfg,
         defines=d,
     )
+    read_skip = is_causal and CAUSAL_SKIP and CAUSAL_READ_SKIP and k_num_chunks == 1
+    reader_src = _CAUSAL_READER if read_skip else _READER
+    reader_defines = defines + ([("SDPA_CAUSAL_READ_SKIP", "1")] if read_skip else [])
     kernels = [
-        kern(_READER, reader_ct, rt_r, ttnn.ReaderConfigDescriptor(), defines),
+        kern(reader_src, reader_ct, rt_r, ttnn.ReaderConfigDescriptor(), reader_defines),
         kern(_WRITER, writer_ct, rt_w, ttnn.WriterConfigDescriptor(), defines),
         kern(_COMPUTE, compute_ct, rt_c, ccfg, compute_defines),
     ]

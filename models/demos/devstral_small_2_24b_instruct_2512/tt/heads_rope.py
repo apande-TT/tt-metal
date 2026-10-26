@@ -34,6 +34,9 @@ HOIST_INITS = True  # 57.6 -> 55.0 us a vision layer, bit-identical
 # (with HOIST_INITS) both products of a slot as one SFPU pass with the bf16 rounding constants in registers
 # (kernels/heads_rope_compute.cpp calculate_rope_products), bit-identical to the two mul_binary_tile passes
 ROPE_FUSED_MUL = True
+# (with ROPE_FUSED_MUL) the products keep the sign the multiply gives an exact zero instead of mul_binary_tile's forced
+# +0 (operands are finite, so only the sign of zero products differs; q . k sums and SDPA see the same values)
+ROPE_SIGNED_ZEROS = True
 
 
 def _accessor_args(tensor):
@@ -123,7 +126,11 @@ def apply(qkv, cos, signed_sin, heads, memory_config=ttnn.DRAM_MEMORY_CONFIG):
             compile_time_args=ct,
             runtime_args=rc,
             config=cfg,
-            defines=([("HOIST_INITS", "1")] + ([("ROPE_FUSED_MUL", "1")] if ROPE_FUSED_MUL else []))
+            defines=(
+                [("HOIST_INITS", "1")]
+                + ([("ROPE_FUSED_MUL", "1")] if ROPE_FUSED_MUL else [])
+                + ([("ROPE_SIGNED_ZEROS", "1")] if ROPE_FUSED_MUL and ROPE_SIGNED_ZEROS else [])
+            )
             if HOIST_INITS
             else [],
         ),

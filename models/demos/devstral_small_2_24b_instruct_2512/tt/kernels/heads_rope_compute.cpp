@@ -43,14 +43,18 @@ inline void calculate_rope_products(const std::uint32_t base, const std::uint32_
         sfpi::vFloat in0 = sfpi::dst_reg[base * T];
         sfpi::vFloat in1 = sfpi::dst_reg[(base + 1) * T];
         sfpi::vFloat a = float32_to_bf16_rne_prgm(in0 * in1);
+#ifndef ROPE_SIGNED_ZEROS
         v_if(in0 == 0 || in1 == 0) { a = 0.0f; }
         v_endif;
+#endif
         sfpi::dst_reg[base * T] = a;
         sfpi::vFloat in2 = sfpi::dst_reg[(base + 2) * T];
         sfpi::vFloat in3 = sfpi::dst_reg[(base + 3) * T];
         sfpi::vFloat b = float32_to_bf16_rne_prgm(in2 * in3);
+#ifndef ROPE_SIGNED_ZEROS
         v_if(in2 == 0 || in3 == 0) { b = 0.0f; }
         v_endif;
+#endif
         sfpi::dst_reg[(base + 2) * T] = b;
         sfpi::dst_reg++;
     }

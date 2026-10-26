@@ -4,7 +4,8 @@
 
 // tt/minimal_mm.py: a copy of minimal_matmul's dm_in0_sender.cpp whose injector cores may defer their output block's write too
 // (DEFER_INJECTOR: the SWIGLU_OVERLAP compute finishes a block's SwiGLU epilogue during the next block, so no core can
-// write a block right after its own K loop). Otherwise the stock kernel.
+// write a block right after its own K loop), and CHUNKED_FWD (mm_dataflow_common.hpp): each block is passed along the
+// forwarding chain FWD_IN0_ROWS M rows at a time. Otherwise the stock kernel.
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -14,7 +15,7 @@
 #include "api/dataflow/circular_buffer.h"
 #include "api/core_local_mem.h"
 #include "api/tensor/noc_traits.h"
-#include "ttnn/operations/experimental/minimal_matmul/device/kernels/matmul_dataflow_common.hpp"
+#include "mm_dataflow_common.hpp"
 #include "ttnn/operations/experimental/ccl/strided_all_gather_async/device/kernels/fused_receiver_utils.hpp"
 
 void kernel_main() {
@@ -276,7 +277,7 @@ void kernel_main() {
         }
 #endif
         uint32_t current_M_block_tiles = m_tile_end - m_tile;
-        uint32_t current_block_bytes = current_M_block_tiles * K_block_tiles * in0_tile_size;
+        [[maybe_unused]] uint32_t current_block_bytes = current_M_block_tiles * K_block_tiles * in0_tile_size;
 #ifdef FUSE_AG
         if constexpr (is_injector_core) {
             fused_op_receiver.reset();
@@ -287,8 +288,22 @@ void kernel_main() {
         reuse_block = false;
         k_forward = true;
         for (uint32_t n_block_iter = 0; n_block_iter < N_blocks_per_core; n_block_iter++) {
+#ifdef N_SEG_TILES
+            // N blocks within two segments of the core's N range: [0, N_SEG_TILES) walked K-forward, the rest
+            // K-backward -- the K-block order a two-block split [N_SEG_TILES | rest] gives every tile; in0 is reused
+            // only where the direction flips
+            constexpr uint32_t n_seg_blocks0 = (N_SEG_TILES + N_block_tiles - 1) / N_block_tiles;
+            const bool n_seg1 = n_block_iter >= n_seg_blocks0;
+            uint32_t n_tile =
+                N_start_tile +
+                (n_seg1 ? N_SEG_TILES + (n_block_iter - n_seg_blocks0) * N_block_tiles : n_block_iter * N_block_tiles);
+            uint32_t n_tile_end = std::min(
+                n_tile + N_block_tiles, n_seg1 ? N_end_tile : std::min(N_start_tile + N_SEG_TILES, N_end_tile));
+            k_forward = !n_seg1;
+#else
             uint32_t n_tile = N_start_tile + n_block_iter * N_block_tiles;
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
+#endif
             bool is_last_block = (m_block_iter == M_blocks_per_core - 1) && (n_block_iter == (N_blocks_per_core - 1));
             bool not_first_block = (n_block_iter > 0 || m_block_iter > 0);
 
@@ -361,6 +376,66 @@ void kernel_main() {
                 cb_in0.reserve_back(in0_block_num_tiles);
 
                 uint32_t in0_start_address = cb_in0.get_write_ptr();
+#ifdef CHUNKED_FWD
+                // the block in chunks of FWD_IN0_ROWS M rows: the receiver semaphore counts the chunks landed (the
+                // upstream core relays the count after each chunk's write), and each chunk goes on downstream at once
+                {
+                    constexpr uint32_t R = FWD_IN0_ROWS;
+                    constexpr uint32_t row_bytes = K_block_tiles * in0_tile_size;
+                    const uint32_t n_fwd = (current_M_block_tiles + R - 1) / R;
+                    if constexpr (is_injector_core) {
+                        // every chunk's reads issued at once, chunk c tagged with transaction id c + 1
+                        for (uint32_t c = 0; c < n_fwd; c++) {
+                            issue_in0_rows<K_block_tiles>(
+                                in0_reader,
+                                in0_shape,
+                                cb_in0_id,
+                                in0_tile_size,
+                                m_tile,
+                                c * R,
+                                std::min(c * R + R, current_M_block_tiles),
+                                k_block * K_block_tiles,
+                                (k_block + 1) * K_block_tiles,
+                                c + 1);
+                        }
+                    } else {
+                        in0_receiver_semaphore.set(INVALID);
+                        in0_sender_semaphore.up(noc, in0_sender_noc_x, in0_sender_noc_y, 1);
+                    }
+                    for (uint32_t c = 0; c < n_fwd; c++) {
+                        const uint32_t r0 = c * R;
+                        const uint32_t r1 = std::min(r0 + R, current_M_block_tiles);
+                        if constexpr (is_injector_core) {
+                            wait_rows(c + 1);
+                        } else {
+                            in0_receiver_semaphore.wait_min(c + 1);
+                        }
+                        if (c + 1 == n_fwd) {
+                            cb_in0.push_back(in0_block_num_tiles);
+                        }
+                        if (!is_sink_core) {
+                            if (c == 0) {
+                                in0_sender_semaphore.wait(1);
+                                in0_sender_semaphore.set(0);
+                            }
+                            const uint32_t off = r0 * row_bytes;
+                            noc.async_write(
+                                CoreLocalMem<uint32_t>(in0_start_address + off),
+                                UnicastEndpoint{},
+                                (r1 - r0) * row_bytes,
+                                {},
+                                {.noc_x = in0_dest_noc_x, .noc_y = in0_dest_noc_y, .addr = in0_start_address + off});
+                            noc.async_writes_flushed();  // (also retires the previous count relay's source read)
+                            in0_valid_semaphore.set(c + 1);
+                            in0_valid_semaphore.relay_unicast(
+                                noc, in0_receiver_semaphore, in0_dest_noc_x, in0_dest_noc_y);
+                        }
+                    }
+                    if constexpr (is_injector_core) {
+                        noc_async_read_set_trid(0);
+                    }
+                }
+#else
                 if constexpr (is_injector_core) {
 #ifdef FUSE_AG
                     if (is_injector_core) {
@@ -427,6 +502,7 @@ void kernel_main() {
 
                     in0_valid_semaphore.relay_unicast(noc, in0_receiver_semaphore, in0_dest_noc_x, in0_dest_noc_y);
                 }
+#endif  // CHUNKED_FWD
 #ifdef SRS_FUSE_OP_SIGNALER
                 if constexpr (is_output_writer) {
                     // Deferred-write path only (guarded by defer_write, which is false on the fused RS path).
@@ -478,6 +554,9 @@ void kernel_main() {
             k_forward = !k_forward;
             // We get reuse on in0 when striding N block
             reuse_block = true;
+#ifdef N_SEG_TILES
+            reuse_block = n_block_iter + 1 == n_seg_blocks0;
+#endif
 
             defer_write_m_tile = out_m_tile;
             defer_write_m_tile_end = out_m_tile_end;

@@ -48,6 +48,9 @@ from models.tt_transformers.demo.devstral_small_2_24b_instruct_2512._stubs.pixtr
 class TtPixtralVisionModel:
     # bf16 vision features (the transformer's output) stay in L1 up to this many bytes a core; 0: DRAM
     FEATURES_L1_BYTES = 48 * 1024
+    # the patch embeddings / ln_pre / the first fp32 residual in L1 while the fp32 copy takes at most this many bytes a
+    # core (8 x 256 x 1024: 76 KB); 0: DRAM
+    PRE_L1_BYTES = 96 * 1024
     # Every layer's head split and q / k RoPE as one C++ program (pixtral_attention.CPP_HEADS_ROPE), reading a signed
     # sin table.
     CPP_HEADS_ROPE = True
@@ -200,20 +203,24 @@ class TtPixtralVisionModel:
             compute_with_storage_grid_size=grid,
         )
 
+        # the patch embeddings, ln_pre's output and the fp32 residual it starts stay in L1 while they fit
+        # (PRE_L1_BYTES a core for the fp32 copy), each freed by its one reader -- the same ops, placed in L1
+        pre_bytes = 4 * mt * nt * ttnn.TILE_SIZE * ttnn.TILE_SIZE // (grid.x * grid.y)
+        pre_mem = ttnn.L1_MEMORY_CONFIG if 0 < pre_bytes <= self.PRE_L1_BYTES else ttnn.DRAM_MEMORY_CONFIG
         if minimal_mm.supported(x, self.w_patch, self.compute_cfg):
             # the same program, its core ranges' padding skipped (tt/minimal_mm.py SKIP_PADDING), bit-identical
-            x = minimal_mm.matmul(
-                x, self.w_patch, patch_cfg, self.compute_cfg, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=x.dtype
-            )
+            x = minimal_mm.matmul(x, self.w_patch, patch_cfg, self.compute_cfg, memory_config=pre_mem, dtype=x.dtype)
         else:
             x = ttnn.experimental.minimal_matmul(
                 x,
                 self.w_patch,
                 config=patch_cfg,
                 compute_kernel_config=self.compute_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=pre_mem,
             )
-        x = self.ln_pre(x)
+        e, x = x, self.ln_pre(x, memory_config=pre_mem)
+        if pre_mem.buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(e)
         s = x.shape[-2]
 
         if position_ids is None:
@@ -233,6 +240,11 @@ class TtPixtralVisionModel:
 
         # (the layers keep their fp32 residual stream in L1; the bf16 features stay in L1 while they take at most
         # FEATURES_L1_BYTES a core -- 8 x 256 x 1024: 38 KB -- for the projector's norm and unfold, else DRAM)
+        if pre_mem.buffer_type == ttnn.BufferType.L1 and x.dtype != ttnn.float32 and sp == s:
+            # the first layer's fp32 residual (the cast attention.py would run), the L1 bf16 copy freed before the
+            # layers so it does not sit under their circular buffers
+            e, x = x, ttnn.typecast(x, ttnn.float32, memory_config=pre_mem)
+            ttnn.deallocate(e)
         h = self.transformer(x, attention_mask=mask, position_embeddings=(cos, sin))
         grid = self.device.compute_with_storage_grid_size()
         f_bytes = 2 * int(h.shape[0]) * int(h.shape[-2]) * int(h.shape[-1]) // (grid.x * grid.y)

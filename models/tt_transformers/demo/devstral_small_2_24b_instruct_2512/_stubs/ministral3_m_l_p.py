@@ -13,6 +13,7 @@ Tensor-parallel over the mesh (TP = number of devices; TP = 1 on a single device
                grid: decode (mode="decode") keeps separate gate / up weights on ttnn.linear instead.
   * down_proj  row-parallel on the intermediate dim, then all_reduce.
 """
+
 from __future__ import annotations
 
 import torch
@@ -116,6 +117,31 @@ class TtMinistral3MLP:
     # The many-row down projection folds a fp32 residual add into its output stage (tt/minimal_mm.py residual=,
     # bit-identical to ttnn.add(residual, down)): __call__(x, residual=h) returns h + mlp(x). The vision MLPs set it.
     FUSE_RESIDUAL_DOWN = False
+    # A short prompt's (<= 128 tile rows) down projection runs on the full grid with blocks cut to each core's exact
+    # M / N ranges (see _forward) instead of the 80-core grid of whole 16 x 16-tile blocks.
+    SHORT_DOWN_FULL_GRID = True
+    # grid try (run 8): the fused gate/up's N block may be 14 tiles when that tiles each core's N range in fewer blocks
+    # than 12 (the data-parallel vision MLP's 26-tile range: 14 + 12 instead of 12 + 12 + a 2-tile block)
+    GATE_UP_N14 = True
+    # An L1-input fused gate/up with an L1 product (the vision MLP) whose N range runs in two blocks (14 + 12) splits
+    # each of them into N blocks of at most this many tiles (8 + 6, 8 + 4; 2 x 2 subblocks): small enough that
+    # tt/minimal_mm.py's SWIGLU_OVERLAP fits its two fp32 intermediates beside the L1 tensors, so each block's SwiGLU
+    # epilogue runs under the next block's matmul. The readers walk K backwards on every other N block (to reuse in0),
+    # so the smaller blocks keep the two old blocks' K directions (minimal_mm n_seg=): bit-identical. 0: off.
+    # (M blocks of 2 or 3 tiles under the old N blocks instead: 245 us a layer vs 260.)
+    GATE_UP_L1_OVERLAP_N = 8
+    # The TP text MLP's short-prompt (<= 128 tile rows) down as tt/minimal_mm.matmul(..., swapped=True): the weight in
+    # srcB (a bf16 copy of the bf8 weight, transposed once at load: exact), so HiFi2 multiplies the full operands.
+    SHORT_DOWN_SWAPPED = True
+    # ... and the long prompt's (> 128 tile rows) down too, in N blocks of LONG_DOWN_SWAPPED_N_BLOCK prompt tile rows
+    LONG_DOWN_SWAPPED = True
+    LONG_DOWN_SWAPPED_N_BLOCK = 10
+    # ... on the last thirty text layers only: the image prompt's [IMG] rows amplify a rounding-order change through the
+    # layers after it (image prefill-hidden PCC: layers 0-39 swapped 0.9944 < 0.995; 10-39 0.99525; 20-39 / 30-39 0.995503)
+    LONG_DOWN_SWAPPED_LAYERS = frozenset(range(10, 40))
+    # The prefill gate / up in 16-deep K blocks (tt/minimal_mm.py SWIGLU_DEEP_K: the SwiGLU pass gets a whole subblock
+    # to hide behind; not bit-identical) on these layers only (all 40: image prefill-hidden PCC 0.994431 < 0.995)
+    PREFILL_GU_DEEP_K_LAYERS = frozenset(range(20, 40))
 
     def __init__(self, device, torch_module, in_scale=None, layer_idx=None, norm_eps=None) -> None:
         """in_scale: optional per-input-feature scale (the post-attention RMSNorm's gamma) folded into gate/up.
@@ -291,6 +317,37 @@ class TtMinistral3MLP:
                 fp32_dest_acc_en=True,
                 packer_l1_acc=False,
             )
+        # SHORT_DOWN_SWAPPED: the bf8 weight's values (<= 7 significant bits: exact in bf16) transposed to (N x K) for
+        # the swapped program, whose srcB multiplier pass takes all 7 -- HiFi2 over srcA's two passes is HiFi4's product.
+        self.w_down_t = None
+        self.long_down_swapped = self.LONG_DOWN_SWAPPED and layer_idx in self.LONG_DOWN_SWAPPED_LAYERS
+        self.gu_deep_k = layer_idx in self.PREFILL_GU_DEEP_K_LAYERS
+        if self.SHORT_DOWN_SWAPPED and type(self) is TtMinistral3MLP and tp > 1 and self.DOWN_DTYPE == ttnn.bfloat8_b:
+            # (built on the host: _put's bf8 quantization of the same matrix, dequantized, transposed and tilized there,
+            # then uploaded -- no device ops)
+            wq = ttnn.to_torch(
+                ttnn.from_torch(
+                    torch_module.down_proj.weight.T.detach().to(torch.bfloat16).contiguous(),
+                    dtype=ttnn.bfloat8_b,
+                    layout=ttnn.TILE_LAYOUT,
+                )
+            )
+            wt = ttnn.from_torch(
+                wq.T.contiguous().to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=shard(-1),
+            )
+            del wq
+            self.w_down_t = ttnn.to_device(wt, device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            del wt
+            self.down_swapped_cfg = ttnn.init_device_compute_kernel_config(
+                device.arch(),
+                math_fidelity=ttnn.MathFidelity.HiFi2,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
         # The many-row fused gate/up is compute-bound; it runs at HiFi2 (fp32 accumulation kept).
         lofi = type(self) is TtMinistral3MLP and layer_idx is not None and layer_idx in PREFILL_GATE_UP_LOFI_LAYERS
         self.gate_up_cfg = ttnn.init_device_compute_kernel_config(
@@ -381,10 +438,9 @@ class TtMinistral3MLP:
         )
         return self._reduce(out)
 
-    def _gate_up_n_block(self, x, grid):
-        """N block of the fused gate/up: 12 tiles, or the whole per-core N range when that is smaller. minimal_matmul
-        hands each core 2 * ceil(pairs / cores) weight tiles along N (the grid's y axis when M > N), and a block wider
-        than that range is computed padded: the vision MLP's 8-tile range ran 12-tile blocks (half of them padding)."""
+    def _gate_up_n_range(self, x, grid):
+        """Each core's N tile range in the fused gate/up: minimal_matmul hands it 2 * ceil(pairs / cores) weight tiles
+        along N (the grid's y axis when it splits transposed, else x)."""
         shape = tuple(int(d) for d in x.shape)
         mt = shape[-2] // ttnn.TILE_SIZE
         for d in shape[:-2]:
@@ -393,8 +449,17 @@ class TtMinistral3MLP:
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
 
         n_cores = grid.y if minimal_mm.transposed(mt, nt, grid.x, grid.y, swiglu=True) else grid.x
-        n_core = 2 * -(-(nt // 2) // n_cores)
-        return n_core if n_core < 12 else 12
+        return 2 * -(-(nt // 2) // n_cores)
+
+    def _gate_up_n_block(self, x, grid):
+        """N block of the fused gate/up: 12 tiles, or the whole per-core N range when that is smaller (a block wider
+        than that range is computed padded: the vision MLP's 8-tile range ran 12-tile blocks, half of them padding)."""
+        n_core = self._gate_up_n_range(x, grid)
+        if n_core <= 12:
+            return n_core
+        if self.GATE_UP_N14 and -(-n_core // 14) < -(-n_core // 12) and (n_core % 14) % 2 == 0:
+            return 14
+        return 12
 
     @staticmethod
     def _m_range(mt, nt, grid, swiglu=False):
@@ -419,13 +484,19 @@ class TtMinistral3MLP:
         m_rng = self._m_range(rows // ttnn.TILE_SIZE, nt_gu, grid, swiglu=True)
         m_gu = min(range(min(8, m_rng), max(1, min(8, m_rng) // 2) - 1, -1), key=lambda b: -(-m_rng // b) * b - m_rng)
         n_gu = self._gate_up_n_block(x, grid)
+        sub_h, sub_w = (1, 4) if n_gu % 4 == 0 else (2 if m_gu % 2 == 0 else 1, 2)
+        n_seg, ov_n = None, self.GATE_UP_L1_OVERLAP_N
+        if ov_n and x_l1 and inter_l1 and PREFILL_MM_PROGRAM and ov_n < n_gu < self._gate_up_n_range(x, grid):
+            # the old blocks' boundary becomes the K-direction segment of ov_n-tile blocks (2 x 2 subblocks: 8 + 6)
+            n_seg, n_gu = n_gu, ov_n
+            sub_h, sub_w = (2 if m_gu % 2 == 0 else 1, 2)
         gu_cfg = ttnn.MinimalMatmulConfig(
             M_block_size=m_gu,
             # (an L1 fp32 input + the L1 product leave room only for half-depth activation blocks)
             K_block_size=4 if x_l1 and inter_l1 and x.dtype == ttnn.float32 else 8,
             N_block_size=n_gu,
-            subblock_h=1 if n_gu % 4 == 0 else 2 if m_gu % 2 == 0 else 1,
-            subblock_w=4 if n_gu % 4 == 0 else 2,
+            subblock_h=sub_h,
+            subblock_w=sub_w,
             compute_with_storage_grid_size=grid,
         )
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
@@ -439,7 +510,7 @@ class TtMinistral3MLP:
         )
         if PREFILL_MM_PROGRAM and minimal_mm.supported(x, self.w_gate_up, self.gate_up_cfg, fuse_swiglu=True):
             # the same program with silu * up as one SFPU pass (tt/minimal_mm.py), bit-identical
-            m = minimal_mm.matmul(x, self.w_gate_up, **gu_kw)
+            m = minimal_mm.matmul(x, self.w_gate_up, deep_k_ok=self.gu_deep_k, n_seg=n_seg, **gu_kw)
         else:
             m = ttnn.experimental.minimal_matmul(x, self.w_gate_up, **gu_kw)
         if x_l1:  # the caller's norm output, read only here (see TtAttention)
@@ -455,7 +526,21 @@ class TtMinistral3MLP:
         down_cfg = None
         # the down keeps minimal_matmul's stock M > N split (stock_orient below): transposed it measured no better
         n_rng_dn = -(-nt // (grid.y if mt > nt else grid.x))
-        if mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
+        m_rng_dn = -(-mt // (grid.x if mt > nt else grid.y))
+        n_sub = max(w for w in (1, 2, 3, 4) if n_rng_dn % w == 0)
+        if self.SHORT_DOWN_FULL_GRID and mt <= 128 and mt < nt and n_sub >= 3:
+            # A short prompt on the FULL grid with blocks cut to each core's exact ranges (M blocks of half the M
+            # range, N blocks of the whole N range, 1 x n_sub subblocks): the 128-row prompt's 128 x 160 output tiles
+            # are 13 x 15 a core over 110 cores instead of 16 x 16 over the 80-core grid of whole 16-tile blocks.
+            down_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=-(-m_rng_dn // 2),
+                K_block_size=8,
+                N_block_size=n_rng_dn,
+                subblock_h=1,
+                subblock_w=n_sub,
+                compute_with_storage_grid_size=grid,
+            )
+        elif mt <= 128 and mt % 16 == 0 and nt % 16 == 0 and mt // 16 <= grid.y and grid.x - 1 <= nt // 16 <= grid.x:
             down_cfg = ttnn.MinimalMatmulConfig(
                 M_block_size=8,
                 K_block_size=8,
@@ -500,7 +585,36 @@ class TtMinistral3MLP:
             memory_config=ttnn.L1_MEMORY_CONFIG if down_l1 else ttnn.DRAM_MEMORY_CONFIG,
             dtype=down_dtype,
         )
+        n_sw = -(-mt // grid.x)
         if (
+            self.w_down_t is not None
+            and ((mt <= 128 and n_sw % 2 == 0) or (self.long_down_swapped and mt > 128))
+            and m.layout == ttnn.TILE_LAYOUT
+            and not m.is_sharded()
+            and int(m.padded_shape[-1]) == int(self.w_down_t.padded_shape[-1])
+        ):
+            # swapped (SHORT_DOWN_SWAPPED / LONG_DOWN_SWAPPED): the weight's 160 rows over the grid's 10 rows (16 a
+            # core, M blocks of 8), the prompt's tile rows over its 11 columns (128: 12 a core, one N block; 416: 38 a
+            # core in N blocks of 10), 2 x 2 subblocks, at HiFi2
+            sw_cfg = ttnn.MinimalMatmulConfig(
+                M_block_size=8,
+                K_block_size=8,
+                N_block_size=n_sw if mt <= 128 else self.LONG_DOWN_SWAPPED_N_BLOCK,
+                subblock_h=2,
+                subblock_w=2,
+                compute_with_storage_grid_size=grid,
+            )
+            out = minimal_mm.matmul(
+                m,
+                self.w_down_t,
+                config=sw_cfg,
+                compute_kernel_config=self.down_swapped_cfg,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                dtype=down_dtype,
+                swapped=True,
+                orient=False,
+            )
+        elif (
             residual is not None
             and self.FUSE_RESIDUAL_DOWN
             and self.tp == 1

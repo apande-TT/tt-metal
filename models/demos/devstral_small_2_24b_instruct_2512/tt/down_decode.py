@@ -48,6 +48,16 @@ class StreamDownDecode:
     # every shard as soon as its tiles are in (kernels/ar_send_shards.cpp) instead of reading a wave's shards back
     # once the whole wave is done (kernels/ar_send_waves.cpp)
     DIRECT_SEND = True
+    # heads=True (run 8): __call__ takes SDPA-decode's head-major (1, B, H, hd) output itself -- free cores of the grid
+    # assemble the (32, H * hd) row, HEADS_TILES x tiles a RISC (kernels/heads_gather.cpp, the copy tt/concat_heads.py's
+    # decode concat makes), straight into the sender's x CB (gate_up_sender.cpp X_GATHER) while the weight streams
+    # start: no separate concat program. In trace the stream program pays for every core it adds, so few producers
+    # (2 tiles a RISC: 8 cores for K = 32 tiles; 1 a RISC on 16 cores ran +75 us a token)
+    HEADS_GATHER = True
+    HEADS_TILES = 2
+    # cpp try (run 8): no producer cores -- RISCV_0 of the first 2 K stream cores each gathers half an x tile while its
+    # first weight push is in flight (gate_up_stream.cpp GU_HEADS), so the program keeps the stream's 81 cores
+    HEADS_ON_STREAM = True
 
     @classmethod
     def rb_for(cls, dtype) -> int:
@@ -130,6 +140,8 @@ class StreamDownDecode:
         self.sender = (g.x - 1, g.y - 1)
         self.sender_set = ttnn.CoreRangeSet([rng(*self.sender, *self.sender)])
         self.all = self.cores.merge(self.sender_set)
+        taken = set(self.core_xy) | {self.sender}
+        self.free_xy = [(c % g.x, c // g.x) for c in range(g.x * g.y) if (c % g.x, c // g.x) not in taken]
         snd = phys(*self.sender)
         self.sender_xy = [snd.x, snd.y]
         self.rects = [len(rects)]  # the sender's multicast targets (NOC 0 order corners) and core counts
@@ -143,6 +155,31 @@ class StreamDownDecode:
         cfg.fp32_dest_acc_en = True
         cfg.math_approx_mode = False
         self.cfg = cfg
+
+    def heads_ok(self, x) -> bool:
+        """Whether __call__(x, heads=True) can take x: SDPA-decode's (1, B, H, hd) bf16 L1-interleaved output, H * hd
+        = K, with a free core of the grid for every 2 * HEADS_TILES x tiles."""
+        if not (self.HEADS_GATHER and self.spread and self.DUAL_NOC and not self.ar_fold) or len(x.shape) != 4:
+            return False
+        one, b, h, hd = (int(d) for d in x.shape)
+        mem = x.memory_config()
+        return (
+            one == 1
+            and b <= ttnn.TILE_SIZE
+            and h <= ttnn.TILE_SIZE
+            and hd % ttnn.TILE_SIZE == 0
+            and h * hd == self.kt * ttnn.TILE_SIZE
+            and self.kt % (2 * self.HEADS_TILES) == 0
+            and (
+                len(self.core_xy) >= 2 * self.kt
+                if self.HEADS_ON_STREAM
+                else len(self.free_xy) >= self.kt // (2 * self.HEADS_TILES)
+            )
+            and x.dtype == ttnn.bfloat16
+            and x.layout == ttnn.TILE_LAYOUT
+            and mem.buffer_type == ttnn.BufferType.L1
+            and not x.is_sharded()
+        )
 
     def _n_send(self):
         return 2 if self.DUAL_NOC and self.spread else 1
@@ -189,11 +226,15 @@ class StreamDownDecode:
             defines=list(defines),
         )
 
-    def __call__(self, m, memory_config=None):
+    def __call__(self, m, memory_config=None, heads=False):
         """m: (1, 1, 32, K) bf16 tiles (interleaved); returns m @ W_down, (1, 1, 32, N) bf16 in L1 (memory_config:
-        an L1 layout to write it in instead, e.g. the width shards the decode all_reduce reads)."""
+        an L1 layout to write it in instead, e.g. the width shards the decode all_reduce reads). heads: m is instead
+        SDPA-decode's (1, B, H, hd) output (heads_ok), concatenated into the row inside this program."""
         shape = tuple(int(d) for d in m.shape)
-        if shape[:-1] != (1, 1, ttnn.TILE_SIZE) or m.dtype != ttnn.bfloat16 or m.is_sharded():
+        if heads:
+            if not self.heads_ok(m):
+                raise ValueError(f"StreamDownDecode(heads=True) cannot take {shape} {m.dtype}")
+        elif shape[:-1] != (1, 1, ttnn.TILE_SIZE) or m.dtype != ttnn.bfloat16 or m.is_sharded():
             raise ValueError(f"StreamDownDecode takes one interleaved bf16 tile row, got {shape} {m.dtype}")
         if self.ar_fold:
             raise NotImplementedError("an ar_fold StreamDownDecode lays its columns out for ar_call")
@@ -208,19 +249,86 @@ class StreamDownDecode:
         )
         acc = lambda *ts: [a for t in ts for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
         wdt = self.w.dtype
+        SEM_READY, SEM_VALID, SEM_GATHER, CB_SCRATCH = 0, 1, 2, 3
+        everyone, gather_xy = self.all, []
+        tpr = self.HEADS_TILES
+        on_stream = heads and self.HEADS_ON_STREAM
+        if heads and not on_stream:  # the producers: the first free cores, HEADS_TILES x tiles a RISC, as row runs
+            gather_xy = self.free_xy[: kt // (2 * tpr)]
+            runs = []
+            for x, y in gather_xy:
+                if runs and runs[-1][1] == y and runs[-1][2] == x - 1:
+                    runs[-1][2] = x
+                else:
+                    runs.append([x, y, x])
+            row = lambda x0, y, x1: ttnn.CoreRange(ttnn.CoreCoord(x0, y), ttnn.CoreCoord(x1, y))
+            gather_set = ttnn.CoreRangeSet([row(*r) for r in runs])
+            everyone = self.all.merge(gather_set)
+        fmt = lambda index, page, dtype: [
+            ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)
+        ]
         cbs = [  # x first: the sender writes it at its own address of it, the same L1 address on every core
-            self._cb(0, kt, x_tile, ttnn.bfloat16),
+            ttnn.CBDescriptor(
+                total_size=kt * x_tile, core_ranges=everyone, format_descriptors=fmt(0, x_tile, ttnn.bfloat16)
+            ),
             self._cb(1, depth * rb, w_tile, wdt),
             self._cb(2, depth * rb, w_tile, wdt),
             self._cb(16, self.NC, o_tile, ttnn.bfloat16),
         ]
-        SEM_READY, SEM_VALID = 0, 1
-        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=self.all, initial_value=0) for i in (SEM_READY, SEM_VALID)]
+        sems = [
+            ttnn.SemaphoreDescriptor(id=i, core_ranges=everyone, initial_value=0)
+            for i in ((SEM_READY, SEM_VALID, SEM_GATHER) if heads else (SEM_READY, SEM_VALID))
+        ]
         dm = lambda risc, noc: ttnn.DataMovementConfigDescriptor(processor=risc, noc=noc)
         dm0 = dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.NOC_0)
         dm1 = dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.NOC_1)
         # one weight column a push (nc = 1); the OWNER (RISCV_1) writes the core's output tiles
-        kernels = self._sender_kernels(m, SEM_READY, SEM_VALID, dm0, acc(m))
+        if on_stream:  # one face pair a gathering stream RISC
+            cbs.append(
+                ttnn.CBDescriptor(
+                    total_size=x_tile // 2,
+                    core_ranges=self.cores,
+                    format_descriptors=fmt(CB_SCRATCH, x_tile // 2, ttnn.bfloat16),
+                )
+            )
+        elif heads:
+            cbs.append(
+                ttnn.CBDescriptor(
+                    total_size=2 * tpr * x_tile,
+                    core_ranges=gather_set,
+                    format_descriptors=fmt(CB_SCRATCH, x_tile, ttnn.bfloat16),
+                )
+            )
+        if heads:
+            kernels = dual_noc_sender_kernels(
+                self.device,
+                self.sender,
+                kt,
+                x_tile,
+                len(self.core_xy),
+                SEM_READY,
+                SEM_VALID,
+                None,
+                self.rects,
+                [],
+                gather=(2 * kt if on_stream else kt // tpr, SEM_GATHER),
+            )
+            _, b, h, hd = shape
+            kernels += [] if on_stream else [
+                self._kernel(
+                    "heads_gather.cpp",
+                    gather_set,
+                    [hd // ttnn.TILE_SIZE, b, risc, 0, CB_SCRATCH, SEM_GATHER, tpr] + acc(m),
+                    [
+                        (xy, [m.buffer_address()] + self.sender_xy + [(2 * i + risc) * tpr])
+                        for i, xy in enumerate(gather_xy)
+                    ],
+                    cfg,
+                )
+                for risc, cfg in enumerate((dm0, dm1))
+            ]
+        else:
+            kernels = self._sender_kernels(m, SEM_READY, SEM_VALID, dm0, acc(m))
         nsend = [("GU_NSEND", str(self._n_send()))]
         for w, idx, cores in self.groups:
             # two columns: RISC j streams column j; one column: RISC j streams its pushes j, j + 2, ...
@@ -234,9 +342,19 @@ class StreamDownDecode:
                 for c in idx
             ]
             one = [] if w == 2 else [("GU_PSTEP", "2")]
+            hct, hdef, hrt = [], [], lambda j: [[] for _ in idx]
+            if on_stream:  # GU_HEADS: RISCV_0 of core c < 2 K gathers half c % 2 of x tile c // 2
+                hct = [shape[-1] // ttnn.TILE_SIZE, shape[1], CB_SCRATCH, SEM_GATHER] + acc(m)
+                hdef = [("GU_HEADS", "1")]
+                hrt = lambda j: [[m.buffer_address(), c if j == 0 and c < 2 * kt else 0xFFFFFFFF] for c in idx]
+            rtj = lambda j: [(xy, args + extra) for (xy, args), extra in zip(rt(j), hrt(j))]
             kernels += [
-                self._kernel("gate_up_stream.cpp", cores, ct(1, 0) + acc(self.w, out), rt(0), dm0, one + nsend),
-                self._kernel("gate_up_stream.cpp", cores, ct(2, 1) + acc(self.w, out), rt(1), dm1, one + nsend),
+                self._kernel(
+                    "gate_up_stream.cpp", cores, ct(1, 0) + acc(self.w, out) + hct, rtj(0), dm0, one + nsend + hdef
+                ),
+                self._kernel(
+                    "gate_up_stream.cpp", cores, ct(2, 1) + acc(self.w, out) + hct, rtj(1), dm1, one + nsend + hdef
+                ),
                 self._kernel(
                     "down_compute.cpp", cores, [kt, rb], [], self.cfg, [] if w == 2 else [("DOWN_ONE_COL", "1")]
                 ),

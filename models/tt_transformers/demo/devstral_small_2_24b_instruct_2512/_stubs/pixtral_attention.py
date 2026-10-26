@@ -55,6 +55,8 @@ class TtPixtralAttention:
     ATTN_L1_BYTES = 128 * 1024
     # o_proj reads SDPA's head outputs as their concat itself when it also folds the residual add (see __call__).
     FOLD_CONCAT = True
+    # SDPA query chunk candidates, widest first (see __call__).
+    Q_CHUNKS = (64, 32)
 
     def __init__(self, device, torch_module, in_scale=None) -> None:
         """in_scale: the attention_norm gamma, folded into q/k/v (see TtAttention.FOLD_NORM_GAMMA)."""
@@ -256,7 +258,7 @@ class TtPixtralAttention:
         k_chunk = next(c for c in (512, 256, 128, 64, 32) if s % c == 0)
         # Query chunk: 128 rows where the sequence allows (8 x 16 heads x 256 patches: 256 chunks over the grid's 110
         # cores, 185 us vs 215 at 64 rows and 207 at 256 -- each chunk streams its key/value range once).
-        q_chunk = next(c for c in (128, 64, 32) if s % c == 0)
+        q_chunk = next(c for c in self.Q_CHUNKS if s % c == 0)
         sdpa_cfg = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=self.device.compute_with_storage_grid_size(),
             q_chunk_size=q_chunk,

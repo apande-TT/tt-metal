@@ -91,6 +91,13 @@ class TtMinistral3Attention:
     # cores, k on the next B), so q's and k's RoPE run as ONE rotary_embedding_llama_fused_qk and K / V are appended
     # by ONE paged_fused_update_cache (each needs its two inputs on disjoint cores).
     DECODE_FUSED_QK = True
+    # That K / V append as tt/kv_append.py's program (cpp try 1, run 8): the new rows packed to bfloat8_b and written
+    # straight into the cache tiles (exponent groups + mantissa face rows), not untilized / patched / re-tilized.
+    DECODE_KV_APPEND = True
+    # cpp try (run 8): the append reads each user's position from the step's gathered cos table in L1 (tt/rope_gather.py
+    # stashes it in a row the RoPE never reads) instead of from the DRAM cur_pos
+    DECODE_KV_POS_L1 = True
+    _pos_stash = None
     # Decode o_proj as the MLP down's C++ streaming program (tt/down_decode.py: the concatenated heads multicast once,
     # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
     # partials left in L1 for the reduce-scatter.
@@ -126,6 +133,11 @@ class TtMinistral3Attention:
     # many bytes per core: the RoPEs read q / k from L1 and write DRAM, and v is copied to DRAM for the cache fill and
     # SDPA (none stays resident in L1 across the larger prefill ops, whose static buffers leave no room). 0 disables.
     PREFILL_HEADS_L1_BYTES = 512 * 1024
+    # structural (run 8): the prefill QKV written in the head layouts by its own output writer (minimal_mm heads_out)
+    PREFILL_QKV_HEADS_OUT = True
+    # grid try (run 8): the prompt K / V cast to the cache dtype on the fill's slab grid (one (user, kv head) slab of S
+    # rows a core, in L1) after the reshard, instead of on the interleaved split DRAM -> DRAM before it
+    PREFILL_KV_CAST_ON_SLABS = True
     # ... and the fused QKV output feeding that split lands in L1 too while it takes at most this many bytes per core
     # (114 KB at 32 x 128 rows, 372 KB at 32 x 416 rows beside the matmul's ~0.9 MB of static buffers).
     PREFILL_QKV_L1_BYTES = 400 * 1024
@@ -136,6 +148,10 @@ class TtMinistral3Attention:
     # it takes at most this many bytes per core (76 KB at 32 x 128 rows; 248 KB at 416 rows does not fit beside SDPA's
     # static buffers).
     PREFILL_SDPA_OUT_L1_BYTES = 256 * 1024
+    # The prefill RoPEs write q / k into L1 (interleaved) instead of DRAM while q takes at most this many bytes per
+    # core (shard try, run 8: the 32 x 128-row prompt's ~76 KB); SDPA and the cache fill read them there, and both
+    # are freed right after SDPA.
+    PREFILL_ROPE_OUT_L1_BYTES = 96 * 1024
     # ... and the L1 heads are concatenated by one C++ program (tt/concat_heads.py: every core pushes the tiles of its
     # own L1 bank to their slots) instead of nlp_concat_heads.
     CPP_PREFILL_CONCAT = True
@@ -261,7 +277,12 @@ class TtMinistral3Attention:
         # (tt/down_decode.py, bit-identical to the 1D-multicast matmul); then no interleaved decode copy is made.
         self.stream_o = None
         if self.DECODE_OPROJ_STREAM and tp > 1 and self.DECODE_REDUCE_DTYPE == ttnn.bfloat16:
-            from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.down_decode import StreamDownDecode as _SDD
+
+            class StreamDownDecode(_SDD):
+                # grid (run 8): the o_proj's 160 columns over 80 cores, exactly 2 each (10 a DRAM bank) instead of
+                # the down's 104 (2 or 1 each): the same products, and the freed cores let trace overlap its neighbours
+                SPREAD_CORES = 80
 
             w_o = torch_module.o_proj.weight.T  # (Hq * hd, D): device d multiplies the rows of its own heads
             if StreamDownDecode.supports(device, int(w_o.shape[0]) // tp, int(w_o.shape[1]), DECODE_WEIGHT_DTYPE):
@@ -453,6 +474,9 @@ class TtMinistral3Attention:
         batch = gather.batch
         cfg = self._batch_shard_cfg(2 * batch, self.head_dim)
         cos, sin = gather(cur_pos, cos_tab, sin_tab, cfg)
+        type(
+            self
+        )._pos_stash = cos  # (DECODE_KV_POS_L1: the gather stashed cur_pos in this table, see tt/rope_gather.py)
         trans = self.trans_mat_qk
         if batch < self.MAX_DECODE_BATCH:
             trans = ttnn.slice(trans, (0, 0, 0, 0), (1, 1, 2 * batch * ttnn.TILE_SIZE, ttnn.TILE_SIZE))
@@ -593,7 +617,7 @@ class TtMinistral3Attention:
         q_cos, q_sin = (cos, sin) if shared else (per_core(q[0]), per_core(q[1]))
         return tuple(rope[:2]) + q + ((cos, sin, q_cos, q_sin),)
 
-    def _prefill_rope(self, t, cos, sin, rows=None):
+    def _prefill_rope(self, t, cos, sin, rows=None, out_mem=None):
         """Fused prefill RoPE of the (B, H, S, hd) heads t (meta_rope pair order), run on _rope_regroup's view.
         rows: (cos, sin) per-core tables from prefill_rope_tables, moved into L1 for the op when _rope_regroup
         picks them (with the pair-swap tile) and freed after it."""
@@ -616,7 +640,7 @@ class TtMinistral3Attention:
             trans,
             is_decode_mode=False,
             compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=out_mem or ttnn.DRAM_MEMORY_CONFIG,
         )
         for x in l1:
             ttnn.deallocate(x)
@@ -699,7 +723,8 @@ class TtMinistral3Attention:
         b, h, s, d = kv.shape
         slots = b * h
         grid = self.device.compute_with_storage_grid_size()
-        if kv.dtype != cache.dtype:  # e.g. a block-float8 cache
+        cast_on_slabs = self.PREFILL_KV_CAST_ON_SLABS and slots <= grid.x * grid.y
+        if kv.dtype != cache.dtype and not cast_on_slabs:  # e.g. a block-float8 cache
             kv = ttnn.typecast(kv, cache.dtype)
         if slots > grid.x * grid.y:
             s_cap = cache.shape[2]
@@ -715,6 +740,9 @@ class TtMinistral3Attention:
             use_height_and_width_as_shard_shape=True,
         )
         kv = ttnn.to_memory_config(ttnn.reshape(kv, (1, slots, s, d)), slab_cfg)
+        if kv.dtype != cache.dtype:  # (cast_on_slabs) each core casts its own slab in L1
+            kv_in, kv = kv, ttnn.typecast(kv, cache.dtype, memory_config=slab_cfg)
+            ttnn.deallocate(kv_in)
         ttnn.fill_cache(ttnn.reshape(cache, (1, slots, cache.shape[2], d)), kv, 0)
 
     def __call__(
@@ -757,36 +785,61 @@ class TtMinistral3Attention:
         # Prefill QKV on the full grid (ttnn.linear's auto config left this many-row projection on a partial one).
         from models.demos.devstral_small_2_24b_instruct_2512.tt import minimal_mm
 
-        qkv = self._prefill_mm(
-            minimal_mm,
-            x,
-            self.wqkv,
-            config=self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE),
-            compute_kernel_config=self.prefill_proj_cfg,
-            memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
-            dtype=ttnn.bfloat16,
-        )
-        q, k, v = ttnn.experimental.nlp_create_qkv_heads(
-            qkv,
-            num_heads=self.local_heads,
-            num_kv_heads=self.local_kv_heads,
-            transpose_k_heads=False,
-            memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
-        )
-        if qkv_l1:
-            ttnn.deallocate(qkv)
-        if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
-            heads_in = (q, k)
-            v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
-            ttnn.deallocate(v_l1)
+        qkv_cfg = self._prefill_mm_cfg(int(b) * int(s) // ttnn.TILE_SIZE, int(self.wqkv.shape[-1]) // ttnn.TILE_SIZE)
+        if (
+            self.PREFILL_QKV_HEADS_OUT
+            and qkv_cfg is not None
+            and minimal_mm.supported(x, self.wqkv, self.prefill_proj_cfg)
+        ):
+            # the QKV written straight into nlp_create_qkv_heads' q / k / v layouts (minimal_mm heads_out): q / k in L1
+            # (PREFILL_HEADS_L1_BYTES) for the RoPEs, v in DRAM -- no split program, no v copy out of L1
+            qk_mem = ttnn.L1_MEMORY_CONFIG if heads_l1 else ttnn.DRAM_MEMORY_CONFIG
+            q, k, v = minimal_mm.matmul(
+                x,
+                self.wqkv,
+                qkv_cfg,
+                self.prefill_proj_cfg,
+                dtype=ttnn.bfloat16,
+                heads_out=(self.local_heads, self.local_kv_heads, qk_mem, ttnn.DRAM_MEMORY_CONFIG),
+            )
+            if heads_l1:
+                heads_in = (q, k)
+        else:
+            qkv = self._prefill_mm(
+                minimal_mm,
+                x,
+                self.wqkv,
+                config=qkv_cfg,
+                compute_kernel_config=self.prefill_proj_cfg,
+                memory_config=ttnn.L1_MEMORY_CONFIG if qkv_l1 else ttnn.DRAM_MEMORY_CONFIG,
+                dtype=ttnn.bfloat16,
+            )
+            q, k, v = ttnn.experimental.nlp_create_qkv_heads(
+                qkv,
+                num_heads=self.local_heads,
+                num_kv_heads=self.local_kv_heads,
+                transpose_k_heads=False,
+                memory_config=ttnn.L1_MEMORY_CONFIG if heads_l1 else None,
+            )
+            if qkv_l1:
+                ttnn.deallocate(qkv)
+            if heads_l1:  # see PREFILL_HEADS_L1_BYTES; the RoPEs below write q / k to DRAM
+                heads_in = (q, k)
+                v_l1, v = v, ttnn.to_memory_config(v, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(v_l1)
         rope_k = rope_q = self._rope
         if self.meta_rope:
             # One fused RoPE per tensor over every user's heads (the prompt positions are shared by all rows): a
             # 32 x 32 pair-swap per head-dim tile instead of a 128 x 128 rotate-half matmul plus mul / mul / add.
             k_rows = None if rows is None else rows[:2]
             q_rows = None if rows is None else rows[2:4]
-            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows)
-            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows)
+            q_core_bytes = (
+                2 * int(q.shape[0]) * int(q.shape[1]) * int(q.shape[2]) * int(q.shape[3]) // (grid.x * grid.y)
+            )
+            rope_l1 = heads_l1 and q_core_bytes <= self.PREFILL_ROPE_OUT_L1_BYTES
+            rope_mem = ttnn.L1_MEMORY_CONFIG if rope_l1 else None
+            rope_k = lambda t, c, si: self._prefill_rope(t, c, si, k_rows, rope_mem)
+            rope_q = lambda t, c, si: self._prefill_rope(t, c, si, q_rows, rope_mem)
         k = rope_k(k, cos, sin)
         if q_tables is not None:
             q = rope_q(q, *q_tables)  # llama-4 scale already folded into the shared q tables
@@ -851,6 +904,11 @@ class TtMinistral3Attention:
                 compute_kernel_config=self.prefill_sdpa_cfg,
                 memory_config=sdpa_mem,
             )
+        if (
+            self.meta_rope and rope_l1
+        ):  # the L1 RoPE outputs (PREFILL_ROPE_OUT_L1_BYTES), read by SDPA and the cache fill
+            ttnn.deallocate(q)
+            ttnn.deallocate(k)
         heads = attn
         concat_mem = ttnn.L1_MEMORY_CONFIG if concat_l1 else None
         if self.concat_heads is not None and self.concat_heads.supports(attn):
@@ -935,7 +993,13 @@ class TtMinistral3Attention:
             q, k = ttnn.experimental.rotary_embedding_llama_fused_qk(
                 q, k, cos, sin, trans, compute_kernel_config=self.compute_cfg
             )
-            ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import kv_append
+
+            if self.DECODE_KV_APPEND and kv_append.supports(k_cache, k, v_cache, v, cur_pos):
+                stash = cos if self.DECODE_KV_POS_L1 and cos is type(self)._pos_stash else None
+                kv_append.append(k_cache, k, v_cache, v, cur_pos, pos_src=stash)
+            else:
+                ttnn.experimental.paged_fused_update_cache(k_cache, k, v_cache, v, update_idxs_tensor=cur_pos)
             ttnn.deallocate(k)  # free the L1 head shards before SDPA's circular buffers are placed
             ttnn.deallocate(v)
             return self._decode_attend(q, k_cache, v_cache, cur_pos, head_cfg)
@@ -981,6 +1045,11 @@ class TtMinistral3Attention:
             # L1-interleaved: GQA allows no sharded SDPA output, and the head-shard reshard below reads it on-chip
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
+        if self.stream_o is not None and self.decode_all_reduce is not None and self.stream_o.heads_ok(attn):
+            # the o_proj stream concatenates the heads itself, straight out of SDPA's tiles (StreamDownDecode heads=True)
+            p = self.stream_o(attn, memory_config=self.decode_all_reduce.mem, heads=True)
+            ttnn.deallocate(attn)
+            return p if self.defer_decode_reduce else self.decode_all_reduce(p)
         if self.concat_heads_decode is not None and self.concat_heads_decode.supports(attn):
             # (1, 1, B, heads * head_dim) L1-interleaved in one copy program, read straight out of SDPA's tiles
             heads, attn = attn, self.concat_heads_decode(attn)

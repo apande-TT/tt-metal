@@ -19,9 +19,19 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/dataflow/circular_buffer.h"
+#ifdef MM_IN1_TRANSPOSE
+#include "api/compute/transpose.h"
+#endif
 
 #ifndef EPI_TILES
 #define EPI_TILES 1
+#endif
+// MM_IN1_TRANSPOSE (tt/minimal_mm.py matmul(..., swapped=True)): in1 tiles are unpacked transposed and every output
+// tile is transposed on its way out, so (in0 = w^T, in1 = x tiles) computes (x @ w)'s tiles: out^T = w^T @ x^T.
+#ifdef MM_IN1_TRANSPOSE
+constexpr bool MM_TRANSPOSE = true;
+#else
+constexpr bool MM_TRANSPOSE = false;
 #endif
 #ifndef SWIGLU_PAIRS
 #define SWIGLU_PAIRS 1
@@ -34,7 +44,11 @@ void copy_and_pack_block(
     CircularBuffer cb_out(out_cb);
     reconfig_data_format_srca(in_cb);
     pack_reconfig_data_format(out_cb);
+#ifdef MM_IN1_TRANSPOSE
+    transpose_init(in_cb);
+#else
     copy_init(in_cb);
+#endif
     for (uint32_t m = 0; m < M_block_tiles; m++) {
         const uint32_t row_n = m < real_M ? real_N : 0;
         const uint32_t row_base = m * N_block_tiles;
@@ -42,7 +56,11 @@ void copy_and_pack_block(
             const uint32_t nt = (row_n - n) < EPI_TILES ? (row_n - n) : EPI_TILES;
             tile_regs_acquire();
             for (uint32_t t = 0; t < nt; t++) {
+#ifdef MM_IN1_TRANSPOSE
+                transpose_tile(in_cb, row_base + n + t, t);  // the same srcA unpack as copy_tile, transposed
+#else
                 copy_tile(in_cb, row_base + n + t, t);
+#endif
             }
             tile_regs_commit();
             tile_regs_wait();
@@ -404,7 +422,7 @@ void matmul_blocks(
                     in0_index,
                     in1_index,
                     dst_index,
-                    false /*transpose*/,
+                    MM_TRANSPOSE,
                     subblock_w,
                     subblock_h,
                     K_block_tiles);
@@ -486,8 +504,20 @@ void kernel_main() {
         uint32_t current_subblock_h = std::min(current_M_block_tiles, subblock_h);
 
         for (uint32_t n_block_iter = 0; n_block_iter < N_blocks_per_core; n_block_iter++) {
+#ifdef N_SEG_TILES
+            // N blocks within two segments of the core's N range (the readers walk K forward in the first, backward
+            // in the second; in0 is reused only between them, see mm_dm_in0.cpp)
+            constexpr uint32_t n_seg_blocks0 = (N_SEG_TILES + N_block_tiles - 1) / N_block_tiles;
+            const bool n_seg1 = n_block_iter >= n_seg_blocks0;
+            uint32_t n_tile =
+                N_start_tile +
+                (n_seg1 ? N_SEG_TILES + (n_block_iter - n_seg_blocks0) * N_block_tiles : n_block_iter * N_block_tiles);
+            uint32_t n_tile_end = std::min(
+                n_tile + N_block_tiles, n_seg1 ? N_end_tile : std::min(N_start_tile + N_SEG_TILES, N_end_tile));
+#else
             uint32_t n_tile = N_start_tile + n_block_iter * N_block_tiles;
             uint32_t n_tile_end = std::min(n_tile + N_block_tiles, N_end_tile);
+#endif
             uint32_t current_N_block_tiles = n_tile_end - n_tile;
             uint32_t current_subblock_w = std::min(current_N_block_tiles, subblock_w);
             // the tiles the block computes: SKIP_PADDING drops its rows / columns past the real extents
@@ -511,7 +541,7 @@ void kernel_main() {
             matmul_block_init(
                 in0_cb,
                 in1_cb,
-                false /*transpose*/,
+                MM_TRANSPOSE,
                 current_subblock_w /*ct_dim*/,
                 current_subblock_h /*rt_dim*/,
                 K_block_tiles /*kt_dim*/);
@@ -567,6 +597,9 @@ void kernel_main() {
                 if (k_block == K_num_blocks - 1) {
                     if (n_block_iter < N_blocks_per_core - 1) {
                         reuse_in0_block = true;  // striding N next: in0 is reused
+#ifdef N_SEG_TILES
+                        reuse_in0_block = n_block_iter + 1 == n_seg_blocks0;
+#endif
                     }
                 }
                 if (!reuse_in0_block) {

@@ -27,6 +27,18 @@ BLK = 4  # tiles a block (fp32 DEST holds 4)
 CB_X, CB_D, CB_SCALER, CB_H, CB_X2, CB_MASK, CB_OUT, CB_S, CB_SRAW = 0, 1, 2, 3, 4, 5, 16, 17, 18
 # apply()'s stats tile holds the row sum in column 0 and exact zeros in columns 1..31 (no masking needed after a gather)
 CLEAN_STATS = True
+# shard try (run 8): the one-tile-wide stats (~16 KB a core at 416 rows) in L1 for the norm's stats all_gather
+STATS_L1 = True
+# structural try (run 8): the stats written compacted -- each stats tile's column 0 (its 32 row sums) as one row of a
+# compact tile, (1, 1, tile_rows, 32) for tile_rows a multiple of 32 -- so the norm's stats all_gather moves 1/32 of
+# the bytes; tt/stats_expand.py rebuilds the gathered (..., S, 128) tiles exactly (zeros + column 0) for the sum
+COMPACT_STATS = True
+CB_ROW = 19
+# cpp try (run 8): h, its writer copy and h^2 from one DEST pass (kernels/add_stats_compute.cpp ONE_PASS), no cb_h
+ONE_PASS = True
+# apply_l1's per-core shard bounds (see l1_copy_cores)
+L1_COPY_MIN_CORES = 64
+L1_COPY_MAX_BYTES = 640 * 1024
 
 
 def _accessor_args(tensor):
@@ -66,6 +78,43 @@ def apply(x, d):
     return _run(x, d, cast=False)
 
 
+def compact_rows(x):
+    """Tile rows of x's stats when apply() writes them compacted (COMPACT_STATS), else 0."""
+    shape = [int(s) for s in x.shape]
+    rows = 1
+    for s in shape[:-1]:
+        rows *= s
+    rt = rows // _TILE
+    return rt if COMPACT_STATS and rt % _TILE == 0 and rt >= 2 * _TILE else 0
+
+
+def is_compact(stats, x) -> bool:
+    """Whether stats is apply()'s compacted stats tensor for the residual x."""
+    rt = compact_rows(x)
+    return bool(rt) and tuple(int(s) for s in stats.shape) == (1, 1, rt, _TILE)
+
+
+def l1_copy_cores(x):
+    """Cores of apply_l1's height shard for x's rows (whole tile rows a core, the most cores that split them evenly),
+    or 0 when no even split reaches L1_COPY_MIN_CORES or a core's fp32 shard would exceed L1_COPY_MAX_BYTES."""
+    shape = [int(s) for s in x.shape]
+    rows = 1
+    for s in shape[:-1]:
+        rows *= s
+    rt, wt = rows // _TILE, shape[-1] // _TILE
+    grid = x.device().compute_with_storage_grid_size()
+    n = max(c for c in range(1, min(int(grid.x) * int(grid.y), rt) + 1) if rt % c == 0)
+    if n < L1_COPY_MIN_CORES or rt // n * wt * _TILE_BYTES[ttnn.float32] > L1_COPY_MAX_BYTES:
+        return 0
+    return n
+
+
+def apply_l1(x, d):
+    """apply() that also returns a height-sharded L1 copy of h (fp32, l1_copy_cores(x) cores, each its own tile rows,
+    written by the same pass): (h, stats, h_l1). The caller deallocates h_l1."""
+    return _run(x, d, cast=False, l1_copy=True)
+
+
 def apply_bf16(x, d):
     """bf16(x + d) [..., S, W] for the same inputs: the fp32 sum rounded by the SFPU typecast ttnn.typecast runs
     (bit-identical to apply()'s h followed by ttnn.typecast to bf16), with no fp32 h and no stats written. For the
@@ -73,7 +122,7 @@ def apply_bf16(x, d):
     return _run(x, d, cast=True)
 
 
-def _run(x, d, cast):
+def _run(x, d, cast, l1_copy=False):
     device = x.device()
     shape = [int(s) for s in x.shape]
     rows = 1
@@ -82,13 +131,36 @@ def _run(x, d, cast):
     rt, wt = rows // _TILE, shape[-1] // _TILE
     grid = device.compute_with_storage_grid_size()
     gx, ncores = int(grid.x), min(int(grid.x) * int(grid.y), rt)
+    if l1_copy:
+        ncores = l1_copy_cores(x)
+        assert ncores, "add_stats.apply_l1: no even L1 shard for these rows"
     cores = ttnn.num_cores_to_corerangeset(ncores, grid, row_wise=True)
     out_dtype = ttnn.bfloat16 if cast else ttnn.float32
     h = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), out_dtype, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
+    h_l1 = None
+    if l1_copy:
+        h_l1 = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(shape),
+            ttnn.float32,
+            ttnn.TILE_LAYOUT,
+            device,
+            ttnn.create_sharded_memory_config(
+                (rt // ncores * _TILE, shape[-1]),
+                core_grid=cores,
+                strategy=ttnn.ShardStrategy.HEIGHT,
+                orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                use_height_and_width_as_shard_shape=True,
+            ),
+        )
     stats = None
+    compact = not cast and bool(compact_rows(x))
     if not cast:
         stats = ttnn.allocate_tensor_on_device(
-            ttnn.Shape(shape[:-1] + [_TILE]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
+            ttnn.Shape([1, 1, rt, _TILE] if compact else shape[:-1] + [_TILE]),
+            ttnn.float32,
+            ttnn.TILE_LAYOUT,
+            device,
+            ttnn.L1_MEMORY_CONFIG if STATS_L1 else ttnn.DRAM_MEMORY_CONFIG,
         )
     xa, da, ha = x.buffer_address(), d.buffer_address(), h.buffer_address()
     base, extra = divmod(rt, ncores)
@@ -99,6 +171,8 @@ def _run(x, d, cast):
         cy, cx = divmod(c, gx)
         rr.append(((cx, cy), [xa, da, r0, nr]))
         rw.append(((cx, cy), [ha, r0, nr] if cast else [ha, stats.buffer_address(), r0, nr]))
+        if h_l1 is not None:
+            rw[-1][1].append(h_l1.buffer_address())
         rc.append(((cx, cy), [nr]))
         r0 += nr
     cfg = ttnn.ComputeConfigDescriptor()
@@ -130,6 +204,7 @@ def _run(x, d, cast):
             compile_time_args=[wt, BLK] + _accessor_args(h) + ([] if cast else _accessor_args(stats)),
             runtime_args=rw,
             config=ttnn.WriterConfigDescriptor(),
+            defines=([("L1_COPY", "1")] if h_l1 is not None else []) + ([("COMPACT_STATS", "1")] if compact else []),
         ),
         ttnn.KernelDescriptor(
             kernel_source=_CAST_COMPUTE if cast else _COMPUTE,
@@ -138,6 +213,7 @@ def _run(x, d, cast):
             compile_time_args=[wt, BLK],
             runtime_args=rc,
             config=cfg,
+            defines=[("ONE_PASS", "1")] if ONE_PASS and not cast else [],
         ),
     ]
     cbs = [
@@ -149,13 +225,19 @@ def _run(x, d, cast):
         cbs.append(_cb(cores, CB_OUT, out_dtype, 2 * BLK))
         ttnn.generic_op([x, d, h], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
         return h
+    cbs += [] if ONE_PASS else [_cb(cores, CB_H, ttnn.float32, wt)]
     cbs += [
-        _cb(cores, CB_H, ttnn.float32, wt),
         _cb(cores, CB_X2, ttnn.float32, wt),
         _cb(cores, CB_OUT, ttnn.float32, 2 * BLK),
         _cb(cores, CB_S, ttnn.float32, 2),
         _cb(cores, CB_MASK, ttnn.float32, 1),
         _cb(cores, CB_SRAW, ttnn.float32, 2),
     ]
+    if compact:  # the 32 row sums of a stats tile, gathered into one row
+        fmt = ttnn.CBFormatDescriptor(buffer_index=CB_ROW, data_format=ttnn.uint32, page_size=128)
+        cbs.append(ttnn.CBDescriptor(total_size=128, core_ranges=cores, format_descriptors=[fmt]))
+    if h_l1 is not None:
+        ttnn.generic_op([x, d, h, stats, h_l1], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+        return h, stats, h_l1
     ttnn.generic_op([x, d, h, stats], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
     return h, stats

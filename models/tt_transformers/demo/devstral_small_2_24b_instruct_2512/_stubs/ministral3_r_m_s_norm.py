@@ -50,6 +50,16 @@ class TtMinistral3RMSNorm:
     # multiplying by the all-ones row -- the interleaved kernel then holds no 5120-wide gamma row in L1 (its static
     # buffers ended ~27 KB under the L1 top, leaving no room for the decode all_reduce's 40-core scratch).
     UNIT_PREFILL_NO_WEIGHT = True
+    # The decode norm whose width shards feed the HiFi2 QKV directly (decode keep_sharded) runs without the all-ones
+    # weight: with it, rms_norm adds a FUSE_GAMMA pass (x * 1.0 through SrcA) whose only effect is truncating the fp32
+    # output to TF32, and the HiFi2 QKV multiplies only the high bits of its in0 anyway (a bf16-truncated row gives
+    # bit-identical products), so the QKV output is unchanged and the norm skips the pass.
+    DECODE_SHARDED_NO_WEIGHT = True
+    # The sharded prefill final norm's normed rows and gamma product land in L1 for its all_gather (shard tries, run 8).
+    FINAL_GAMMA_OUT_L1 = True
+    # cpp try (run 8): ... that gamma multiply as tt/gamma_mul.py's program (binary_ng's SFPU row-broadcast multiply
+    # with gamma broadcast once a core and 4 tiles a DEST acquire; bit-identical)
+    FINAL_GAMMA_CPP = True
 
     def __init__(self, canonical_instance, gamma=None, gamma_rows=None, unit_weight=False) -> None:
         self._impl = canonical_instance
@@ -141,10 +151,11 @@ class TtMinistral3RMSNorm:
         l1 (unit gamma only): unshard into L1 instead of DRAM (the decode gate / up multicast the row from there
         once per K block, so each block's activation fetch skips a DRAM round trip)."""
         mem, prog = self._decode_cfg(int(x.shape[-1]))
+        no_weight = keep_sharded and self.gamma is None and self.unit_weight and self.DECODE_SHARDED_NO_WEIGHT
         n = ttnn.rms_norm(
             ttnn.to_memory_config(x, mem),
             epsilon=self._impl.eps,
-            weight=self._impl.weight,
+            weight=None if no_weight else self._impl.weight,
             program_config=prog,
             memory_config=mem,
             compute_kernel_config=self._impl.compute_kernel_config_hifi2,
@@ -159,7 +170,9 @@ class TtMinistral3RMSNorm:
         n = ttnn.to_memory_config(n, ttnn.DRAM_MEMORY_CONFIG)
         return ttnn.multiply(n, self.gamma, dtype=ttnn.bfloat16)
 
-    def __call__(self, x, *args, **kwargs):
+    def __call__(self, x, *args, hidden_shard=None, **kwargs):
+        if hidden_shard is not None:
+            return self._sharded_prefill(x, **hidden_shard)
         # Canonical RMSNorm takes the 4D [1, 1, S, H] prefill layout; restore the caller's rank.
         shape = tuple(x.shape)
         if len(shape) != 4:
@@ -171,6 +184,42 @@ class TtMinistral3RMSNorm:
         if self.gamma is not None:
             out = ttnn.multiply(out, self.gamma)
         return ttnn.reshape(out, shape)
+
+    def _sharded_prefill(self, x, hidden, stats_mask, gamma_shard, ccl):
+        """This norm (with its checkpoint gamma) on a TP mesh's bf16 hidden shard x (B, 1, S, D / TP), gathered once
+        at the end (structural try, run 8; the model's final norm, see TtMinistral3Model.SHARDED_FINAL_NORM): each
+        device's row sums of squares, an all_gather of those sums (masked to column 0, summed in fp32), x *
+        rsqrt(mean + eps) on the shard, * the device's gamma columns, and ONE all_gather of the bf16 result --
+        instead of gathering the residual and norming + multiplying the full width redundantly on every device."""
+        cfg = self._impl.compute_kernel_config_hifi2
+        sq = ttnn.rms_norm_pre_all_gather(x, compute_kernel_config=cfg, dtype=ttnn.float32)
+        sq = ttnn.all_gather(sq, dim=3, **ccl)
+        sq = ttnn.multiply(sq, stats_mask)
+        sq = ttnn.sum(sq, dim=-1, keepdim=True, compute_kernel_config=cfg)
+        r = ttnn.unary_chain(
+            sq,
+            [
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, 1.0 / hidden),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.ADD_UNARY_SFPU, self._impl.eps),
+                ttnn.UnaryWithParam(ttnn.UnaryOpType.RSQRT, 0.0),
+            ],
+        )
+        y = ttnn.multiply(
+            x, r, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG if self.FINAL_GAMMA_OUT_L1 else None
+        )
+        if self.FINAL_GAMMA_OUT_L1:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import gamma_mul
+
+            if self.FINAL_GAMMA_CPP and gamma_mul.supports(y, gamma_shard):
+                g = gamma_mul.scale(y, gamma_shard, ttnn.L1_MEMORY_CONFIG)
+            else:
+                g = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(y)
+            out = ttnn.all_gather(g, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG, **ccl)
+            ttnn.deallocate(g)
+            return out
+        y = ttnn.multiply(y, gamma_shard, dtype=ttnn.bfloat16)
+        return ttnn.all_gather(y, dim=3, **ccl)
 
 
 # Module-level `build` — primary test entry point.
