@@ -34,6 +34,9 @@ void kernel_main() {
     constexpr uint32_t csize = get_compile_time_arg_val(4);
     constexpr uint32_t transpose_b = get_compile_time_arg_val(5);
     constexpr uint32_t lanes = 8;
+    constexpr uint32_t products = 3 * lanes;
+    // float32 DEST tiles beside the sum: 7 with the full-sync DEST (lane_program sets dst_full_sync_en)
+    constexpr uint32_t group = 7;
 
     constexpr uint32_t cb_a = 0;
     constexpr uint32_t cb_b = 1;
@@ -80,25 +83,33 @@ void kernel_main() {
             b.wait_front(2 * Kt);
             out.reserve_back(1);
             tile_regs_acquire();
-            bool first = true;
-            for (uint32_t i = 0; i < 2; ++i) {
-                for (uint32_t j = 0; i + j < 2; ++j) {
-                    for (uint32_t r = 0; r < lanes; ++r) {
-                        const uint32_t dst = first ? 0 : 1;
-                        if (!first) {
-                            fill_tile_init();
-                            fill_tile(1, 0.0f);
-                        }
-                        matmul_init(cb_m, cb_b, transpose_b);
-                        for (uint32_t kt = 0; kt < Kt; ++kt) {
-                            matmul_tiles(cb_m, cb_b, (i * lanes + r) * Kt + kt, j * Kt + kt, dst);
-                        }
-                        if (!first) {
-                            add_binary_tile_init();
-                            add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
-                        }
-                        first = false;
+            // the first lane product straight into the sum tile (DEST 0), then the rest in groups of up to
+            // `group` products in DEST 1..group (zeroed, one matmul init per group) added to the sum in
+            // order: the same products and the same float32 adds as one product + add at a time
+            matmul_init(cb_m, cb_b, transpose_b);
+            for (uint32_t kt = 0; kt < Kt; ++kt) {
+                matmul_tiles(cb_m, cb_b, kt, kt, 0);
+            }
+            for (uint32_t s0 = 1; s0 < products; s0 += group) {
+                const uint32_t g = s0 + group < products ? group : products - s0;
+                fill_tile_init();
+                for (uint32_t q = 0; q < g; ++q) {
+                    fill_tile(1 + q, 0.0f);
+                }
+                matmul_init(cb_m, cb_b, transpose_b);
+                for (uint32_t q = 0; q < g; ++q) {
+                    // product s = (term, lane): terms (0, 0), (0, 1), (1, 0), lanes 0..7 inner
+                    const uint32_t s = s0 + q;
+                    const uint32_t r = s % lanes;
+                    const uint32_t i = s / lanes == 2 ? 1 : 0;
+                    const uint32_t j = s / lanes == 1 ? 1 : 0;
+                    for (uint32_t kt = 0; kt < Kt; ++kt) {
+                        matmul_tiles(cb_m, cb_b, (i * lanes + r) * Kt + kt, j * Kt + kt, 1 + q);
                     }
+                }
+                add_binary_tile_init();
+                for (uint32_t q = 0; q < g; ++q) {
+                    add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1 + q, 0);
                 }
             }
             tile_regs_commit();

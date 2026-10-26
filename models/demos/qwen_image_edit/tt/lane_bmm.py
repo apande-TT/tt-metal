@@ -119,6 +119,7 @@ def lane_program(pa, pb, transpose_b, mem, diag_fn, n_diag, n_copies, compute_ke
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
+    cfg.dst_full_sync_en = True  # 8 float32 DEST tiles: lane_bmm.cpp batches 7 lane products per group
     cfg.math_approx_mode = False
     acc = []
     for t in (pa[0], pa[1], pb[0], pb[1], diag):
