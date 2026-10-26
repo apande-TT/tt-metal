@@ -19,8 +19,10 @@ from __future__ import annotations
 # sys.path (perf_test_mcp.py:21) and `cc_optimize` IS the root. Both spellings are tried, which
 # is what every other cross-package import in this tree does.
 try:
+    from ..agent import marker_vocab as _vocab
     from ..agent import stage_seams as _seams
 except ImportError:  # perf_automation itself is the sys.path root
+    from agent import marker_vocab as _vocab
     from agent import stage_seams as _seams
 
 import json
@@ -77,17 +79,11 @@ def _install():
 
 _BLOCK_TAG = "_perf_block_idx"
 _STACK_TAG = "_perf_stack_idx"
-_SIGNPOST_PREFIX = "PERF_BLOCK_SIGNPOST:"
-# A BLOCK HAS TWO EDGES AND ONLY ONE WAS MARKED. With a start marker alone, every op emitted
-# after the last block of a stack is attributed to that block -- and "after the last block" is
-# the whole rest of the model. Measured on Voxtral 2026-08-13: a normal encoder block dispatches
-# 20 ops and the LAST one was credited with 12573, i.e. 67% of the entire run, including
-# embedding, rms_norm, silu, scaled_dot_product_attention_decode and argmax -- language-model
-# decode ops that are not in the encoder at all. Coverage then concluded the encoder needs all 32
-# layers (it needs 1-2: all 32 blocks are one class emitting identical ops), max() took 32 as the
-# window, capping to 32 changed no work, and the run profiled the whole model.
-_SIGNPOST_END_PREFIX = "PERF_BLOCK_SIGNPOST_END:"
-_STAGE_PREFIX = "PERF_STAGE_SIGNPOST:"
+# This file EMITS these; marker_vocab spells them, because three other modules parse them back and
+# the copies had already drifted. The reason a block needs a closing edge is recorded there too.
+_SIGNPOST_PREFIX = _vocab.BLOCK
+_SIGNPOST_END_PREFIX = _vocab.BLOCK_END
+_STAGE_PREFIX = _vocab.STAGE
 
 
 _ATOMIC = (str, bytes, bytearray, int, float, bool, complex, type(None))
@@ -890,6 +886,35 @@ def _install_block_signposts():
     return []
 
 
+# HOW MANY ORDINARY OPS THE PRINTED SEQUENCE CARRIES. The capture itself is unbounded -- a
+# five-stage pipeline reached 1,133,392 entries -- so the line has to be cut somewhere or the
+# reader is handed ~59 MB of JSON through a pipe. This is the cut that was always here.
+_SEQ_PRINT_OPS = 50000
+
+
+def _printable_seq(seq, cap: int = _SEQ_PRINT_OPS) -> list:
+    """The head of `seq`, PLUS every control token that falls past it, in original order.
+
+    THE CUT MUST NOT EAT THE STRUCTURE. A head slice keeps the first ops and drops every marker
+    emitted later -- and the markers are the only record of which block ran inside which stage.
+    They are a rounding error in size: of those 1,133,392 entries, 691 were markers, 0.06%.
+
+    Qwen-Image-Edit 2026-10-25: four stages ran ahead of the transformer and exhausted the slice
+    before it reached them, so all 60 of its block signposts fell past the cut. The walk had found
+    the stack and the blocks had announced themselves; the sequence simply did not carry it.
+    full_blocks read 0, which run.py reports as "the built model exposes NO discoverable block
+    stacks" -- the depth knob was declared unusable, the profile ran all 60 blocks, and the run
+    died after 10.6 h having overflowed the device profiler's buffer. One head slice, two nights.
+
+    Deletion only, never reordering, so the surviving tokens keep the order they ran in: everything
+    before the cut holds its place and the later markers follow, which is where they were. The head
+    is the same slice as before, so _work_signal -- which ignores control tokens -- is unchanged.
+    """
+    head = list((seq or [])[:cap])
+    tail = [t for t in (seq or [])[cap:] if _vocab.is_control(t)]
+    return head + tail
+
+
 def main(node: str, case: str | None = None) -> None:
     _install()
     _install_block_signposts()
@@ -911,7 +936,7 @@ def main(node: str, case: str | None = None) -> None:
         pass
     print("PERF_OP_SIGS=" + json.dumps(sorted(_SIGS)), flush=True)
     print("PERF_OP_SIG_COUNTS=" + json.dumps(Counter(_SEQ)), flush=True)
-    print("PERF_OP_SIG_SEQUENCE=" + json.dumps(_SEQ[:50000]), flush=True)
+    print("PERF_OP_SIG_SEQUENCE=" + json.dumps(_printable_seq(_SEQ)), flush=True)
 
 
 if __name__ == "__main__":
