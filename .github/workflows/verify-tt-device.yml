@@ -1,8 +1,8 @@
 name: verify-tt-device
 
 # Device-side verification of the auto-synced tool branch (apande-TT:feature/tt-hw-planner).
-# The cloud auto-sync (sync-upstream.yml) only merges + pushes -- it has no TT hardware, so it
-# cannot prove the merge still builds and still computes correct numbers. This workflow does
+# The daily auto-sync (the tt-sync-upstream systemd timer on the TT box) only merges + pushes,
+# so it cannot prove the merge still builds and still computes correct numbers. This workflow does
 # that on a self-hosted TT box labelled `tt-verify`.
 #
 # RUNS DAILY, BUT YIELDS TO HUMANS. The TT box is an interactive machine that people also drive
@@ -62,7 +62,7 @@ jobs:
     steps:
       # Scripts only -- preflight must stay cheap and must not clone the tree it may not touch.
       # Defaults to this workflow's own ref, which is where the helpers live (the tool branch does
-      # not carry them: it has no berlin_gate.sh either).
+      # not carry them).
       - name: Checkout CI helpers
         uses: actions/checkout@v4
         with:
