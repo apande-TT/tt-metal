@@ -310,6 +310,9 @@ EXACT_BMM_L1_BYTES = 0
 EXACT_CORE_GRID = None
 # split_matmul's plain (exact=False) limb products on this core grid (None: ttnn picks its own)
 BMM_CORE_GRID = None
+# the vision attention's float32 RoPE intermediates (x * cos, rotate_half(x), its * sin) in L1 when q / k take at most
+# this many bytes (0: DRAM)
+VISION_ROPE_L1_BYTES = 0
 # the vision attention's logit scale applied as the mask add's input activation (False: multiply + add)
 VISION_FUSED_SCALE_MASK = False
 # fn(qkv, off, heads, head_dim, mem) -> [N, heads, S, head_dim] head-major (the column block off + h * head_dim per
@@ -516,14 +519,20 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
 
 
-def rotate_half(t):
-    """HF rotate_half(x) = cat(-x[..., D/2:], x[..., :D/2]) by slicing (exact; the x @ R form rounds)."""
+def rotate_half(t, mem=None):
+    """HF rotate_half(x) = cat(-x[..., D/2:], x[..., :D/2]) by slicing (exact; the x @ R form rounds).
+    mem: memory config of the halves and the result (None: the ops' defaults)."""
     shape = list(t.shape)
     half = shape[-1] // 2
     lo_end = shape[:-1] + [half]
-    x1 = ttnn.slice(t, [0] * len(shape), lo_end)
-    x2 = ttnn.slice(t, [0] * (len(shape) - 1) + [half], shape)
-    return ttnn.concat([ttnn.neg(x2), x1], dim=-1)
+    kw = {} if mem is None else {"memory_config": mem}
+    x1 = ttnn.slice(t, [0] * len(shape), lo_end, **kw)
+    x2 = ttnn.slice(t, [0] * (len(shape) - 1) + [half], shape, **kw)
+    out = ttnn.concat([ttnn.neg(x2, **kw), x1], dim=-1, **kw)
+    if mem is not None and mem.buffer_type == ttnn.BufferType.L1:
+        ttnn.deallocate(x1)
+        ttnn.deallocate(x2)
+    return out
 
 
 def _bmm_full_k_config(a, b, transpose_b):
@@ -790,7 +799,18 @@ class TtVisionAttention:
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
         def _rope(t):
-            return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
+            if not (0 < 4 * math.prod([int(d) for d in t.padded_shape]) <= VISION_ROPE_L1_BYTES):
+                return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
+            # the rotation's intermediates in L1; only the result goes to DRAM
+            l1 = ttnn.L1_MEMORY_CONFIG
+            a = ttnn.multiply(t, cos, memory_config=l1)
+            r = rotate_half(t, l1)
+            b = ttnn.multiply(r, sin, memory_config=l1)
+            ttnn.deallocate(r)
+            out = ttnn.add(a, b, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(a)
+            ttnn.deallocate(b)
+            return out
 
         q, k = _rope(q), _rope(k)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
