@@ -86,6 +86,8 @@ class TtRMSNorm:
         self._device = device
         self.weight32 = None
         self.precise = False
+        # precise path as one fused call fn(x32, weight32, eps) (bit-identical to the chain below); None = the chain
+        self.fused_fn = None
 
     def _ensure_w32(self):
         if self.weight32 is None:
@@ -98,6 +100,8 @@ class TtRMSNorm:
     def __call__(self, x):
         if self.precise:
             x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
+            if self.fused_fn is not None and len(self._w32_host) == 1:
+                return self.fused_fn(x32, self._ensure_w32(), self.eps)
             l1 = 0 < 4 * math.prod([int(d) for d in x32.padded_shape]) <= NORM_L1_BYTES
             kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
             sq = ttnn.multiply(x32, x32, **kw)
