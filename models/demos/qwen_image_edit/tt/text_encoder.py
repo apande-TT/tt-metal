@@ -168,6 +168,7 @@ class TtQwenTextEncoder:
         _te_layer.SOFTMAX_L1_BYTES = 8 * 1024 * 1024  # and its softmax intermediates in L1
         _te_layer.SOFTMAX_FUSED_EXP = True  # with the exp fused into the scores - max subtract
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
+        _te_attention.VISION_ROPE_L1_BYTES = 4 * 1024 * 1024  # its RoPE intermediates (q / k: 2.2 MB) in L1
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
         # faces), not slice + reshape [N, S, heads, 80] + permute (the reshape pads the 4 local heads to a tile dim)
         _te_attention.VISION_HEADS_FN = fused_face_heads
