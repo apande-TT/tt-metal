@@ -396,7 +396,8 @@ def _block_config(x, w):
 
 
 def _bias_rows(bias):
-    """float32 [1, 1, 32, N] TILE with the [.., 1, N] bias in every row (built once per bias tensor: 0 + bias)."""
+    """float32 [1, 1, 32, N] TILE with the [.., 1, N] bias in every row, built on device once per bias tensor
+    (0 + bias). Build it at load time: a first build inside a trace capture replays with every call."""
     if id(bias) not in _BIAS_ROWS:
         b = ttnn.typecast(bias, ttnn.float32)
         n = int(b.shape[-1])
@@ -700,6 +701,7 @@ class TtVisionAttention:
         bqkv = torch.cat(b_blocks, dim=0).reshape(1, 1, 1, -1)
         self.wqkv = upload(device, wqkv_t, mapper=shard_mapper(device, -1))
         self.bqkv = upload(device, bqkv, mapper=shard_mapper(device, -1))
+        _bias_rows(self.bqkv)  # LINEAR_BIAS_FUSED's bias rows built here, at load time (never inside a trace capture)
         # proj: row-parallel -- input rows are head-major, so chip d's rows match its local heads.
         self.wproj = upload(
             device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
