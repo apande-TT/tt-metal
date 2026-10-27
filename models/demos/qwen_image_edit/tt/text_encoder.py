@@ -135,7 +135,7 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_LINEAR_FN = fused_lane_linear
         _te_attention.EXACT_LINEAR_PATTERNS_FN = fused_lane_linear_patterns  # all patterns + median in one
         # and the float32 bias add of those linears (vision qkv) after the median in the same program (its bias rows
-        # built when the attention loads, so no trace capture records the build)
+        # built on host when the attention loads, so neither a trace capture nor a device op records the build)
         _te_attention.LINEAR_BIAS_FUSED = True
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
