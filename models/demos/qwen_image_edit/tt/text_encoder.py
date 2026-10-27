@@ -170,6 +170,7 @@ class TtQwenTextEncoder:
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
+        _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
         self.set_precise(True)
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
