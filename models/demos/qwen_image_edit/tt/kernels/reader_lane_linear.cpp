@@ -6,7 +6,9 @@
 //   cb 2: the 8 diagonal 0/1 lane tiles E_q = diag(col % 8 == q), once;
 //   per unit (row block rb, output columns [nt0, nt1)):
 //     cb 1: the weight's column block, row-major kt * csize + (nt - nt0), once per unit (csize * Kt entries);
-//     per limb i: cb 0: the limb's row block (K tile kt -> kt).
+//     per limb i: cb 0: the limb's row block (K tile kt -> kt);
+//     with a bias (patterns = 3): cb 8: the bias tiles of the unit's output columns (float32, the bias in every
+//     row), for the median epilogue.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -21,17 +23,20 @@ void kernel_main() {
     const uint32_t d_addr = get_arg_val<uint32_t>(4);
     const uint32_t start_unit = get_arg_val<uint32_t>(5);
     const uint32_t num_units = get_arg_val<uint32_t>(6);
+    const uint32_t bias_addr = get_arg_val<uint32_t>(7);
 
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
     constexpr uint32_t Nt = get_compile_time_arg_val(1);
     constexpr uint32_t chunks = get_compile_time_arg_val(2);
     constexpr uint32_t csize = get_compile_time_arg_val(3);
     constexpr uint32_t limbs = get_compile_time_arg_val(4);
+    constexpr bool has_bias = get_compile_time_arg_val(5) != 0;
     constexpr auto a0_args = TensorAccessorArgs<6>();
     constexpr auto a1_args = TensorAccessorArgs<a0_args.next_compile_time_args_offset()>();
     constexpr auto a2_args = TensorAccessorArgs<a1_args.next_compile_time_args_offset()>();
     constexpr auto w_args = TensorAccessorArgs<a2_args.next_compile_time_args_offset()>();
     constexpr auto d_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
+    constexpr auto bias_args = TensorAccessorArgs<d_args.next_compile_time_args_offset()>();
     constexpr uint32_t lanes = 8;
 
     constexpr uint32_t cb_a = 0;
@@ -84,6 +89,18 @@ void kernel_main() {
             }
             noc.async_read_barrier();
             da.push_back(Kt);
+        }
+        if constexpr (has_bias) {
+            constexpr uint32_t cb_bias = 8;
+            const auto bs = TensorAccessor(bias_args, bias_addr);
+            const uint32_t bpage = get_local_cb_interface(cb_bias).fifo_page_size;
+            DataflowBuffer dbias(cb_bias);
+            dbias.reserve_back(csize);
+            for (uint32_t nt = nt0; nt < nt1; ++nt) {
+                noc.async_read(bs, dbias, bpage, {.page_id = nt}, {.offset_bytes = (nt - nt0) * bpage});
+            }
+            noc.async_read_barrier();
+            dbias.push_back(csize);
         }
     }
 }

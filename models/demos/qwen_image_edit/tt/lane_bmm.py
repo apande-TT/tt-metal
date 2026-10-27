@@ -188,6 +188,24 @@ def fused_lane_linear(parts, w, lanes, mem):
     and the 8 lanes of (part * mask_r) @ w (w: bf16 [K, N] TILE, any interleaved buffer); lanes: lane id of each
     K entry. -> float32 [..., M, N] in `mem` (kernels/lane_linear.cpp), or None when the operands do not fit
     the kernel (the caller then runs the stock ops)."""
+    return fused_lane_linear_patterns(parts, w, [lanes], mem)
+
+
+def fused_lane_linear_patterns(parts, w, lane_lists, mem, bias=None):
+    """fused_lane_linear over 1 or 3 lane patterns in one program; with 3, the elementwise median of the three
+    patterns' products (split_linear's vote), the weight block and limbs loaded once for all of them. bias (3
+    patterns only): float32 [1, 1, 32, N] TILE, the bias in every row, added to the median by one float32 add
+    (round to nearest even), as a ttnn.add of the [1, 1, 1, N] bias after the vote would."""
+    if len(lane_lists) not in (1, 3):
+        return None
+    if bias is not None and (
+        len(lane_lists) != 3
+        or bias.dtype != ttnn.float32
+        or bias.layout != ttnn.TILE_LAYOUT
+        or bias.is_sharded()
+        or [int(v) for v in bias.padded_shape][-2:] != [_TILE, int(w.padded_shape[-1])]
+    ):
+        return None
     if not 1 <= len(parts) <= 3 or len(w.shape) != 2 or w.dtype != ttnn.bfloat16:
         return None
     if any(p.dtype != ttnn.bfloat16 or p.layout != ttnn.TILE_LAYOUT or p.is_sharded() for p in parts):
@@ -196,10 +214,13 @@ def fused_lane_linear(parts, w, lanes, mem):
         return None
     a_s, w_s = [int(v) for v in parts[0].padded_shape], [int(v) for v in w.padded_shape]
     k = int(parts[0].shape[-1])
-    shift = _lane_shift(lanes)
+    shifts = [_lane_shift(lanes) for lanes in lane_lists]
     # whole K tiles only (no padded K entries for the lane masks to cover), K matching the weight
-    if shift is None or len(lanes) != k or k % _TILE or a_s[-1] != k or w_s[0] != k or int(w.shape[0]) != k:
+    if any(s is None for s in shifts) or any(len(lanes) != k for lanes in lane_lists):
         return None
+    if k % _TILE or a_s[-1] != k or w_s[0] != k or int(w.shape[0]) != k:
+        return None
+    n_pat = len(lane_lists)
     if any([int(v) for v in p.padded_shape] != a_s for p in parts[1:]):
         return None
     k_t, n_t = k // _TILE, w_s[1] // _TILE
@@ -211,11 +232,14 @@ def fused_lane_linear(parts, w, lanes, mem):
     # core: a limb (double-buffered), the weight block, the 8 lane tiles, one lane copy, the running sums and
     # the output (float32). Pick the column split with the least work on the busiest core (lane copies cost
     # about two columns' products)
+    a_tiles = len(parts) * k_t  # every limb's row block, held for all the unit's patterns
     best = None
     for c in range(1, n_t + 1):
         csize = -(-n_t // c)
         chunks = -(-n_t // csize)
-        if (2 * k_t + _LANES + k_t + csize * k_t) * 2048 + (csize + 4) * 4096 > 900 * 1024:
+        est = 6 * csize if n_pat == 3 else 0  # the three patterns' sums awaiting their median (double-buffered)
+        est += csize if bias is not None else 0  # and the unit's bias tiles
+        if (a_tiles + _LANES + k_t + csize * k_t) * 2048 + (csize + est + 4) * 4096 > 900 * 1024:
             continue
         cost = -(-rows * chunks // cores_n) * (csize + 2)
         if best is None or cost < best[0]:
@@ -239,13 +263,17 @@ def fused_lane_linear(parts, w, lanes, mem):
         )
 
     cbs = [
-        _cb(0, ttnn.bfloat16, 2048, 2 * k_t),
+        _cb(0, ttnn.bfloat16, 2048, a_tiles),
         _cb(1, ttnn.bfloat16, 2048, csize * k_t),
         _cb(2, ttnn.bfloat16, 2048, _LANES),
         _cb(3, ttnn.bfloat16, 2048, k_t),
         _cb(4, ttnn.float32, 4096, csize),
         _cb(16, ttnn.float32, 4096, 4),
     ]
+    if n_pat == 3:  # each pattern's sums in its own cb (5, 6, 7), read front tile first
+        cbs += [_cb(5 + q, ttnn.float32, 4096, 2 * csize) for q in range(3)]
+    if bias is not None:
+        cbs.append(_cb(8, ttnn.float32, 4096, csize))
     a_list = list(parts) + [parts[0]] * (3 - len(parts))  # unused limb slots read nothing
     addrs = [p.buffer_address() for p in a_list] + [w.buffer_address(), diag.buffer_address()]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -256,11 +284,14 @@ def fused_lane_linear(parts, w, lanes, mem):
                 for cy in range(r.start.y, r.end.y + 1):
                     # this core's units cover output tiles [first, last) contiguously (row-major (row, nt))
                     first, last = _tile_of(start, chunks, csize, n_t), _tile_of(start + per, chunks, csize, n_t)
-                    rd_rt[cx][cy] = addrs + [start, per]
+                    rd_rt[cx][cy] = addrs + [start, per, bias.buffer_address() if bias is not None else 0]
                     wr_rt[cx][cy] = [out.buffer_address(), last - first, first]
                     cp_rt[cx][cy] = [start, per]
                     start += per
-    ct = [k_t, n_t, chunks, csize, len(parts), shift]
+    # the reader's (its tensor accessors follow at index 6; index 5: whether it streams a bias)
+    ct = [k_t, n_t, chunks, csize, len(parts), int(bias is not None)]
+    shift3 = (shifts + [0, 0])[:3]
+    ct_compute = [k_t, n_t, chunks, csize, len(parts)] + shift3 + [n_pat, int(bias is not None)]
     # as the stock linear's precise_config: HiFi4, float32 DEST; the running sums reload exactly (UnpackToDestFp32)
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
@@ -268,9 +299,11 @@ def fused_lane_linear(parts, w, lanes, mem):
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
     modes[4] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    for q in range(4):  # the patterns' sums and the bias
+        modes[5 + q] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     acc = []
-    for t in a_list + [w, diag]:
+    for t in a_list + [w, diag, bias if bias is not None else diag]:  # the bias slot reads nothing without one
         acc += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
     kernels = [
         ttnn.KernelDescriptor(
@@ -296,11 +329,11 @@ def fused_lane_linear(parts, w, lanes, mem):
             kernel_source=os.path.join(_KERNELS, "lane_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=ct,
+            compile_time_args=ct_compute,
             runtime_args=cp_rt,
             config=cfg,
         ),
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-    ttnn.generic_op(list(parts) + [w, diag, out], prog)
+    ttnn.generic_op(list(parts) + [w, diag] + ([bias] if bias is not None else []) + [out], prog)
     return out

@@ -23,7 +23,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
-from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear
+from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear, fused_lane_linear_patterns
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
@@ -133,6 +133,9 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_BMM_FN = fused_lane_bmm
         # the exact-lane linears (vision tower) likewise: a lane pattern's limb x lane products + adds as one kernel
         _te_attention.EXACT_LINEAR_FN = fused_lane_linear
+        _te_attention.EXACT_LINEAR_PATTERNS_FN = fused_lane_linear_patterns  # all patterns + median in one
+        # and the float32 bias add of those linears (vision qkv) after the median in the same program
+        _te_attention.LINEAR_BIAS_FUSED = True
         # the vision token permutations as one bf16 matmul per limb (one-hot rows: each output is a single
         # 1 * v product, already exact without the exact-lane decomposition)
         vision_transformer_pretrained_model.ONEHOT_PERMUTE = True
