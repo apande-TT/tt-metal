@@ -176,6 +176,7 @@ class TtQwenTextEncoder:
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
         _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
+        _te_stack.RESIDUAL_L1_BYTES = 8 * 1024 * 1024  # and the block's mid residual x + attn (7.2 MB)
         self.set_precise(True)
         # the vision blocks' float32 RMSNorms as two C++ programs each (rms_rows: row scale, then (x * rs) * w),
         # bit-identical to the six-op chain (and taking precedence over NORM_L1_BYTES)
