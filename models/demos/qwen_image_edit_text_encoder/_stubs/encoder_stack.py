@@ -21,6 +21,8 @@ host in numpy and applied on device as one-hot matmuls / additive masks.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 
@@ -96,8 +98,17 @@ class TtRMSNorm:
     def __call__(self, x):
         if self.precise:
             x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
-            ms = ttnn.mean(ttnn.multiply(x32, x32), dim=-1, keepdim=True, compute_kernel_config=self.compute_cfg)
-            return ttnn.multiply(ttnn.multiply(x32, ttnn.rsqrt(ttnn.add(ms, self.eps))), self._ensure_w32())
+            l1 = 0 < 4 * math.prod([int(d) for d in x32.padded_shape]) <= NORM_L1_BYTES
+            kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
+            sq = ttnn.multiply(x32, x32, **kw)
+            ms = ttnn.mean(sq, dim=-1, keepdim=True, compute_kernel_config=self.compute_cfg)
+            if l1:
+                ttnn.deallocate(sq)
+            xr = ttnn.multiply(x32, ttnn.rsqrt(ttnn.add(ms, self.eps)), **kw)
+            out = ttnn.multiply(xr, self._ensure_w32())
+            if l1:
+                ttnn.deallocate(xr)
+            return out
         return ttnn.rms_norm(x, epsilon=self.eps, weight=self.weight, compute_kernel_config=self.compute_cfg)
 
 
@@ -175,6 +186,8 @@ class TtVisionBlock:
         return ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))))
 
 
+# the precise RMSNorm's float32 intermediates (x * x, x * rsqrt) in L1 when x takes at most this many bytes (0: DRAM)
+NORM_L1_BYTES = 0
 # the vision MLP's SiLU applied as the gate input's activation of the gate * up multiply (precise path)
 VISION_MLP_FUSED_SILU = False
 
