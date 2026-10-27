@@ -186,12 +186,19 @@ class TtVisionBlock:
         normalised activations enter the branch matmuls in fp32 instead of being rounded to bf16 first."""
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
         a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
-        x = ttnn.add(x, _fp32(a))
-        return ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))))
+        l1 = 0 < 4 * math.prod([int(d) for d in x.padded_shape]) <= RESIDUAL_L1_BYTES
+        x = ttnn.add(x, _fp32(a), **({"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}))
+        out = ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if l1:
+            ttnn.deallocate(x)
+        return out
 
 
 # the precise RMSNorm's float32 intermediates (x * x, x * rsqrt) in L1 when x takes at most this many bytes (0: DRAM)
 NORM_L1_BYTES = 0
+# the vision block's mid residual (x + attn, read by norm2 and the MLP residual add) in L1 when it takes at most this
+# many bytes (0: DRAM)
+RESIDUAL_L1_BYTES = 0
 # the vision MLP's SiLU applied as the gate input's activation of the gate * up multiply (precise path)
 VISION_MLP_FUSED_SILU = False
 
