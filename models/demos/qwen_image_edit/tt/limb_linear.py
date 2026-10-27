@@ -30,12 +30,12 @@ def _largest_divisor(n, cap):
     return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None):
+def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity=ttnn.MathFidelity.HiFi4):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
     wide output (K < N) also runs as one group of whole output rows per core, like a long-K one. bias_rows: float32
     [32, N] (the bias row replicated over a tile's rows), added to the product in the same pass:
-    (hi @ w + lo @ w) + b, the separate float32 bias add's order."""
+    (hi @ w + lo @ w) + b, the separate float32 bias add's order. fidelity: both limbs' products' math fidelity."""
     if w.dtype != ttnn.bfloat16 or hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16:
         return None
     hs, ws = [int(d) for d in hi.padded_shape], [int(d) for d in w.padded_shape]
@@ -105,7 +105,7 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None):
         sd_rt[sender.x][sender.y] = [w.buffer_address(), start.x, start.y, end.x, end.y, g * n_g]
 
     cfg = ttnn.ComputeConfigDescriptor()
-    cfg.math_fidelity = ttnn.MathFidelity.HiFi4
+    cfg.math_fidelity = fidelity
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     if bias_rows is not None:
