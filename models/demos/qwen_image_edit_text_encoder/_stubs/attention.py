@@ -701,7 +701,12 @@ class TtVisionAttention:
         bqkv = torch.cat(b_blocks, dim=0).reshape(1, 1, 1, -1)
         self.wqkv = upload(device, wqkv_t, mapper=shard_mapper(device, -1))
         self.bqkv = upload(device, bqkv, mapper=shard_mapper(device, -1))
-        _bias_rows(self.bqkv)  # LINEAR_BIAS_FUSED's bias rows built here, at load time (never inside a trace capture)
+        # LINEAR_BIAS_FUSED's bias rows, built on host: the bias rounded to bf16 by ttnn's own conversion (as uploaded),
+        # replicated over a tile's rows, tilized on host and moved to the device (no device op, never in a trace)
+        b16 = ttnn.to_torch(ttnn.from_torch(bqkv, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)).float()
+        rows = b16.expand(1, 1, TILE, -1).contiguous()
+        rows = ttnn.from_torch(rows, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=shard_mapper(device, -1))
+        _BIAS_ROWS[id(self.bqkv)] = (self.bqkv, ttnn.to_device(rows, device))
         # proj: row-parallel -- input rows are head-major, so chip d's rows match its local heads.
         self.wproj = upload(
             device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
