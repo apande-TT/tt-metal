@@ -27,6 +27,7 @@ from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
+from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -175,6 +176,10 @@ class TtQwenTextEncoder:
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
         _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
         self.set_precise(True)
+        # the vision blocks' float32 RMSNorms as two C++ programs each (rms_rows: row scale, then (x * rs) * w),
+        # bit-identical to the six-op chain (and taking precedence over NORM_L1_BYTES)
+        for blk in self.visual.blocks:
+            blk.block.norm1.fused_fn = blk.block.norm2.fused_fn = fused_rms_norm
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
 
