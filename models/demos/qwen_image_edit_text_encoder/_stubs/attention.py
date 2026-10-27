@@ -395,26 +395,51 @@ def _block_config(x, w):
     )
 
 
-def _exact_linear_fn(parts, w, patterns, out_bytes):
+def _bias_rows(bias):
+    """float32 [1, 1, 32, N] TILE with the [.., 1, N] bias in every row (built once per bias tensor: 0 + bias)."""
+    if id(bias) not in _BIAS_ROWS:
+        b = ttnn.typecast(bias, ttnn.float32)
+        n = int(b.shape[-1])
+        zeros = ttnn.zeros([1, 1, TILE, n], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=b.device())
+        _BIAS_ROWS[id(bias)] = (bias, ttnn.add(zeros, b))  # the source kept alive with its rows: ids stay unique
+    return _BIAS_ROWS[id(bias)][1]
+
+
+_BIAS_ROWS = {}
+
+
+def _exact_linear_fn(parts, w, patterns, out_bytes, bias=None):
     """_exact_sum of split_linear's products through EXACT_LINEAR_FN (one call per lane pattern; L1 / DRAM as
-    _exact_sum places them), or None when it declines a pattern."""
+    _exact_sum places them), or None when it declines a pattern. -> (result, bias applied): with LINEAR_BIAS_FUSED
+    the [1, 1, 1, N] bias is added inside EXACT_LINEAR_PATTERNS_FN after the vote when it takes it."""
     l1 = bool(EXACT_SUM_L1_BYTES) and 0 < out_bytes <= EXACT_SUM_L1_BYTES
     mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
     k = int(parts[0].shape[-1])
     if EXACT_LINEAR_PATTERNS_FN is not None:
-        out = EXACT_LINEAR_PATTERNS_FN(parts, w, [[_lane_of(i, pt) for i in range(k)] for pt in patterns], mem)
+        lane_lists = [[_lane_of(i, pt) for i in range(k)] for pt in patterns]
+        out = None
+        if LINEAR_BIAS_FUSED and bias is not None:
+            out = EXACT_LINEAR_PATTERNS_FN(parts, w, lane_lists, mem, bias=_bias_rows(bias))
+            if out is not None:
+                return (ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out), True
+        out = EXACT_LINEAR_PATTERNS_FN(parts, w, lane_lists, mem)
         if out is not None:
-            return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
+            return (ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out), False
     ests = []
     for pattern in patterns:
         y = EXACT_LINEAR_FN(parts, w, [_lane_of(i, pattern) for i in range(k)], mem)
         if y is None:
             for t in ests:
                 ttnn.deallocate(t)
-            return None
+            return None, False
         ests.append(y)
     out = _vote(ests)
-    return ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out
+    return (ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out), False
+
+
+# split_linear's exact-lane products take their float32 bias add inside EXACT_LINEAR_PATTERNS_FN, after the vote
+# (fn(..., bias=rows)), instead of a separate ttnn.add (False: the separate add)
+LINEAR_BIAS_FUSED = False
 
 
 # fn(hi, lo, w) -> hi @ w + lo @ w as float32 (one call: the weight streamed once for both limbs, the same fp32
@@ -460,7 +485,10 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
 
     if exact:
         out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
-        y = _exact_linear_fn(parts, w, _patterns(exact), out_bytes) if EXACT_LINEAR_FN is not None else None
+        y = None
+        if EXACT_LINEAR_FN is not None:
+            y, fused = _exact_linear_fn(parts, w, _patterns(exact), out_bytes, bias)
+            bias = None if fused else bias
         if y is None:
             y = _exact_sum(mm, parts, _patterns(exact), out_bytes=out_bytes)
         for t in staged:
