@@ -27,6 +27,7 @@ from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
@@ -108,6 +109,7 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_REDUCE_L1_BYTES = 48 * 1024 * 1024
         # where the batch splits over the TP devices: all_to_all + local adds + all_gather instead
         _te_attention.A2A_REDUCE = True
+        _te_attention.A2A_SUM_FN = fused_block_sum  # its local sum of the n source partials as one C++ kernel
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
         # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
