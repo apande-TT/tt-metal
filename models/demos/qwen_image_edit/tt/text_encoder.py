@@ -29,6 +29,7 @@ from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
+from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -169,6 +170,7 @@ class TtQwenTextEncoder:
         _te_layer.FUSED_SCALE_MASK = True  # the LM attention's logit scale fused into its mask add
         _te_layer.SOFTMAX_L1_BYTES = 8 * 1024 * 1024  # and its softmax intermediates in L1
         _te_layer.SOFTMAX_FUSED_EXP = True  # with the exp fused into the scores - max subtract
+        _te_layer.ROPE_FN = fused_rope  # and its float32 RoPE as one C++ kernel (no float32 intermediates)
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         _te_attention.VISION_ROPE_L1_BYTES = 4 * 1024 * 1024  # its RoPE intermediates (q / k: 2.2 MB) in L1
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
