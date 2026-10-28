@@ -13,7 +13,7 @@
 //   y   = ((xc * r) * s1) + sh unary_bcast<COL> / <ROW> + mul_binary_tile, mul_binary_tile, add_binary_tile<NE>
 // xc is recomputed per pass from x and mu (the same subtraction, the same value) instead of stored; mu and r are
 // one tile each per row (column 0 valid, as the stock reduce's output). s1 = 1 + scale and sh arrive per tile
-// (row 0 valid). x arrives three times per row: mean pass, variance pass, apply pass.
+// (row 0 valid). Each x row arrives once and stays in cb_x (Wt tiles, two rows deep) for the three passes.
 
 #include <cstdint>
 
@@ -47,10 +47,9 @@ inline void row_mean_of(CircularBuffer& x, uint32_t inv_w_bits) {
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     for (uint32_t wt = 0; wt < Wt; ++wt) {
         const uint32_t d = wt == 0 ? 0 : 2;
-        x.wait_front(1);
+        x.wait_front(wt + 1);  // the row stays in cb_x (popped after the apply pass)
         copy_init(cb_x);
-        copy_tile(cb_x, 0, d);
-        x.pop_front(1);
+        copy_tile(cb_x, wt, d);
         if constexpr (centered) {
             sub_binary_tile_init();
             sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(d, 3, d);
@@ -113,11 +112,10 @@ void kernel_main() {
 
         // y = ((x - mu) * r) * (1 + scale) + shift
         for (uint32_t wt = 0; wt < Wt; ++wt) {
-            x.wait_front(1);
             ss.wait_front(2);
             tile_regs_acquire();
             copy_init(cb_x);
-            copy_tile(cb_x, 0, 0);
+            copy_tile(cb_x, wt, 0);
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_mu);
             unary_bcast<ckernel::BroadcastType::COL>(cb_mu, 0, 1);
             sub_binary_tile_init();
@@ -140,9 +138,9 @@ void kernel_main() {
             pack_tile(0, cb_out);
             tile_regs_release();
             out.push_back(1);
-            x.pop_front(1);
             ss.pop_front(2);
         }
+        x.pop_front(Wt);
         mu.pop_front(1);
         r.pop_front(1);
     }

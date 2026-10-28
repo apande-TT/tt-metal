@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Reader of ln_modulate.cpp: for each tile row i of this core it streams the row's Wt x tiles three times -- the
-// mean pass and the variance pass (`batch` tiles per barrier), then the apply pass, where each x tile comes with
-// the (1 + scale) and shift tiles of its column for i's batch item (b = i / St; one table row when the tables are
+// Reader of ln_modulate.cpp: for each tile row i of this core it reads the row's Wt x tiles once (`batch` tiles per
+// barrier; the compute keeps the row in cb_x for its three passes), then for the apply pass
+// the (1 + scale) and shift tiles of each column for i's batch item (b = i / St; one table row when the tables are
 // shared) -- only their row 0 (faces 0 and 1's first rows), the one the ROW broadcast reads. Runtime args: x, (1 + scale), shift addresses, the tile row count and the first one.
 
 #include "api/dataflow/dataflow_api.h"
@@ -40,21 +40,18 @@ void kernel_main() {
     DataflowBuffer x(cb_x);
     DataflowBuffer ss(cb_ss);
     for (uint32_t i = start; i < start + num; ++i) {
-        for (uint32_t pass = 0; pass < 2; ++pass) {
-            for (uint32_t wt = 0; wt < Wt; wt += batch) {
-                x.reserve_back(batch);
-                for (uint32_t k = 0; k < batch; ++k) {
-                    noc.async_read(xs, x, page, {.page_id = i * Wt + wt + k}, {.offset_bytes = k * page});
-                }
-                noc.async_read_barrier();
-                x.push_back(batch);
+        // the row once: it stays in cb_x (two rows deep) for all three of the compute's passes
+        for (uint32_t wt = 0; wt < Wt; wt += batch) {
+            x.reserve_back(batch);
+            for (uint32_t k = 0; k < batch; ++k) {
+                noc.async_read(xs, x, page, {.page_id = i * Wt + wt + k}, {.offset_bytes = k * page});
             }
+            noc.async_read_barrier();
+            x.push_back(batch);
         }
         const uint32_t tab = batched ? (i / St) * Wt : 0;
         for (uint32_t wt = 0; wt < Wt; ++wt) {
-            x.reserve_back(1);
             ss.reserve_back(2);
-            noc.async_read(xs, x, page, {.page_id = i * Wt + wt}, {.offset_bytes = 0});
             // only row 0 of a table tile is read by the ROW broadcast: faces 0 and 1's first rows
             for (uint32_t f = 0; f < 2; ++f) {
                 const uint32_t o = f * face_bytes;
@@ -62,7 +59,6 @@ void kernel_main() {
                 noc.async_read(shs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = o}, {.offset_bytes = page + o});
             }
             noc.async_read_barrier();
-            x.push_back(1);
             ss.push_back(2);
         }
     }

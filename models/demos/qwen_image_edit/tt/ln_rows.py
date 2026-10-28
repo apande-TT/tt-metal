@@ -5,7 +5,7 @@
 Replaces _stubs/encoder_stack.py _TtBlock._modulate(x, shift, scale) = LN(x) * (1 + scale) + shift, spelled as
 mean / subtract / multiply / mean / add / rsqrt / multiply / multiply / add with float32 intermediates of x's size:
 kernels/ln_modulate.cpp makes each tile row's mean and rsqrt(var + eps) and the modulated output with the stock
-ops' SFPU calls in the same order (see its header), from three reads of the row (kernels/reader_ln_mod.cpp), so the
+ops' SFPU calls in the same order (see its header), from one read of the row kept in L1 (kernels/reader_ln_mod.cpp), so the
 result is bit-identical and none of the intermediates is written.
 """
 from __future__ import annotations
@@ -59,7 +59,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
             core_ranges=cores,
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
         )
-        for i, pages in ((0, 2 * batch), (1, 1), (2, 1), (3, 4), (16, 2))
+        for i, pages in ((0, 2 * Wt), (1, 1), (2, 1), (3, 4), (16, 2))  # x: two whole rows (one in use, one read)
     ]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [x.buffer_address(), scale1.buffer_address(), shift.buffer_address()]
