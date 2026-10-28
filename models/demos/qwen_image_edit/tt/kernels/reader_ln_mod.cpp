@@ -5,7 +5,7 @@
 // Reader of ln_modulate.cpp: for each tile row i of this core it streams the row's Wt x tiles three times -- the
 // mean pass and the variance pass (`batch` tiles per barrier), then the apply pass, where each x tile comes with
 // the (1 + scale) and shift tiles of its column for i's batch item (b = i / St; one table row when the tables are
-// shared). Runtime args: x, (1 + scale), shift addresses, the tile row count and the first one.
+// shared) -- only their row 0 (faces 0 and 1's first rows), the one the ROW broadcast reads. Runtime args: x, (1 + scale), shift addresses, the tile row count and the first one.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -30,6 +30,8 @@ void kernel_main() {
     constexpr uint32_t cb_x = 0;
     constexpr uint32_t cb_ss = 3;
     const uint32_t page = get_local_cb_interface(cb_x).fifo_page_size;
+    constexpr uint32_t face_bytes = 16 * 16 * 4;  // float32 face
+    constexpr uint32_t row_bytes = 16 * 4;        // one face row
     const auto xs = TensorAccessor(x_args, x_addr);
     const auto scs = TensorAccessor(sc_args, sc_addr);
     const auto shs = TensorAccessor(sh_args, sh_addr);
@@ -53,8 +55,12 @@ void kernel_main() {
             x.reserve_back(1);
             ss.reserve_back(2);
             noc.async_read(xs, x, page, {.page_id = i * Wt + wt}, {.offset_bytes = 0});
-            noc.async_read(scs, ss, page, {.page_id = tab + wt}, {.offset_bytes = 0});
-            noc.async_read(shs, ss, page, {.page_id = tab + wt}, {.offset_bytes = page});
+            // only row 0 of a table tile is read by the ROW broadcast: faces 0 and 1's first rows
+            for (uint32_t f = 0; f < 2; ++f) {
+                const uint32_t o = f * face_bytes;
+                noc.async_read(scs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = o}, {.offset_bytes = o});
+                noc.async_read(shs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = o}, {.offset_bytes = page + o});
+            }
             noc.async_read_barrier();
             x.push_back(1);
             ss.push_back(2);
