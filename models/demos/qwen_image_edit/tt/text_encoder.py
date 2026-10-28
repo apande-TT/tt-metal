@@ -184,6 +184,10 @@ class TtQwenTextEncoder:
         # bit-identical to the six-op chain (and taking precedence over NORM_L1_BYTES)
         for blk in self.visual.blocks:
             blk.block.norm1.fused_fn = blk.block.norm2.fused_fn = fused_rms_norm
+        # and the LM decoder layers' (row-staged pairs: one weight row per device) and the final norm
+        for lyr in self.text_model.layers:
+            lyr.input_layernorm.fused_fn = lyr.post_attention_layernorm.fused_fn = fused_rms_norm
+        self.text_model.norm.fused_fn = fused_rms_norm
         self.mrope_section = list(te.config.text_config.rope_parameters["mrope_section"])
         self.group = self.text_model.layers[0].self_attn.group
 
