@@ -131,6 +131,9 @@ def _gather_sum(y, n, cluster_axis, mem=None):
 # local float32 adds in source order, and an all_gather of the sums: ~2(n-1)/n of the tensor on the fabric
 # instead of (n-1)x, and 1/n of the slices/adds (same adds, same order)
 A2A_REDUCE = False
+# fn(g, n, part, memory_config) -> the sum of g's n leading-dim blocks of shape `part` in source order (e.g. one
+# fused kernel), used when each device keeps one batch item (the blocks are then contiguous); None: slices + adds
+A2A_SUM_FN = None
 
 
 def _a2a_sum(y, n, cluster_axis):
@@ -141,6 +144,11 @@ def _a2a_sum(y, n, cluster_axis):
         y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear
     )
     part = [shape[0] // n, 1] + shape[2:]
+    if A2A_SUM_FN is not None and part[0] == 1:
+        # [1, n, S, C] -> [n, 1, S, C] moves only leading dims: block i stays source i's partial
+        out = A2A_SUM_FN(ttnn.reshape(g, [n, 1] + shape[2:]), n, part, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(g)
+        return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear)
     out = None
     for i in range(n):
         p = ttnn.slice(g, [0, i, 0, 0], [part[0], i + 1] + shape[2:])
