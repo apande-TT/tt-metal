@@ -66,6 +66,9 @@ _TEMB_CACHE = {}
 # skip the modulated activations' typecast when they already have the target dtype (precise: float32 ->
 # float32, a full copy)
 SKIP_SAME_CAST = False
+# fn(x, 1 + scale, shift, eps) -> LN(x) * (1 + scale) + shift in one call (e.g. a fused kernel), or None to run the
+# ops; None: the stock LayerNorm + modulation chain
+MODULATE_FN = None
 
 
 class _TtBlock:
@@ -113,6 +116,10 @@ class _TtBlock:
         return ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, self.eps)))
 
     def _modulate(self, x, shift, scale):
+        if MODULATE_FN is not None:
+            y = MODULATE_FN(x, ttnn.add(scale, 1.0), shift, self.eps)
+            if y is not None:
+                return y
         return ttnn.add(ttnn.multiply(self._ln(x), ttnn.add(scale, 1.0)), shift)
 
     def __call__(self, img, txt, silu_temb, rotary, mask, temb_parts=None):
