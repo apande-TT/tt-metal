@@ -123,13 +123,22 @@ class _TtBlock:
         cast = lambda t: t if SKIP_SAME_CAST and t.dtype == mdt else ttnn.typecast(t, mdt)  # noqa: E731
         img_m = cast(self._modulate(img, i_sh1, i_sc1))
         txt_m = cast(self._modulate(txt, t_sh1, t_sc1))
-        a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary)
 
-        img = ttnn.add(img, ttnn.multiply(i_g1, a_img))
-        txt = ttnn.add(txt, ttnn.multiply(t_g1, a_txt))
+        # residual += gate * branch; a TP reduce may apply it on its own slice (_ccl.gated_residual), else here
+        def gated(r, g, branch, entry):
+            return entry.out if entry is not None and entry.out is not None else ttnn.add(r, ttnn.multiply(g, branch))
 
-        img = ttnn.add(img, ttnn.multiply(i_g2, self.img_ff(self._modulate(img, i_sh2, i_sc2))))
-        txt = ttnn.add(txt, ttnn.multiply(t_g2, self.txt_ff(self._modulate(txt, t_sh2, t_sc2))))
+        with _ccl.gated_residual((i_g1, img), (t_g1, txt)) as e:
+            a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary)
+        img = gated(img, i_g1, a_img, e[0] if e else None)
+        txt = gated(txt, t_g1, a_txt, e[1] if e else None)
+
+        with _ccl.gated_residual((i_g2, img)) as e:
+            f = self.img_ff(self._modulate(img, i_sh2, i_sc2))
+        img = gated(img, i_g2, f, e[0] if e else None)
+        with _ccl.gated_residual((t_g2, txt)) as e:
+            f = self.txt_ff(self._modulate(txt, t_sh2, t_sc2))
+        txt = gated(txt, t_g2, f, e[0] if e else None)
         return img, txt
 
 

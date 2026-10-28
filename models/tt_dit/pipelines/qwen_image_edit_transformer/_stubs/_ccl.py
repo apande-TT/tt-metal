@@ -153,6 +153,40 @@ A2A_SUM_FN = None
 # (g, n, part, memory_config, bias) -> sum + bias, so the bias rides the all_gather instead of a full-tensor add
 # after it; None: the bias is added to the gathered sum
 A2A_SUM_BIAS_FN = None
+# the gated residual update r + g * reduce(y) done by the all_to_all reduce on each device's own 1/n slice, before
+# the all_gather (which then gathers the updated residual): the same multiply and add per element on 1/n of the
+# rows instead of on the whole replicated tensor. Requested per call through gated_residual(); False: never
+GATED_RESIDUAL = False
+_PENDING = []  # [GatedResidual] registered by gated_residual(), consumed in order by matching reduces
+
+
+class GatedResidual:
+    """One pending r + g * reduce(y): `out` holds the updated residual once a reduce has applied it."""
+
+    def __init__(self, gate, residual):
+        self.gate, self.residual, self.out = gate, residual, None
+
+
+@contextlib.contextmanager
+def gated_residual(*pairs):
+    """Offer (gate, residual) pairs to the reduces run inside the block: a reduce whose output has the
+    residual's shape takes the first such pair and returns r + g * sum (entry.out) instead of the sum."""
+    entries = [GatedResidual(g, r) for g, r in pairs] if GATED_RESIDUAL else []
+    _PENDING.extend(entries)
+    try:
+        yield entries
+    finally:
+        for e in entries:
+            if e in _PENDING:
+                _PENDING.remove(e)
+
+
+def _take_gated(y):
+    for e in _PENDING:
+        if list(e.residual.shape) == list(y.shape) and len(e.gate.shape) == len(y.shape):
+            _PENDING.remove(e)
+            return e
+    return None
 
 
 def _a2a_split_dim(lead, n):
@@ -165,8 +199,9 @@ def _a2a_split_dim(lead, n):
     return None
 
 
-def _a2a_sum(y, ax, n, bias=None):
-    """bias (needs A2A_SUM_BIAS_FN): added to the local sum, before the all_gather."""
+def _a2a_sum(y, ax, n, bias=None, gated=None):
+    """bias (needs A2A_SUM_BIAS_FN): added to the local sum, before the all_gather. gated (GatedResidual): the
+    local sum s becomes r + g * s on this device's slice of r (and of g where g spans the split dim)."""
     shape = list(y.shape)
     lead = [1] * (4 - len(shape)) + shape  # 4D for the all_to_all
     d = _a2a_split_dim(lead, n)
@@ -189,10 +224,21 @@ def _a2a_sum(y, ax, n, bias=None):
             p = ttnn.slice(g, [i * part[0], 0, 0, 0], [(i + 1) * part[0]] + part[1:], **kw)
             out = p if out is None else ttnn.add(out, p, **kw)
     ttnn.deallocate(g)
+    if gated is not None:
+        r4 = ttnn.mesh_partition(ttnn.reshape(gated.residual, lead), dim=d, cluster_axis=ax)
+        g4 = ttnn.reshape(gated.gate, [1] * (4 - len(shape)) + list(gated.gate.shape))
+        if int(g4.shape[d]) > 1:
+            g4 = ttnn.mesh_partition(g4, dim=d, cluster_axis=ax)
+        s = out
+        out = ttnn.add(r4, ttnn.multiply(g4, s))
+        ttnn.deallocate(s)
     out = ttnn.all_gather(
         out, dim=d, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
-    return ttnn.reshape(out, shape)
+    out = ttnn.reshape(out, shape)
+    if gated is not None:
+        gated.out = out
+    return out
 
 
 def _a2a_ok(y, n):
@@ -241,10 +287,15 @@ def all_reduce(y, device, axis=_CURRENT, bias=None):
         and int(bias.padded_shape[-1]) == int(y.padded_shape[-1])
         and _a2a_ok(y, tuple(device.shape)[axes[0]])
     )
+    gated = _take_gated(y) if _PENDING and len(axes) == 1 and _a2a_ok(y, tuple(device.shape)[axes[0]]) else None
     if fold:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
 
-        return _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], bias=_precise._bias_rows(bias))
+        return _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], bias=_precise._bias_rows(bias), gated=gated)
+    if gated is not None and bias is None:
+        return _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], gated=gated)
+    if gated is not None:  # a bias the local sum cannot take: give the pair back to the caller
+        _PENDING.insert(0, gated)
     for ax in axes:
         y = _gather_sum(y, device, ax)
     return y if bias is None else ttnn.add(y, bias)
