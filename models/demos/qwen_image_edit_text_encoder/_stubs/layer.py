@@ -55,6 +55,9 @@ MLP_FUSED_SILU = False
 SOFTMAX_L1_BYTES = 0
 # the LM attention softmax's exp applied as the scores - max subtract's output activation (one op, no exp round trip)
 SOFTMAX_FUSED_EXP = False
+# fn(t, cos, sin) -> the precise LM attention's RoPE t * cos + rotate_half(t) * sin in one call (e.g. a fused kernel),
+# or None to run the stock ops (None: slices + neg + concat + multiplies + add)
+ROPE_FN = None
 
 
 def _t(lin):
@@ -222,6 +225,9 @@ class TtTextAttention:
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
         def _rope(t):
+            y = ROPE_FN(t, cos, sin) if ROPE_FN is not None else None
+            if y is not None:
+                return y
             return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
 
         q, k = _rope(q), _rope(k)
