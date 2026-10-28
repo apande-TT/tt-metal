@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import (
     ada_layer_norm_continuous,
     decoder_head,
@@ -50,6 +51,9 @@ class TtRMSNorm32:
         self.cfg = _hifi(device)
 
     def __call__(self, x):
+        if x.dtype == ttnn.float32 and x.layout == ttnn.TILE_LAYOUT and int(x.shape[-1]) % 32 == 0:
+            # two C++ programs (rms_rows), bit-identical to the chain below without its float32 intermediates
+            return fused_rms_norm(x, self.w, self.eps)
         ms = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True, compute_kernel_config=self.cfg)
         return ttnn.multiply(ttnn.multiply(x, ttnn.rsqrt(ttnn.add(ms, self.eps))), self.w)
 
