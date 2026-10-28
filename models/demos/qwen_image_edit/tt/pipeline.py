@@ -44,6 +44,7 @@ from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
 from models.demos.qwen_image_edit.tt.joint_heads import fused_joint_heads
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
+from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
@@ -275,6 +276,8 @@ class QwenImageEditTT:
 
         _tr_stack.SKIP_SAME_CAST = True  # no float32 -> float32 copy of the modulated activations
         _tr_stack.SHARE_TEMB_LIMBS = True  # temb's SiLU + L1 limbs once per forward, shared by every block
+        # the blocks' float32 LayerNorm + modulation as one C++ program (ln_rows: no float32 intermediates)
+        _tr_stack.MODULATE_FN = fused_ln_modulate
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
 
         _tr_temb.LIMBS_L1 = True  # the timestep MLP's activation limbs in L1
