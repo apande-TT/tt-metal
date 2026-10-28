@@ -242,6 +242,8 @@ class QwenImageEditTT:
         _tr_ccl.A2A_SUM_FN = fused_block_sum  # the local sum of the n source blocks as one C++ kernel
         # and with the row-parallel layer's bias added in that same pass (before the all_gather, not after it)
         _tr_ccl.A2A_SUM_BIAS_FN = fused_block_sum_bias
+        # and the blocks' gated residual updates r + g * reduce on each device's 1/8 token slice before the gather
+        _tr_ccl.GATED_RESIDUAL = True
         # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
         _tr_precise.SPLIT_FN = fused_split_bf16
         _te_attention.SPLIT_FN = fused_split_bf16
