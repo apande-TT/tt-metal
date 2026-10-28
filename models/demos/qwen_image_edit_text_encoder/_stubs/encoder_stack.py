@@ -100,7 +100,8 @@ class TtRMSNorm:
     def __call__(self, x):
         if self.precise:
             x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
-            if self.fused_fn is not None and len(self._w32_host) == 1:
+            # (a row-staged pair is still one [1, W] float32 weight row per device)
+            if self.fused_fn is not None:
                 return self.fused_fn(x32, self._ensure_w32(), self.eps)
             l1 = 0 < 4 * math.prod([int(d) for d in x32.padded_shape]) <= NORM_L1_BYTES
             kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
