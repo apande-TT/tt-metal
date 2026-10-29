@@ -285,6 +285,7 @@ class QwenImageEditTT:
         _tr_stack.SHARE_TEMB_LIMBS = True  # temb's SiLU + L1 limbs once per forward, shared by every block
         # the blocks' float32 LayerNorm + modulation as one C++ program (ln_rows: no float32 intermediates)
         _tr_stack.MODULATE_FN = fused_ln_modulate
+        _tr_stack.MODULATE_SPLIT = True  # writing its bf16 limbs (the q/k/v and FF-up inputs) instead of float32
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
 
         _tr_temb.LIMBS_L1 = True  # the timestep MLP's activation limbs in L1

@@ -26,9 +26,11 @@ def _f32_bits(v):
     return int(np.array([v], dtype=np.float32).view(np.uint32)[0])
 
 
-def fused_ln_modulate(x, scale1, shift, eps, mem=None):
+def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
     """x [B, S, W] float32 TILE (interleaved, S and W tile multiples), scale1 = 1 + scale and shift [B or 1, 1, W]
-    float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit."""
+    float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit.
+    split: -> (y, (hi, lo)) with y's bf16 limbs as limb_split.fused_split_bf16 makes them (DRAM), and y itself
+    allocated but NOT written -- for a caller whose only use of y is that split."""
     ts = (x, scale1, shift)
     if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
@@ -44,6 +46,9 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
     rows = B * St
     device = x.device()
     out = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG)
+    if split:
+        hi = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
+        lo = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
     batch = next(b for b in (4, 2, 1) if Wt % b == 0)
     reader_ct = [Wt, St, 1 if sB > 1 else 0, batch]
     for t in ts:
@@ -53,13 +58,19 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, rows)
     page = 4096  # one float32 tile
+    f32, b16 = (ttnn.float32, page), (ttnn.bfloat16, page // 2)
+    cb_list = [(0, 2 * Wt, f32), (1, 1, f32), (2, 1, f32), (3, 4, f32)]  # x: two whole rows (one in use, one read)
+    if split:  # hi, lo, scratch hi, scratch y
+        cb_list += [(16, 2, b16), (17, 2, b16), (24, 2, b16), (25, 2, f32)]
+    else:
+        cb_list += [(16, 2, f32)]
     cbs = [
         ttnn.CBDescriptor(
-            total_size=pages * page,
+            total_size=pages * fmt[1],
             core_ranges=cores,
-            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=fmt[0], page_size=fmt[1])],
         )
-        for i, pages in ((0, 2 * Wt), (1, 1), (2, 1), (3, 4), (16, 2))  # x: two whole rows (one in use, one read)
+        for i, pages, fmt in cb_list
     ]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [x.buffer_address(), scale1.buffer_address(), shift.buffer_address()]
@@ -69,7 +80,11 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
             for cx in range(r.start.x, r.end.x + 1):
                 for cy in range(r.start.y, r.end.y + 1):
                     rd_rt[cx][cy] = addrs + [per, start]
-                    wr_rt[cx][cy] = [out.buffer_address(), per * Wt, start * Wt]
+                    wr_rt[cx][cy] = (
+                        [hi.buffer_address(), lo.buffer_address(), per * Wt, start * Wt]
+                        if split
+                        else [out.buffer_address(), per * Wt, start * Wt]
+                    )
                     cp_rt[cx][cy] = [per]
                     start += per
     # as binary_ng / unary / the accurate float32 reduce: float32 inputs unpacked to DEST, float32 DEST, precise SFPU
@@ -78,7 +93,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
-    for i in (0, 1, 2, 3):
+    for i in (0, 1, 2, 3, 25):
         modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     kernels = [
@@ -91,10 +106,15 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_TT_METAL, _WRITER),
+            kernel_source=os.path.join(_KERNELS, "writer_two_outputs.cpp") if split else os.path.join(_TT_METAL, _WRITER),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=(
+                list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
+                + list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
+                if split
+                else [16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+            ),
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -102,9 +122,13 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None):
             kernel_source=os.path.join(_KERNELS, "ln_modulate.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[Wt, _f32_bits(1.0 / W), _f32_bits(eps)],
+            compile_time_args=[Wt, _f32_bits(1.0 / W), _f32_bits(eps), 1 if split else 0],
             runtime_args=cp_rt,
             config=cfg,
         ),
     ]
-    return ttnn.generic_op([x, scale1, shift, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    if split:
+        ttnn.generic_op([x, scale1, shift, hi, lo], prog)
+        return out, (hi, lo)
+    return ttnn.generic_op([x, scale1, shift, out], prog)

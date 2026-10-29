@@ -13,7 +13,8 @@
 //   y   = ((xc * r) * s1) + sh unary_bcast<COL> / <ROW> + mul_binary_tile, mul_binary_tile, add_binary_tile<NE>
 // xc is recomputed per pass from x and mu (the same subtraction, the same value) instead of stored; mu and r are
 // one tile each per row (column 0 valid, as the stock reduce's output). s1 = 1 + scale and sh arrive per tile
-// (row 0 valid). Each x row arrives once and stays in cb_x (Wt tiles, two rows deep) for the three passes.
+// (row 0 valid). With `split` (compile-time arg 3) the output is y's bf16 limbs, made as kernels/split_bf16.cpp
+// makes them (hi = the packer's bf16 narrowing of y, lo = bf16(y - float32(hi))), instead of y. Each x row arrives once and stays in cb_x (Wt tiles, two rows deep) for the three passes.
 
 #include <cstdint>
 
@@ -27,6 +28,7 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/pack.h"
 #include "api/compute/reduce.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/reg_api.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/dataflow/circular_buffer.h"
@@ -35,7 +37,10 @@ constexpr uint32_t cb_x = 0;
 constexpr uint32_t cb_mu = 1;
 constexpr uint32_t cb_r = 2;
 constexpr uint32_t cb_ss = 3;  // (1 + scale, shift) per apply tile
-constexpr uint32_t cb_out = 16;
+constexpr uint32_t cb_out = 16;  // y (float32), or with `split` its bf16 hi limb
+constexpr uint32_t cb_lo = 17;   // split: bf16(y - float32(hi))
+constexpr uint32_t cb_tmp = 24;  // split: scratch hi (bf16)
+constexpr uint32_t cb_y = 25;    // split: scratch y (float32)
 
 template <bool centered>
 inline void row_mean_of(CircularBuffer& x, uint32_t inv_w_bits) {
@@ -45,6 +50,7 @@ inline void row_mean_of(CircularBuffer& x, uint32_t inv_w_bits) {
         unary_bcast<ckernel::BroadcastType::COL>(cb_mu, 0, 3);
     }
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
+    reconfig_data_format_srca(cb_x);
     for (uint32_t wt = 0; wt < Wt; ++wt) {
         const uint32_t d = wt == 0 ? 0 : 2;
         x.wait_front(wt + 1);  // the row stays in cb_x (popped after the apply pass)
@@ -73,12 +79,16 @@ void kernel_main() {
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t inv_w_bits = get_compile_time_arg_val(1);  // float32 bits of 1 / W
     constexpr uint32_t eps_bits = get_compile_time_arg_val(2);    // float32 bits of eps
+    constexpr bool split = get_compile_time_arg_val(3) != 0;      // write y's bf16 limbs (hi, lo) instead of y
 
     CircularBuffer x(cb_x);
     CircularBuffer mu(cb_mu);
     CircularBuffer r(cb_r);
     CircularBuffer ss(cb_ss);
     CircularBuffer out(cb_out);
+    CircularBuffer lo(cb_lo);
+    CircularBuffer tmp(cb_tmp);
+    CircularBuffer yb(cb_y);
 
     compute_kernel_hw_startup(cb_x, cb_out);
     for (uint32_t row = 0; row < num_rows; ++row) {
@@ -88,6 +98,7 @@ void kernel_main() {
         tile_regs_commit();
         mu.reserve_back(1);
         tile_regs_wait();
+        pack_reconfig_data_format(cb_mu);
         pack_tile(0, cb_mu);
         tile_regs_release();
         mu.push_back(1);
@@ -105,6 +116,7 @@ void kernel_main() {
         tile_regs_commit();
         r.reserve_back(1);
         tile_regs_wait();
+        pack_reconfig_data_format(cb_r);
         pack_tile(0, cb_r);
         tile_regs_release();
         r.push_back(1);
@@ -114,6 +126,7 @@ void kernel_main() {
         for (uint32_t wt = 0; wt < Wt; ++wt) {
             ss.wait_front(2);
             tile_regs_acquire();
+            reconfig_data_format_srca(cb_x);
             copy_init(cb_x);
             copy_tile(cb_x, wt, 0);
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_mu);
@@ -134,10 +147,48 @@ void kernel_main() {
             add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
             tile_regs_commit();
             out.reserve_back(1);
-            tile_regs_wait();
-            pack_tile(0, cb_out);
-            tile_regs_release();
-            out.push_back(1);
+            if constexpr (!split) {
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_out);
+                pack_tile(0, cb_out);
+                tile_regs_release();
+                out.push_back(1);
+            } else {
+                // as split_bf16.cpp: hi = bf16(y) (packer narrowing), lo = bf16(y - float32(hi))
+                tmp.reserve_back(1);
+                yb.reserve_back(1);
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_out);
+                pack_tile(0, cb_out);
+                pack_tile(0, cb_tmp);
+                pack_reconfig_data_format(cb_y);
+                pack_tile(0, cb_y);
+                tile_regs_release();
+                out.push_back(1);
+                tmp.push_back(1);
+                yb.push_back(1);
+
+                tmp.wait_front(1);
+                yb.wait_front(1);
+                lo.reserve_back(1);
+                tile_regs_acquire();
+                reconfig_data_format_srca(cb_y);
+                copy_init(cb_y);
+                copy_tile(cb_y, 0, 0);
+                reconfig_data_format_srca(cb_tmp);
+                copy_init(cb_tmp);
+                copy_tile(cb_tmp, 0, 1);
+                sub_binary_tile_init();
+                sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+                tile_regs_commit();
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_lo);
+                pack_tile(0, cb_lo);
+                tile_regs_release();
+                lo.push_back(1);
+                tmp.pop_front(1);
+                yb.pop_front(1);
+            }
             ss.pop_front(2);
         }
         x.pop_front(Wt);
