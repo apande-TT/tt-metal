@@ -339,6 +339,9 @@ WEIGHT_LANES = False
 # Optional fused kernel for them: WEIGHT_LANE_SPLIT(w) -> the 8 masked copies of w (each equal to w * its row mask)
 # from one read of w, or None for a weight it does not take.
 WEIGHT_LANE_SPLIT = None
+# Within one row-chunked linear: {id(w): its 8 lane copies}, formed by the first chunk and reused by the rest
+# (None = no reuse; the owner of the dict frees the copies when the linear is done).
+LANE_CACHE = None
 _ROW_LANE_MASKS = {}
 
 
@@ -368,9 +371,17 @@ def _weight_lane_sums(lead, ws):
     if 2 * sum(w.shape[-1] for w in ws) > rows or any(len(w.shape) != 2 for w in ws):
         return None
     accs = [_LaneAcc() for _ in ws]
-    split = None if WEIGHT_LANE_SPLIT is None else [WEIGHT_LANE_SPLIT(w) for w in ws]
+    cache = LANE_CACHE if WEIGHT_LANE_SPLIT is not None else None
+    if cache is not None:
+        for w in ws:
+            if id(w) not in cache:
+                cache[id(w)] = WEIGHT_LANE_SPLIT(w)
+        split = [cache[id(w)] for w in ws]
+    else:
+        split = None if WEIGHT_LANE_SPLIT is None else [WEIGHT_LANE_SPLIT(w) for w in ws]
     if split is not None and any(lanes is None for lanes in split):
         split = None
+        cache = None
     # the lead limb, read by every lane product, staged in L1 once when it is small (the vision qkv 14.4 MB, proj
     # 17.3 MB per chip)
     vol = 2
@@ -381,7 +392,8 @@ def _weight_lane_sums(lead, ws):
         for i, w in enumerate(ws):
             wr = ttnn.multiply(w, m) if split is None else split[i][r]  # 0 / 1: exact
             accs[i].push(_linear_mm(src, wr)(src))
-            ttnn.deallocate(wr)
+            if cache is None:
+                ttnn.deallocate(wr)
     if src is not lead:
         ttnn.deallocate(src)
     return [acc.value() for acc in accs]
@@ -983,7 +995,9 @@ class TtVisionAttention:
 
         def _rope(t):
             return ttnn.add(
-                ttnn.multiply(t, cos), ttnn.multiply(rotate_half_padded(t, D), sin), memory_config=ttnn.DRAM_MEMORY_CONFIG
+                ttnn.multiply(t, cos),
+                ttnn.multiply(rotate_half_padded(t, D), sin),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
         q, k = _rope(q), _rope(k)

@@ -44,6 +44,7 @@ from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_pretrained_model as _vision_tower
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _dit_ccl
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _dit_attention
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
@@ -270,7 +271,11 @@ class TtQwenImageEditPipeline:
         # (the exact all-reduces' gathered partials summed in one fused pass, bit-identical to the slice + add chain;
         # and its exact linears -- the text encoder's split_linear -- with the encoders' fused hooks: the trailing
         # limbs' products at HiFi2 and the limb split in one pass too)
+        # (its weight-lane linears' 8 lane copies formed once per linear, not once per row chunk; 96 MB output
+        # chunks, so the FF down's 8192-row chunks take weight lanes too: 2 x 3072 <= 8192)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
+            _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
+        ), self._hook(_dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail():
             v = self.transformer(x_in, t, st.prompt, st.rotary)

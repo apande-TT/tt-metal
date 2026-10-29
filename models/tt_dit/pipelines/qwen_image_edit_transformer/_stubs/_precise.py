@@ -181,8 +181,24 @@ def _weight_lane_chunk(x, ws):
     return chunk if 2 * n <= min(rows, chunk) else None
 
 
+# Reuse each weight's lane copies across the row chunks of one linear (formed once, not once per chunk).
+LANE_REUSE = False
+
+
 def _chunked_unless_weight_lanes(fn, x, ws):
-    return _row_chunked(fn, x, _weight_lane_chunk(x, ws))
+    chunk = _weight_lane_chunk(x, ws)
+    if chunk is None or not LANE_REUSE:
+        return _row_chunked(fn, x, chunk)
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+    _te.LANE_CACHE = {}
+    try:
+        return _row_chunked(fn, x, chunk)
+    finally:
+        for lanes in _te.LANE_CACHE.values():
+            for t in lanes or ():
+                ttnn.deallocate(t)
+        _te.LANE_CACHE = None
 
 
 def linear(x, w, bias=None, compute_kernel_config=None):
