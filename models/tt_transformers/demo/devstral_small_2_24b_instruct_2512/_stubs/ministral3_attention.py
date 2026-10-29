@@ -84,6 +84,9 @@ class TtMinistral3Attention:
     DECODE_SHARDED_INPUT = True
     DECODE_SHARDED_K_BLOCK = 20
     DECODE_SHARDED_READERS_PER_BANK = 3  # (the op allows 1-3)
+    # cpp try (run 12): that QKV as tt/qkv_decode.py's program -- one column a core on 48 cores instead of two on 24,
+    # the x row multicast in chunks by a sender core, each column accumulated over the whole K in fp32 DEST
+    DECODE_QKV_STREAM = True
     # nlp_create_qkv_heads_decode reads the QKV's width shards in place (its sharded-input path) instead of an
     # unsharded copy of the row.
     DECODE_SHARDED_HEADS = True
@@ -237,19 +240,36 @@ class TtMinistral3Attention:
         # matmul has only N / 32 = 48 output tiles to spread, one per core, and streams the weight at ~190 GB/s.
         k_in, n_dev = wqkv.shape[0], wqkv.shape[1] // tp
         banks, cores = device.dram_grid_size().x, QKV_DECODE_CORES.num_cores
-        self.wqkv_decode = _put(
-            wqkv,
-            shard(-1),
-            dtype=DECODE_WEIGHT_DTYPE,
-            memory_config=ttnn.MemoryConfig(
-                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
-                ttnn.BufferType.DRAM,
-                ttnn.ShardSpec(
-                    ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
-                    (k_in, -(-n_dev // (ttnn.TILE_SIZE * banks)) * ttnn.TILE_SIZE),
-                    ttnn.ShardOrientation.ROW_MAJOR,
+        self.stream_qkv = None
+        if self.DECODE_QKV_STREAM and self.DECODE_SHARDED_INPUT and tp > 1:
+            from models.demos.devstral_small_2_24b_instruct_2512.tt.qkv_decode import StreamQKVDecode
+
+            if StreamQKVDecode.supports(device, int(k_in), int(n_dev), DECODE_WEIGHT_DTYPE):
+                self.stream_qkv = StreamQKVDecode(
+                    device,
+                    wqkv,
+                    DECODE_WEIGHT_DTYPE,
+                    ttnn.MathFidelity.HiFi2,
+                    lambda t, dtype: _put(t, shard(-1), dtype=dtype),
+                    tp,
+                )
+        self.wqkv_decode = (
+            None
+            if self.stream_qkv is not None
+            else _put(
+                wqkv,
+                shard(-1),
+                dtype=DECODE_WEIGHT_DTYPE,
+                memory_config=ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.DRAM,
+                    ttnn.ShardSpec(
+                        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))}),
+                        (k_in, -(-n_dev // (ttnn.TILE_SIZE * banks)) * ttnn.TILE_SIZE),
+                        ttnn.ShardOrientation.ROW_MAJOR,
+                    ),
                 ),
-            ),
+            )
         )
         self.qkv_act_cfg = ttnn.create_sharded_memory_config(
             (ttnn.TILE_SIZE, k_in // cores),
@@ -960,7 +980,20 @@ class TtMinistral3Attention:
         """x (1, 1, B, D) -> (1, 1, B, D); cos/sin (1, B, 1, hd); cur_pos int32 [B]; position_ids (B, 1, 1, 1) fp32."""
         b = x.shape[-2]
         head_cfg = self._head_cfg(b)
-        if x.is_sharded():  # the input norm's own width shards (DECODE_SHARDED_INPUT)
+        split = None  # (q, k, v) when the QKV program splits the heads itself
+        if x.is_sharded() and self.stream_qkv is not None:
+            heads_mem = self._batch_shard_cfg(2 * b, self.head_dim)
+            lh, lkv, hd = self.local_heads, self.local_kv_heads, self.head_dim
+            if (
+                len(position_embeddings) == 3
+                and self.DECODE_SHARDED_HEADS
+                and self.stream_qkv.heads_ok(heads_mem, int(b), lh, lkv, hd)
+            ):
+                split = self.stream_qkv(x, heads=(heads_mem, int(b), lh, lkv, hd))
+            else:
+                qkv = self.stream_qkv(x)
+            ttnn.deallocate(x)
+        elif x.is_sharded():  # the input norm's own width shards (DECODE_SHARDED_INPUT)
             qkv = ttnn.linear(
                 x,
                 self.wqkv_decode,
@@ -982,7 +1015,7 @@ class TtMinistral3Attention:
         if len(position_embeddings) == 3 and self.DECODE_SHARDED_HEADS:
             # DECODE_FUSED_QK (tables from decode_rope_tables): k's heads on the B cores after q's, so one fused RoPE
             # rotates both and one fused cache update appends K (k's cores) and V (q's cores).
-            q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+            q, k, v = split or ttnn.experimental.nlp_create_qkv_heads_decode(
                 qkv,
                 num_heads=self.local_heads,
                 num_kv_heads=self.local_kv_heads,
