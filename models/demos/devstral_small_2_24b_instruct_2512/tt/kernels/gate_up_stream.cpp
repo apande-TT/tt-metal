@@ -33,6 +33,10 @@
 #ifndef GU_PSTEP
 #define GU_PSTEP 1
 #endif
+// GU_PIPE2 (see the push loop) unless GU_PIPE1
+#ifndef GU_PIPE1
+#define GU_PIPE2 1
+#endif
 
 void kernel_main() {
     constexpr uint32_t Kt = get_compile_time_arg_val(GU_CTA + 0);  // K tiles
@@ -83,6 +87,15 @@ void kernel_main() {
     constexpr uint32_t H_ROW = 32, H_FACE = 512;
 #endif
 
+#ifdef GU_PIPE2
+    // GU_PIPE2: two pushes in flight -- push p is read tagged with NOC transaction id 1 + p % 2 (the read command
+    // buffer keeps the tag for every packet of the read) into the CB slot after the still-pending push p - 1, and only
+    // then is p - 1 waited for (its own id) and pushed: the RISC no longer idles a whole DRAM round trip per push.
+    // Same tiles in the same CB slots, pushed in order.
+    const uint32_t cb_limit = get_local_cb_interface(cb_w).fifo_limit;
+    const uint32_t cb_size = get_local_cb_interface(cb_w).fifo_size;
+    uint32_t prev_trid = 0;
+#endif
     uint32_t push = 0;
     for (uint32_t k0 = 0; k0 < Kt / GU_PSTEP; k0 += RB, ++push) {
         if (!have_x) {
@@ -94,8 +107,22 @@ void kernel_main() {
                 have_x = true;
             }
         }
+#ifdef GU_PIPE2
+        cb_reserve_back(cb_w, prev_trid ? 2 * T : T);
+        uint32_t wr = get_write_ptr(cb_w);
+        if (prev_trid) {
+            wr += T * w_tile;
+            if (wr >= cb_limit) {
+                wr -= cb_size;
+            }
+        }
+        const uint32_t trid = 1 + (push & 1);
+        noc_async_read_set_trid(trid);
+        noc_async_read(w.get_noc_addr(page), wr, T * w_tile);
+#else
         cb_reserve_back(cb_w, T);
         noc_async_read(w.get_noc_addr(page), get_write_ptr(cb_w), T * w_tile);
+#endif
         page += T * NB * GU_PSTEP;
 #ifdef GU_HEADS
         const bool h_now = push == 0 && h_job != 0xFFFFFFFF;
@@ -113,7 +140,15 @@ void kernel_main() {
             }
         }
 #endif
+#ifdef GU_PIPE2
+#ifdef GU_HEADS
+        if (h_now) {
+            noc_async_read_barrier();  // the head rows (and this push) have landed
+        }
+#endif
+#else
         noc_async_read_barrier();
+#endif
 #ifdef GU_HEADS
         if (h_now) {
             const uint32_t sx = get_arg_val<uint32_t>(GU_RTA + 3), sy = get_arg_val<uint32_t>(GU_RTA + 4);
@@ -124,8 +159,23 @@ void kernel_main() {
             noc_async_atomic_barrier();
         }
 #endif
+#ifdef GU_PIPE2
+        if (prev_trid) {
+            noc_async_read_barrier_with_trid(prev_trid);
+            cb_push_back(cb_w, T);
+        }
+        prev_trid = trid;
+#else
+        cb_push_back(cb_w, T);
+#endif
+    }
+#ifdef GU_PIPE2
+    if (prev_trid) {
+        noc_async_read_barrier_with_trid(prev_trid);
         cb_push_back(cb_w, T);
     }
+    noc_async_read_set_trid(0);
+#endif
 
     if constexpr (OWNER) {
         if (!have_x) {

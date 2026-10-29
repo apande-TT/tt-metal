@@ -473,6 +473,15 @@ PLANNED_TP = 4
 #                     The long (416-row) prompt's down too on the last thirty layers (LONG_DOWN_SWAPPED_LAYERS 10-39):
 #                     the image prompt's chaotic rows amplify a perturbation only through the layers after it.
 #   prefill gate / up in 16-deep K blocks on layers 20-39 (minimal_mm.SWIGLU_DEEP_K, PREFILL_GU_DEEP_K_LAYERS).
+#   decode QKV + head split as ONE generic_op (ministral3_attention.DECODE_QKV_STREAM, tt/qkv_decode.py HEADS_OUT): one
+#                     column a core on 48 cores, x multicast in chunks by a sender core over both NOCs, both RISCs
+#                     streaming the bank-major column, the whole K in fp32 DEST (text PCC 0.995063 -> 0.99513, image
+#                     unchanged), each core scattering its tile's rows into the q / k / v head shards: QKV 21.7 + split
+#                     2.25 -> ~20 us a layer, one program fewer; trace decode 12.508 -> 12.360 ms.
+#   decode q / k RoPE inside the K / V append's program (ministral3_attention.DECODE_ROPE_APPEND, tt/kv_append.py
+#                     rope_append, kernels/rope_append_compute.cpp): the stock fused RoPE's calls (HiFi4, fp32 DEST, bf16
+#                     intermediates) on the same 64 cores, then the bfloat8_b pack: 1.94 + 3.23 -> 2.83 us a layer, one
+#                     program fewer, bit-identical; trace decode 12.36 -> 12.32 ms.
 
 
 def kv_capacity_for(tp):

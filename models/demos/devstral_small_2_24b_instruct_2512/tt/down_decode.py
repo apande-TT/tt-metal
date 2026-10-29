@@ -58,6 +58,7 @@ class StreamDownDecode:
     # cpp try (run 8): no producer cores -- RISCV_0 of the first 2 K stream cores each gathers half an x tile while its
     # first weight push is in flight (gate_up_stream.cpp GU_HEADS), so the program keeps the stream's 81 cores
     HEADS_ON_STREAM = True
+    # cpp try (run 12): its weight streams keep two pushes in flight a RISC (kernels/gate_up_stream.cpp GU_PIPE2)
 
     @classmethod
     def rb_for(cls, dtype) -> int:
