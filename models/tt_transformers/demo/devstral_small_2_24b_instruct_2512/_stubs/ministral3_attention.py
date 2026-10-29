@@ -100,6 +100,9 @@ class TtMinistral3Attention:
     # cpp try (run 8): the append reads each user's position from the step's gathered cos table in L1 (tt/rope_gather.py
     # stashes it in a row the RoPE never reads) instead of from the DRAM cur_pos
     DECODE_KV_POS_L1 = True
+    # cpp try (run 12): the fused q / k RoPE runs inside that append's program (tt/kv_append.py rope_append: the stock
+    # RoPE's arithmetic on the same cores, then the bfloat8_b pack) -- one program fewer a layer.
+    DECODE_ROPE_APPEND = True
     _pos_stash = None
     # Decode o_proj as the MLP down's C++ streaming program (tt/down_decode.py: the concatenated heads multicast once,
     # a bank-major copy streamed one column per data-movement RISC, ~9 KB pushes, fp32 DEST over all K), its bf16
@@ -1023,11 +1026,23 @@ class TtMinistral3Attention:
                 memory_config=self._batch_shard_cfg(2 * b, self.head_dim),
             )
             cos, sin, trans = position_embeddings
+            from models.demos.devstral_small_2_24b_instruct_2512.tt import kv_append
+
+            if (
+                self.DECODE_ROPE_APPEND
+                and self.DECODE_KV_APPEND
+                and kv_append.supports(k_cache, k, v_cache, v, cur_pos)
+                and kv_append.rope_ok(q, k, v, cos, sin, trans)
+            ):
+                stash = cos if self.DECODE_KV_POS_L1 and cos is type(self)._pos_stash else None
+                q_rot = kv_append.rope_append(q, k, v, cos, sin, trans, k_cache, v_cache, cur_pos, pos_src=stash)
+                ttnn.deallocate(q)  # the head shards, freed as the stock path frees them, before SDPA's CBs are placed
+                ttnn.deallocate(k)
+                ttnn.deallocate(v)
+                return self._decode_attend(q_rot, k_cache, v_cache, cur_pos, head_cfg)
             q, k = ttnn.experimental.rotary_embedding_llama_fused_qk(
                 q, k, cos, sin, trans, compute_kernel_config=self.compute_cfg
             )
-            from models.demos.devstral_small_2_24b_instruct_2512.tt import kv_append
-
             if self.DECODE_KV_APPEND and kv_append.supports(k_cache, k, v_cache, v, cur_pos):
                 stash = cos if self.DECODE_KV_POS_L1 and cos is type(self)._pos_stash else None
                 kv_append.append(k_cache, k, v_cache, v, cur_pos, pos_src=stash)
