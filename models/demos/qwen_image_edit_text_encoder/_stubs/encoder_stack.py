@@ -145,6 +145,44 @@ class TtVisionMLP:
         # precise: gate/up/product in float32, down projection out in float32 with an exact TP reduce.
         self.precise = False
 
+    def add_to(self, x, residual):
+        """residual + self(x), with the down projection's exact TP reduce, its bias and the residual add in one
+        per-device pass (exact_all_reduce_add); None where that path does not apply (the caller runs both)."""
+        if not (self.precise and self.tp > 1 and _attention.A2A_RESIDUAL_FN is not None):
+            return None
+        shape = list(residual.shape)
+        if len(shape) != 4 or shape[1] != 1 or shape[0] != self.tp or residual.dtype != ttnn.float32:
+            return None
+        b32 = ttnn.typecast(self.b_down, ttnn.float32) if self.b_down is not None else None
+        if b32 is not None and getattr(self, "_b_rows", None) is None:
+            n = int(b32.shape[-1])
+            zeros = ttnn.zeros([32, n], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+            self._b_rows = ttnn.add(zeros, ttnn.reshape(b32, (1, n)))  # 0 + b: the row over a tile's rows, exact
+        r = _attention.exact_all_reduce_add(
+            self._down_partial(x), self.device, residual, getattr(self, "_b_rows", None)
+        )
+        if r is None:
+            return None
+        out, fused = r
+        if fused:
+            return out
+        out = ttnn.add(out, b32) if b32 is not None else out
+        return ttnn.add(residual, out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def _down_partial(self, x):
+        """The precise path up to the down projection's per-device partial (before the TP reduce)."""
+        cfg = self.compute_cfg
+        L = getattr(self, "limbs", 2)
+        ex = getattr(self, "exact", True)
+        xp = split_bf16(x, L) if _attention.SHARE_SPLIT else None  # gate and up share x's limbs
+        gate = split_linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp)
+        up = split_linear(x, self.w_up, bias=self.b_up, compute_kernel_config=cfg, exact=ex, limbs=L, parts=xp)
+        if VISION_MLP_FUSED_SILU:
+            h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+        else:
+            h = ttnn.multiply(ttnn.silu(gate), up)
+        return split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, limbs=L)
+
     def __call__(self, x):
         if self.precise:
             cfg = self.compute_cfg
@@ -189,7 +227,10 @@ class TtVisionBlock:
         a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
         l1 = 0 < 4 * math.prod([int(d) for d in x.padded_shape]) <= RESIDUAL_L1_BYTES
         x = ttnn.add(x, _fp32(a), **({"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}))
-        out = ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # x + mlp: with the MLP's TP reduce, bias and this add in one pass where it applies
+        out = self.mlp.add_to(cast(self.norm2(x)), x) if VISION_MLP_RESIDUAL_FUSED else None
+        if out is None:
+            out = ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))), memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if l1:
             ttnn.deallocate(x)
         return out
@@ -202,6 +243,9 @@ NORM_L1_BYTES = 0
 RESIDUAL_L1_BYTES = 0
 # the vision MLP's SiLU applied as the gate input's activation of the gate * up multiply (precise path)
 VISION_MLP_FUSED_SILU = False
+# the vision block's x + mlp(...) with the MLP's exact TP reduce and bias in one per-device pass
+# (_attention.exact_all_reduce_add; needs _attention.A2A_RESIDUAL_FN)
+VISION_MLP_RESIDUAL_FUSED = False
 
 
 class TtPatchMerger:

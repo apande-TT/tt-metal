@@ -157,6 +157,43 @@ def _a2a_sum(y, n, cluster_axis):
     return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear)
 
 
+# fn(g, n, part, memory_config, bias_rows, gate, residual, split_dim, cluster_axis) -> this device's
+# residual slice + (local sum [+ bias]) in one pass (block_sum.fused_block_sum_gated, gate None), for
+# exact_all_reduce_add; None: exact_all_reduce_add does not apply
+A2A_RESIDUAL_FN = None
+
+
+def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1):
+    """residual + (exact_all_reduce(y) [+ bias]) with the all_to_all reduce's local sum, the bias and the residual
+    add in one pass on each device's batch item before the all_gather (the same float32 adds in the same order).
+    -> (that sum, True); (exact_all_reduce(y), False) when the kernel does not take the shapes (the caller adds the
+    bias and the residual); None, with nothing run, where this path does not apply. y, residual: [n, 1, S, C]."""
+    n = mesh_shape(device)[cluster_axis]
+    shape = list(y.shape)
+    if A2A_RESIDUAL_FN is None or n == 1 or not A2A_REDUCE or len(shape) != 4 or shape[1] != 1 or shape[0] != n:
+        return None
+    if list(residual.shape) != shape or residual.dtype != ttnn.float32 or y.dtype != ttnn.float32:
+        return None
+    g = ttnn.experimental.all_to_all_async_generic(
+        y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear
+    )
+    part = [1, 1] + shape[2:]
+    blocks = ttnn.reshape(g, [n, 1] + shape[2:])  # block i = source i's partial of this device's batch item
+    r3 = ttnn.reshape(residual, [shape[0]] + shape[2:])
+    out = A2A_RESIDUAL_FN(blocks, n, part, ttnn.DRAM_MEMORY_CONFIG, bias_rows, None, r3, 1, cluster_axis)
+    if out is None:  # shapes the kernel does not take: sum, bias and residual add as separate ops
+        out = A2A_SUM_FN(blocks, n, part, ttnn.DRAM_MEMORY_CONFIG) if A2A_SUM_FN is not None else None
+        if out is None:
+            out = None
+            for i in range(n):
+                p = ttnn.slice(g, [0, i, 0, 0], [1, i + 1] + shape[2:])
+                out = p if out is None else ttnn.add(out, p)
+        ttnn.deallocate(g)
+        return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear), False
+    ttnn.deallocate(g)
+    return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear), True
+
+
 def exact_all_reduce(y, device, cluster_axis=1):
     """Sum over the TP axis without rounding: gather the float32 partials (bit-exact data movement) and
     add them in float32. ttnn.all_reduce rounds float32 partials at bf16 level (measured ~7e-3 abs on
