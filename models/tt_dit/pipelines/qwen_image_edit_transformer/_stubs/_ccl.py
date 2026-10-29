@@ -156,6 +156,10 @@ A2A_SUM_FN = None
 # (g, n, part, memory_config, bias) -> sum + bias, so the bias rides the all_gather instead of a full-tensor add
 # after it; None: the bias is added to the gathered sum
 A2A_SUM_BIAS_FN = None
+# the local sum (+ bias) with a gated_residual() update in one pass: a callable
+# (g, n, part, memory_config, bias_rows or None, gate, residual, split_dim, cluster_axis) -> r_slice + gate * sum,
+# or None to run the sum and the update as separate ops (None: separate ops)
+A2A_GATED_SUM_FN = None
 # the gated residual update r + g * reduce(y) done by the all_to_all reduce on each device's own 1/n slice, before
 # the all_gather (which then gathers the updated residual): the same multiply and add per element on 1/n of the
 # rows instead of on the whole replicated tensor. Requested per call through gated_residual(); False: never
@@ -225,8 +229,16 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
     )
     part = list(g.shape)
     part[0] //= n
+    gated_done = False
     kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if A2A_SUM_L1 else {}
-    if bias is not None:
+    out = None
+    if gated is not None and A2A_GATED_SUM_FN is not None:
+        mem = kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG)
+        out = A2A_GATED_SUM_FN(g, n, part, mem, bias, gated.gate, gated.residual, d, ax)
+    if out is not None:  # the sum, bias and gated residual update in one pass
+        ttnn.deallocate(g)
+        gated_done = True
+    elif bias is not None:
         out = A2A_SUM_BIAS_FN(g, n, part, kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG), bias)
     elif A2A_SUM_FN is not None:
         out = A2A_SUM_FN(g, n, part, kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG))
@@ -235,8 +247,9 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
         for i in range(n):
             p = ttnn.slice(g, [i * part[0], 0, 0, 0], [(i + 1) * part[0]] + part[1:], **kw)
             out = p if out is None else ttnn.add(out, p, **kw)
-    ttnn.deallocate(g)
-    if gated is not None:
+    if not gated_done:
+        ttnn.deallocate(g)
+    if gated is not None and not gated_done:
         r4 = ttnn.mesh_partition(ttnn.reshape(gated.residual, lead), dim=d, cluster_axis=ax)
         g4 = ttnn.reshape(gated.gate, [1] * (4 - len(shape)) + list(gated.gate.shape))
         if int(g4.shape[d]) > 1:
