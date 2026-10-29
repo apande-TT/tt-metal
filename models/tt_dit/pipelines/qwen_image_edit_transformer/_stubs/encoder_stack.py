@@ -135,17 +135,23 @@ class _TtBlock:
         def gated(r, g, branch, entry):
             return entry.out if entry is not None and entry.out is not None else ttnn.add(r, ttnn.multiply(g, branch))
 
-        with _ccl.gated_residual((i_g1, img), (t_g1, txt)) as e:
-            a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary)
+        # need_txt False (set on the last block by its caller): the text stream's outputs are not used after this
+        # block, so its attention output projection, FF and residual updates are skipped (txt is returned as is)
+        need_txt = getattr(self, "need_txt", True)
+        pairs = ((i_g1, img), (t_g1, txt)) if need_txt else ((i_g1, img),)
+        with _ccl.gated_residual(*pairs) as e:
+            a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary, need_txt=need_txt)
         img = gated(img, i_g1, a_img, e[0] if e else None)
-        txt = gated(txt, t_g1, a_txt, e[1] if e else None)
+        if need_txt:
+            txt = gated(txt, t_g1, a_txt, e[1] if e else None)
 
         with _ccl.gated_residual((i_g2, img)) as e:
             f = self.img_ff(self._modulate(img, i_sh2, i_sc2))
         img = gated(img, i_g2, f, e[0] if e else None)
-        with _ccl.gated_residual((t_g2, txt)) as e:
-            f = self.txt_ff(self._modulate(txt, t_sh2, t_sc2))
-        txt = gated(txt, t_g2, f, e[0] if e else None)
+        if need_txt:
+            with _ccl.gated_residual((t_g2, txt)) as e:
+                f = self.txt_ff(self._modulate(txt, t_sh2, t_sc2))
+            txt = gated(txt, t_g2, f, e[0] if e else None)
         return img, txt
 
 

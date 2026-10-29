@@ -313,7 +313,9 @@ class TtQwenJointAttention:
         encoder_hidden_states_mask=None,
         attention_mask=None,
         image_rotary_emb=None,
+        need_txt=True,
     ):
+        """need_txt False: the text rows' output projection is skipped (txt returned as None)."""
         d = self.device
         hs = _as_tt(hidden_states, d, ttnn.float32 if _precise.ENABLED else ttnn.bfloat16)
         ehs = _as_tt(encoder_hidden_states, d, ttnn.float32 if _precise.ENABLED else ttnn.bfloat16)
@@ -408,10 +410,12 @@ class TtQwenJointAttention:
             o_img = ttnn.slice(o, (0, L, 0), (B, S, W))
             ttnn.deallocate(o)
             img = self._out(o_img, self.img_out)
-            txt = self._out(o_txt, self.txt_out)
+            txt = self._out(o_txt, self.txt_out) if need_txt else None
+            if not need_txt:
+                ttnn.deallocate(o_txt)
         else:
             img = self._out(self._attend(qi, kh, kl, v, mask_add, shared), self.img_out)
-            txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out)
+            txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out) if need_txt else None
         if shared is not None and shared[0] is not None:
             ttnn.deallocate(shared[0])
         return img, txt
