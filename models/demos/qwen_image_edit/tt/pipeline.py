@@ -37,7 +37,12 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_bias, fused_sum_bias
+from models.demos.qwen_image_edit.tt.block_sum import (
+    fused_block_sum,
+    fused_block_sum_bias,
+    fused_block_sum_gated,
+    fused_sum_bias,
+)
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
@@ -245,6 +250,7 @@ class QwenImageEditTT:
         _tr_ccl.A2A_SUM_BIAS_FN = fused_block_sum_bias
         # and the blocks' gated residual updates r + g * reduce on each device's 1/8 token slice before the gather
         _tr_ccl.GATED_RESIDUAL = True
+        _tr_ccl.A2A_GATED_SUM_FN = fused_block_sum_gated  # with the local sum, bias and update as one C++ program
         _tr_ccl.A2A_RECV_L1_BYTES = 32 * 1024 * 1024  # the text stream's received partials (25 MB) in L1
         # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
         _tr_precise.SPLIT_FN = fused_split_bf16

@@ -119,3 +119,111 @@ def _sum_program(srcs, out, n, reader, reader_ct):
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
     return ttnn.generic_op(srcs + [out], prog)
+
+
+def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim, cluster_axis):
+    """The all_to_all reduce's local sum (+ bias_rows) with the gated residual update in one pass:
+    r_slice + gate * sum(g's n blocks of shape `part`) [+ bias], where r_slice is this device's slice of `residual`
+    along `split_dim` of the 4-D [1, B, S, W] layout (its batch items for split_dim 1, its tile rows for 2) -- the
+    slice the all_to_all handed it -- so each device runs its own program (MeshProgramDescriptor). The same SFPU
+    float32 adds and multiply as fused_block_sum(_bias) + ttnn.multiply(gate, .) + ttnn.add(r_slice, .).
+    gate: [B or 1, 1, W] float32; residual: [B, S, W] float32. None when the shapes do not fit."""
+    ts = [g, gate, residual] + ([bias_rows] if bias_rows is not None else [])
+    if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
+        return None
+    if len(part) != 4 or int(part[0]) != 1 or split_dim not in (1, 2) or len(residual.shape) != 3:
+        return None
+    B, S, W = (int(v) for v in residual.shape)
+    _, b_loc, s_loc, w = (int(v) for v in part)
+    if w != W or S % 32 or s_loc % 32 or W % 32 or list(residual.padded_shape) != list(residual.shape):
+        return None
+    gB = int(gate.shape[0])
+    if len(gate.shape) != 3 or int(gate.shape[1]) != 1 or int(gate.shape[2]) != W or gB not in (1, B):
+        return None
+    Wt, Rt, Rt_loc = W // 32, S // 32, s_loc // 32
+    device = g.device()
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(part), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
+    n_tiles = _tiles(out)
+    has_bias = bias_rows is not None
+    reader_ct = [n_tiles, n, Wt, Rt_loc, Rt, 1 if has_bias else 0, 1 if gB > 1 else 0]
+    for t in (g, bias_rows if has_bias else g, residual, gate):
+        reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    grid = device.compute_with_storage_grid_size()
+    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, n_tiles)
+    page = 4096  # one float32 tile
+    n_in = n + (1 if has_bias else 0)
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=pages * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
+        )
+        for i, pages in ((0, 2 * n_in), (1, 2), (2, 2), (16, 2))
+    ]
+    cfg = ttnn.ComputeConfigDescriptor()
+    cfg.math_fidelity = ttnn.MathFidelity.HiFi4
+    cfg.fp32_dest_acc_en = True
+    cfg.math_approx_mode = False
+    modes = [ttnn.UnpackToDestMode.Default] * 32
+    for i in (0, 1, 2):
+        modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    cfg.unpack_to_dest_mode = modes
+    addrs = [
+        g.buffer_address(),
+        (bias_rows if has_bias else g).buffer_address(),
+        residual.buffer_address(),
+        gate.buffer_address(),
+    ]
+
+    def program(k):  # device k of the split: batch items [k * b_loc, ...) or tile rows [k * Rt_loc, ...)
+        b_off, r_off = (k * b_loc, 0) if split_dim == 1 else (0, k * Rt_loc)
+        rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        start = 0
+        for group, per in ((group1, per1), (group2, per2)):
+            for r in group.ranges():
+                for cx in range(r.start.x, r.end.x + 1):
+                    for cy in range(r.start.y, r.end.y + 1):
+                        rd_rt[cx][cy] = addrs + [b_off, r_off, per, start]
+                        wr_rt[cx][cy] = [out.buffer_address(), per, start]
+                        cp_rt[cx][cy] = [per]
+                        start += per
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "reader_sum_gated.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=reader_ct,
+                runtime_args=rd_rt,
+                config=ttnn.ReaderConfigDescriptor(),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(
+                    _TT_METAL,
+                    "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
+                ),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+                runtime_args=wr_rt,
+                config=ttnn.WriterConfigDescriptor(),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "sum_gated.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=[n_in],
+                runtime_args=cp_rt,
+                config=cfg,
+            ),
+        ]
+        return ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+
+    rows, cols = (int(v) for v in tuple(device.shape))
+    mesh_prog = ttnn.MeshProgramDescriptor()
+    for k in range(rows if cluster_axis == 0 else cols):
+        lo = ttnn.MeshCoordinate(k, 0) if cluster_axis == 0 else ttnn.MeshCoordinate(0, k)
+        hi = ttnn.MeshCoordinate(k, cols - 1) if cluster_axis == 0 else ttnn.MeshCoordinate(rows - 1, k)
+        mesh_prog[ttnn.MeshCoordinateRange(lo, hi)] = program(k)
+    io = [g] + ([bias_rows] if has_bias else []) + [residual, gate, out]
+    return ttnn.generic_op(io, mesh_prog)
