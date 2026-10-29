@@ -69,6 +69,9 @@ SKIP_SAME_CAST = False
 # fn(x, 1 + scale, shift, eps) -> LN(x) * (1 + scale) + shift in one call (e.g. a fused kernel), or None to run the
 # ops; None: the stock LayerNorm + modulation chain
 MODULATE_FN = None
+# MODULATE_FN(..., split=True) -> (y, (hi, lo)): the modulated activation's bf16 limbs made in the same pass and
+# registered with _precise.register_split (y itself is then not written: its consumers only split it)
+MODULATE_SPLIT = False
 
 
 class _TtBlock:
@@ -117,6 +120,12 @@ class _TtBlock:
 
     def _modulate(self, x, shift, scale):
         if MODULATE_FN is not None:
+            if MODULATE_SPLIT and _precise.ENABLED and SKIP_SAME_CAST:
+                # the modulated activation is only ever split into its bf16 limbs (q/k/v, FF up): make them here
+                r = MODULATE_FN(x, ttnn.add(scale, 1.0), shift, self.eps, split=True)
+                if r is not None:
+                    _precise.register_split(r[0], r[1])
+                    return r[0]
             y = MODULATE_FN(x, ttnn.add(scale, 1.0), shift, self.eps)
             if y is not None:
                 return y

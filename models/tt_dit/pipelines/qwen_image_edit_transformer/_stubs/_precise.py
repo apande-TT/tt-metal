@@ -73,7 +73,20 @@ EXACT_QK_LIMBS_L1 = False
 SPLIT_FN = None
 
 
+# limbs made by x's producer in the same pass (id(x) -> (x, (hi, lo))): split_bf16(x) hands them out once instead of
+# reading x (see register_split)
+_PRESPLIT = {}
+
+
+def register_split(x, parts):
+    """x's (hi, lo) limbs, made by its producer as SPLIT_FN would: the next split_bf16(x) returns them."""
+    _PRESPLIT[id(x)] = (x, parts)
+
+
 def split_bf16(x, mem=None):
+    pre = _PRESPLIT.pop(id(x), None)
+    if pre is not None and pre[0] is x and mem is None:
+        return pre[1]
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
     if SPLIT_FN is not None and x32.layout == ttnn.TILE_LAYOUT and x32.is_sharded() is False:
         return SPLIT_FN(x32) if mem is None else SPLIT_FN(x32, mem)
