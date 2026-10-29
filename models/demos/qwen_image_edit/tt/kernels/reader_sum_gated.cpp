@@ -7,8 +7,8 @@
 //   cb 0: the n_blocks source tiles i * block_tiles + t in source order, then (has_bias) the bias tile t % Wt
 //   cb 1: the residual tile of t in the whole residual [B, Rt tile rows, Wt]: batch bl + b_off, tile row rt + r_off
 //         (this device's slice: its batch items or its tile rows, per device runtime args)
-//   cb 2: row 0 (faces 0 and 1's first rows) of the gate tile of t's batch item and column -- all the ROW
-//         broadcast reads
+//   cb 2: (has_gate) row 0 (faces 0 and 1's first rows) of the gate tile of t's batch item and column -- all
+//         the ROW broadcast reads
 // One barrier per output tile.
 
 #include "api/dataflow/dataflow_api.h"
@@ -33,7 +33,8 @@ void kernel_main() {
     constexpr uint32_t Rt = get_compile_time_arg_val(4);
     constexpr uint32_t has_bias = get_compile_time_arg_val(5);
     constexpr uint32_t gate_batched = get_compile_time_arg_val(6);
-    constexpr auto src_args = TensorAccessorArgs<7>();
+    constexpr uint32_t has_gate = get_compile_time_arg_val(7);
+    constexpr auto src_args = TensorAccessorArgs<8>();
     constexpr auto bias_args = TensorAccessorArgs<src_args.next_compile_time_args_offset()>();
     constexpr auto res_args = TensorAccessorArgs<bias_args.next_compile_time_args_offset()>();
     constexpr auto gate_args = TensorAccessorArgs<res_args.next_compile_time_args_offset()>();
@@ -60,7 +61,9 @@ void kernel_main() {
         const uint32_t b = t / (Wt * Rt_local) + b_off;
         src.reserve_back(n_in);
         rb.reserve_back(1);
-        gb.reserve_back(1);
+        if constexpr (has_gate) {
+            gb.reserve_back(1);
+        }
         for (uint32_t i = 0; i < n_blocks; ++i) {
             noc.async_read(s, src, page, {.page_id = i * block_tiles + t}, {.offset_bytes = i * page});
         }
@@ -68,13 +71,17 @@ void kernel_main() {
             noc.async_read(bias, src, page, {.page_id = c}, {.offset_bytes = n_blocks * page});
         }
         noc.async_read(res, rb, page, {.page_id = (b * Rt + rt + r_off) * Wt + c}, {.offset_bytes = 0});
-        const uint32_t gp = gate_batched ? b * Wt + c : c;
-        for (uint32_t f = 0; f < 2; ++f) {
-            noc.async_read(gate, gb, row_bytes, {.page_id = gp, .offset_bytes = f * face_bytes}, {.offset_bytes = f * face_bytes});
+        if constexpr (has_gate) {
+            const uint32_t gp = gate_batched ? b * Wt + c : c;
+            for (uint32_t f = 0; f < 2; ++f) {
+                noc.async_read(gate, gb, row_bytes, {.page_id = gp, .offset_bytes = f * face_bytes}, {.offset_bytes = f * face_bytes});
+            }
         }
         noc.async_read_barrier();
         src.push_back(n_in);
         rb.push_back(1);
-        gb.push_back(1);
+        if constexpr (has_gate) {
+            gb.push_back(1);
+        }
     }
 }

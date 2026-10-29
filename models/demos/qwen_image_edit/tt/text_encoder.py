@@ -27,7 +27,7 @@ from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
 from models.demos.qwen_image_edit_text_encoder._stubs import (
@@ -111,6 +111,8 @@ class TtQwenTextEncoder:
         # where the batch splits over the TP devices: all_to_all + local adds + all_gather instead
         _te_attention.A2A_REDUCE = True
         _te_attention.A2A_SUM_FN = fused_block_sum  # its local sum of the n source partials as one C++ kernel
+        # and the vision MLP's reduce with its bias and the block's residual add in that pass
+        _te_attention.A2A_RESIDUAL_FN = fused_block_sum_gated
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
         # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
@@ -179,6 +181,7 @@ class TtQwenTextEncoder:
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
+        _te_stack.VISION_MLP_RESIDUAL_FUSED = True
         _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
         _te_stack.RESIDUAL_L1_BYTES = 8 * 1024 * 1024  # and the block's mid residual x + attn (7.2 MB)
         self.set_precise(True)

@@ -5,6 +5,7 @@
 // The exact all_to_all reduce's local sum with the block's gated residual update, one output tile at a time:
 //   s = ((p0 + p1) + ...) + p_{n-1} [+ bias]   as sum_blocks.cpp: SFPU float32 add<NearestEven> in source order
 //   y = r + g * s                               unary_bcast<ROW>(g) + mul_binary_tile, then add_binary_tile<NE>
+//                                               (without a gate, compile-time arg 1 = 0: y = r + s)
 // bit-identical to fused_block_sum(_bias) followed by ttnn.multiply(g, s) and ttnn.add(r, ...) on the device's
 // slice (float32 binary_ng is SFPU; IEEE multiply / add are commutative). s and g * s stay in DEST.
 // Tiles: cb 0 the n_in source (+ bias) tiles in order, cb 1 the residual tile, cb 2 the gate tile (row 0 valid).
@@ -24,6 +25,7 @@
 void kernel_main() {
     const uint32_t num_tiles = get_arg_val<uint32_t>(0);
     constexpr uint32_t n_in = get_compile_time_arg_val(0);
+    constexpr bool has_gate = get_compile_time_arg_val(1) != 0;  // false: y = r + s
 
     constexpr uint32_t cb_src = 0;
     constexpr uint32_t cb_res = 1;
@@ -50,12 +52,14 @@ void kernel_main() {
             add_binary_tile_init();
             add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
         }
-        gb.wait_front(1);
-        unary_bcast_init<ckernel::BroadcastType::ROW>(cb_gate);
-        unary_bcast<ckernel::BroadcastType::ROW>(cb_gate, 0, 1);
-        gb.pop_front(1);
-        mul_binary_tile_init();
-        mul_binary_tile(0, 1, 0);
+        if constexpr (has_gate) {
+            gb.wait_front(1);
+            unary_bcast_init<ckernel::BroadcastType::ROW>(cb_gate);
+            unary_bcast<ckernel::BroadcastType::ROW>(cb_gate, 0, 1);
+            gb.pop_front(1);
+            mul_binary_tile_init();
+            mul_binary_tile(0, 1, 0);
+        }
         rb.wait_front(1);
         copy_init(cb_res);
         copy_tile(cb_res, 0, 1);

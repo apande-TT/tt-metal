@@ -127,8 +127,10 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
     along `split_dim` of the 4-D [1, B, S, W] layout (its batch items for split_dim 1, its tile rows for 2) -- the
     slice the all_to_all handed it -- so each device runs its own program (MeshProgramDescriptor). The same SFPU
     float32 adds and multiply as fused_block_sum(_bias) + ttnn.multiply(gate, .) + ttnn.add(r_slice, .).
-    gate: [B or 1, 1, W] float32; residual: [B, S, W] float32. None when the shapes do not fit."""
-    ts = [g, gate, residual] + ([bias_rows] if bias_rows is not None else [])
+    gate: [B or 1, 1, W] float32, or None for r_slice + sum; residual: [B, S, W] float32. None when the shapes do
+    not fit."""
+    has_gate = gate is not None
+    ts = [g, residual] + ([gate] if has_gate else []) + ([bias_rows] if bias_rows is not None else [])
     if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
     if len(part) != 4 or int(part[0]) != 1 or split_dim not in (1, 2) or len(residual.shape) != 3:
@@ -137,15 +139,16 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
     _, b_loc, s_loc, w = (int(v) for v in part)
     if w != W or S % 32 or s_loc % 32 or W % 32 or list(residual.padded_shape) != list(residual.shape):
         return None
-    gB = int(gate.shape[0])
-    if len(gate.shape) != 3 or int(gate.shape[1]) != 1 or int(gate.shape[2]) != W or gB not in (1, B):
+    gB = int(gate.shape[0]) if has_gate else 1
+    if has_gate and (len(gate.shape) != 3 or int(gate.shape[1]) != 1 or int(gate.shape[2]) != W or gB not in (1, B)):
         return None
+    gate = gate if has_gate else residual  # the reader's (unused) gate accessor
     Wt, Rt, Rt_loc = W // 32, S // 32, s_loc // 32
     device = g.device()
     out = ttnn.allocate_tensor_on_device(ttnn.Shape(part), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
     n_tiles = _tiles(out)
     has_bias = bias_rows is not None
-    reader_ct = [n_tiles, n, Wt, Rt_loc, Rt, 1 if has_bias else 0, 1 if gB > 1 else 0]
+    reader_ct = [n_tiles, n, Wt, Rt_loc, Rt, 1 if has_bias else 0, 1 if gB > 1 else 0, int(has_gate)]
     for t in (g, bias_rows if has_bias else g, residual, gate):
         reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
     grid = device.compute_with_storage_grid_size()
@@ -212,7 +215,7 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
                 kernel_source=os.path.join(_KERNELS, "sum_gated.cpp"),
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores,
-                compile_time_args=[n_in],
+                compile_time_args=[n_in, int(has_gate)],
                 runtime_args=cp_rt,
                 config=cfg,
             ),
@@ -225,5 +228,5 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
         lo = ttnn.MeshCoordinate(k, 0) if cluster_axis == 0 else ttnn.MeshCoordinate(0, k)
         hi = ttnn.MeshCoordinate(k, cols - 1) if cluster_axis == 0 else ttnn.MeshCoordinate(rows - 1, k)
         mesh_prog[ttnn.MeshCoordinateRange(lo, hi)] = program(k)
-    io = [g] + ([bias_rows] if has_bias else []) + [residual, gate, out]
+    io = [g] + ([bias_rows] if has_bias else []) + [residual] + ([gate] if has_gate else []) + [out]
     return ttnn.generic_op(io, mesh_prog)
