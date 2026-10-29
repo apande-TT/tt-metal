@@ -80,6 +80,9 @@ class TtQwenImageTransformer:
         self.transformer_blocks = [
             qwen_image_transformer_block.build(device, blk) for blk in list(torch_module.transformer_blocks)[:n]
         ]
+        # nothing reads the text stream after the last block (norm_out / proj_out take img alone): that block skips
+        # its text output projection, FF and residual updates
+        self.transformer_blocks[-1].stack.blocks[0].need_txt = False
         self.norm_out = ada_layer_norm_continuous.build(device, torch_module.norm_out)
         self.proj_out = decoder_head.build(device, torch_module.proj_out)
 
