@@ -231,8 +231,14 @@ GUARD_SLACK = 4.0
 _COL_NORMS = {}
 
 
+# Square a bf16 input straight into float32 in _norm_last (no float32 copy of it first). Off by default.
+NORM_BF16_SQUARE = False
+
+
 def _norm_last(t, keepdim=True):
     """L2 norm over the last dim, float32."""
+    if NORM_BF16_SQUARE and t.dtype == ttnn.bfloat16:
+        return ttnn.sqrt(ttnn.sum(ttnn.multiply(t, t, dtype=ttnn.float32), dim=-1, keepdim=keepdim))
     t32 = t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
     return ttnn.sqrt(ttnn.sum(ttnn.multiply(t32, t32), dim=-1, keepdim=keepdim))
 

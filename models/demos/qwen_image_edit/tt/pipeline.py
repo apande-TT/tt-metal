@@ -275,9 +275,12 @@ class TtQwenImageEditPipeline:
         # (its weight-lane linears' 8 lane copies formed once per linear, not once per row chunk; 96 MB output
         # chunks, so the FF down's 8192-row chunks take weight lanes too: 2 x 3072 <= 8192)
         # (and the 8 weight lanes as one K-stacked product: the input repeated 8x along K by the C++ repeat_k)
+        # (and the guard's input row norms squared from the bf16 lead limb straight into float32)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
             _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
         ), self._hook(_dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024), self._hook(
+            _te_attention, "NORM_BF16_SQUARE", True
+        ), self._hook(
             _te_attention, "LANE_STACK", repeat_k if self.weight_lane_split else None
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
