@@ -30,9 +30,11 @@ _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 
 
-def fused_softmax_rows(s, mask_add, mem):
+def fused_softmax_rows(s, mask_add, mem, split_mem=None):
     """s [N, H, Sq, Sk] float32 TILE (interleaved), mask_add [N or 1, 1, 1, Sk] float32 TILE or None
-    -> softmax(s + mask_add, dim=-1) float32 TILE in `mem`, bit-identical to the ttnn op chain (padding too)."""
+    -> softmax(s + mask_add, dim=-1) float32 TILE in `mem`, bit-identical to the ttnn op chain (padding too).
+    split_mem: -> (p, (hi, lo)) with p's bf16 limbs in split_mem, made as limb_split.fused_split_bf16 makes them,
+    and p itself allocated but NOT written -- for a caller whose only use of p is that split."""
     N, H, Sq, Sk = (int(d) for d in s.shape)
     assert s.dtype == ttnn.float32 and s.layout == ttnn.TILE_LAYOUT, "float32 TILE logits"
     Wt, Ht = int(s.padded_shape[-1]) // 32, int(s.padded_shape[-2]) // 32
@@ -46,13 +48,18 @@ def fused_softmax_rows(s, mask_add, mem):
         mask_batches = m[0]
     batch = next(b for b in (4, 2, 1) if Wt % b == 0)  # logit tiles per reader barrier
     out = ttnn.allocate_tensor_on_device(s.shape, ttnn.float32, ttnn.TILE_LAYOUT, s.device(), mem)
+    split = split_mem is not None
+    if split:
+        hi = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
+        lo = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
 
     device = s.device()
     grid = device.compute_with_storage_grid_size()
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, N * H * Ht)
     page = 4096  # one float32 tile
-    pages = [(0, 2 * batch), (2, Wt), (3, 1), (4, 1), (16, 2)]  # s stream, x / e row, max, sum, out
+    pages = [(0, 2 * batch), (2, Wt), (3, 1), (4, 1)]  # s stream, x / e row, max, sum
+    pages += [(17, 2), (24, 2), (25, 2)] if split else [(16, 2)]  # split: lo, scratch hi, scratch p; else out
     if has_mask:
         pages.append((1, Wt))  # the current batch's mask row
     w_mod, h_mod = Sk % 32, Sq % 32
@@ -67,6 +74,16 @@ def fused_softmax_rows(s, mask_add, mem):
         )
         for i, n in pages
     ]
+    if split:  # bf16 hi, lo and scratch hi (float32 scratch p above)
+        bf = {16: 2, 17: 2, 24: 2}
+        cbs = [c for c, (i, _) in zip(cbs, pages) if i not in bf] + [
+            ttnn.CBDescriptor(
+                total_size=n * 2048,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.bfloat16, page_size=2048)],
+            )
+            for i, n in bf.items()
+        ]
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     mask_addr = mask_add.buffer_address() if has_mask else 0
     start = 0
@@ -75,11 +92,16 @@ def fused_softmax_rows(s, mask_add, mem):
             for x in range(r.start.x, r.end.x + 1):
                 for y in range(r.start.y, r.end.y + 1):
                     rd_rt[x][y] = [s.buffer_address(), mask_addr, per, start]
-                    wr_rt[x][y] = [out.buffer_address(), per * Wt, start * Wt]
+                    wr_rt[x][y] = (
+                        [hi.buffer_address(), lo.buffer_address(), per * Wt, start * Wt]
+                        if split
+                        else [out.buffer_address(), per * Wt, start * Wt]
+                    )
                     cp_rt[x][y] = [per, start]
                     start += per
     shape_ct = [Wt, Ht, H, mask_batches, int(has_mask), w_mod, h_mod]
     reader_ct = shape_ct + [batch] + list(ttnn.TensorAccessorArgs(s).get_compile_time_args())
+    shape_ct = shape_ct + [int(split)]
     reader_ct += list(ttnn.TensorAccessorArgs(mask_add if has_mask else s).get_compile_time_args())
     # as binary_ng / unary / the accurate fp32 reduce: float32 inputs unpacked to DEST, float32 DEST, precise SFPU
     cfg = ttnn.ComputeConfigDescriptor()
@@ -87,7 +109,7 @@ def fused_softmax_rows(s, mask_add, mem):
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
-    for i in (0, 1, 2, 3, 4, 5):
+    for i in (0, 1, 2, 3, 4, 5, 25):
         modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     kernels = [
@@ -100,13 +122,20 @@ def fused_softmax_rows(s, mask_add, mem):
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(
+            kernel_source=os.path.join(_KERNELS, "writer_two_outputs.cpp")
+            if split
+            else os.path.join(
                 _TT_METAL,
                 "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
             ),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=(
+                list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
+                + list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
+                if split
+                else [16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+            ),
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -120,4 +149,7 @@ def fused_softmax_rows(s, mask_add, mem):
         ),
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    if split:
+        ttnn.generic_op([s] + ([mask_add] if has_mask else []) + [hi, lo], prog)
+        return out, (hi, lo)
     return ttnn.generic_op([s] + ([mask_add] if has_mask else []) + [out], prog)

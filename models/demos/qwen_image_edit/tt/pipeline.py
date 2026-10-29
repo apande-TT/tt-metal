@@ -238,6 +238,7 @@ class QwenImageEditTT:
         _tr_attention.JOINT_HEADS_FN = fused_joint_heads
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
         _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
+        _tr_attention.SOFTMAX_SPLIT = True  # writing P's bf16 limbs for P @ V instead of P
         # the transformer's exact fp32 TP reduce gathers, slices and adds each token chunk in L1
         _tr_ccl.L1_GATHER_BYTES = 48 * 1024 * 1024
         _tr_ccl.L1_GATHER_INPUT = True  # and each chunk's own partial is staged in L1 for the gather

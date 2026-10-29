@@ -23,6 +23,8 @@
 // and the broadcasts are exact copies, so the same float32 operands reach the same SFPU ops in the same order.
 // cb_x holds the row's Wt x tiles; the subtract / exp pass pops each x tile and pushes its e tile behind
 // (the buffer is exactly Wt tiles, so e lands in x's place), and the divide pass pops the e tiles.
+// With `split` (compile-time arg 7) the output is p's bf16 limbs, made as kernels/split_bf16.cpp makes them
+// (hi = the packer's bf16 narrowing of p, lo = bf16(p - float32(hi))), instead of p.
 
 #include <cstdint>
 
@@ -37,6 +39,7 @@
 #include "api/compute/eltwise_unary/where.h"
 #include "api/compute/pack.h"
 #include "api/compute/reduce.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/reg_api.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/dataflow/circular_buffer.h"
@@ -47,7 +50,10 @@ constexpr uint32_t cb_x = 2;     // the row's Wt tiles: x, then e
 constexpr uint32_t cb_mx = 3;    // row max (column 0 valid)
 constexpr uint32_t cb_den = 4;   // row sum (column 0 valid)
 constexpr uint32_t cb_pad = 5;   // padding masks (1.0 in the padding): right, bottom, corner (those present)
-constexpr uint32_t cb_out = 16;  // probabilities, drained by the writer
+constexpr uint32_t cb_out = 16;  // probabilities (or with `split` their bf16 hi limb), drained by the writer
+constexpr uint32_t cb_lo = 17;   // split: bf16(p - float32(hi))
+constexpr uint32_t cb_tmp = 24;  // split: scratch hi (bf16)
+constexpr uint32_t cb_y = 25;    // split: scratch p (float32)
 
 // The accurate fp32 reduce W of compute_kernel_lib::reduce (REDUCE_ROW, SFPU path, WaitUpfront indexing):
 // DST 0 = tile 0, then DST 1 = tile wt folded into DST 0, then the intra-tile row reduce; packed with the
@@ -78,6 +84,7 @@ inline void reduce_row(uint32_t cb_in, uint32_t cb_red, uint32_t Wt) {
     sfpu_reduce<pool, DataFormat::Float32, ckernel::ReduceDim::REDUCE_ROW>(0, 1, 1);
     tile_regs_commit();
     tile_regs_wait();
+    pack_reconfig_data_format(cb_red);
     PACK((llk_pack_reduce_mask_config<ckernel::ReduceDim::REDUCE_ROW, ckernel::PackMode::Default>(cb_red)));
     pack_tile(0, cb_red);
     PACK((llk_pack_reduce_mask_clear()));
@@ -107,6 +114,7 @@ void kernel_main() {
     constexpr bool has_mask = get_compile_time_arg_val(4) != 0;
     constexpr uint32_t w_mod = get_compile_time_arg_val(5);  // Sk % 32 (0: no right padding)
     constexpr uint32_t h_mod = get_compile_time_arg_val(6);  // Sq % 32 (0: no bottom padding)
+    constexpr bool split = get_compile_time_arg_val(7) != 0;  // write p's bf16 limbs (hi, lo) instead of p
     constexpr uint32_t num_pad = (w_mod != 0) + (h_mod != 0) + (w_mod != 0 && h_mod != 0);
     constexpr uint32_t pad_bottom = w_mod != 0 ? 1 : 0;  // index of the bottom mask in cb_pad (corner: + 1)
     constexpr uint32_t neg_inf_bits = 0xFF800000u;       // FillPad value of ttnn.max (-inf)
@@ -126,6 +134,10 @@ void kernel_main() {
 
     uint32_t mask_key = 0xFFFFFFFF;
     for (uint32_t r = start_row; r < start_row + num_rows; ++r) {
+        if constexpr (split) {  // the previous row's limb packs / bf16 unpacks left other formats configured
+            reconfig_data_format(cb_s, cb_s);
+            pack_reconfig_data_format(cb_x);
+        }
         const bool bottom = h_mod != 0 && r % Ht == Ht - 1;
         // the padding mask of tile wt of this row, or -1 for a tile without padding
         auto pad_tile = [&](uint32_t wt) -> int32_t {
@@ -213,6 +225,9 @@ void kernel_main() {
         for (uint32_t wt = 0; wt < Wt; ++wt) {
             out.reserve_back(1);
             tile_regs_acquire();
+            if constexpr (split) {
+                reconfig_data_format(cb_x, cb_x);
+            }
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_den);
             unary_bcast<ckernel::BroadcastType::COL>(cb_den, 0, 1);
             copy_init(cb_x);
@@ -220,10 +235,50 @@ void kernel_main() {
             div_binary_tile_init();
             div_binary_tile(0, 1, 0);
             tile_regs_commit();
-            tile_regs_wait();
-            pack_tile(0, cb_out);
-            tile_regs_release();
-            out.push_back(1);
+            if constexpr (!split) {
+                tile_regs_wait();
+                pack_tile(0, cb_out);
+                tile_regs_release();
+                out.push_back(1);
+            } else {
+                // as split_bf16.cpp: hi = bf16(p) (packer narrowing), lo = bf16(p - float32(hi))
+                CircularBuffer lo(cb_lo);
+                CircularBuffer tmp(cb_tmp);
+                CircularBuffer yb(cb_y);
+                tmp.reserve_back(1);
+                yb.reserve_back(1);
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_out);
+                pack_tile(0, cb_out);
+                pack_tile(0, cb_tmp);
+                pack_reconfig_data_format(cb_y);
+                pack_tile(0, cb_y);
+                tile_regs_release();
+                out.push_back(1);
+                tmp.push_back(1);
+                yb.push_back(1);
+
+                tmp.wait_front(1);
+                yb.wait_front(1);
+                lo.reserve_back(1);
+                tile_regs_acquire();
+                reconfig_data_format_srca(cb_y);
+                copy_init(cb_y);
+                copy_tile(cb_y, 0, 0);
+                reconfig_data_format_srca(cb_tmp);
+                copy_init(cb_tmp);
+                copy_tile(cb_tmp, 0, 1);
+                sub_binary_tile_init();
+                sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+                tile_regs_commit();
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_lo);
+                pack_tile(0, cb_lo);
+                tile_regs_release();
+                lo.push_back(1);
+                tmp.pop_front(1);
+                yb.pop_front(1);
+            }
             x.pop_front(1);
         }
         den.pop_front(1);
