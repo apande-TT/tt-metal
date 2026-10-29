@@ -144,6 +144,9 @@ def _gather_sum_l1(y, ax, n, nbytes):
 # the (n-1)x of gathering every partial, and 1/n of the slices/adds. Same adds in the same order.
 A2A_REDUCE = False
 A2A_SUM_L1 = False  # the all_to_all's per-source slices and their float32 sum in L1 (all_gathered from there)
+# the all_to_all's received partials (the same bytes as its input, read once by the local sum) in L1 when they take at
+# most this many bytes (0: DRAM)
+A2A_RECV_L1_BYTES = 0
 
 
 # optional replacement for the all_to_all reduce's local sum of its n source blocks: a callable
@@ -208,8 +211,17 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
     y4 = ttnn.reshape(y, lead)
     # out_dim d is split over the devices and in_dim (0) grows by n: block i of dim 0 = source device i's
     # partial of this device's slice of dim d
+    nbytes = 4 if y.dtype == ttnn.float32 else 2
+    for v in shape:
+        nbytes *= v
+    recv_l1 = 0 < nbytes <= A2A_RECV_L1_BYTES
     g = ttnn.experimental.all_to_all_async_generic(
-        y4, in_dim=0, out_dim=d, cluster_axis=ax, topology=ttnn.Topology.Linear
+        y4,
+        in_dim=0,
+        out_dim=d,
+        cluster_axis=ax,
+        topology=ttnn.Topology.Linear,
+        **({"memory_config": ttnn.L1_MEMORY_CONFIG} if recv_l1 else {}),
     )
     part = list(g.shape)
     part[0] //= n
