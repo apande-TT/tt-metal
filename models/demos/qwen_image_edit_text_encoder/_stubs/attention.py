@@ -342,6 +342,11 @@ WEIGHT_LANE_SPLIT = None
 # Within one row-chunked linear: {id(w): its 8 lane copies}, formed by the first chunk and reused by the rest
 # (None = no reuse; the owner of the dict frees the copies when the linear is done).
 LANE_CACHE = None
+# Optional K-repeat kernel: LANE_STACK(x, n) -> [x | ... | x] (n copies along K), or None. With it the weight-side
+# lanes run as ONE product, [x | ... | x] @ [lane 0 rows; ...; lane 7 rows] (K' = 8K): every tile product is still a
+# lane's exact one (<= 4 nonzeros per 32-group), and the lanes accumulate in the product's float32 output instead of
+# 8 float32 outputs summed afterwards.
+LANE_STACK = None
 _ROW_LANE_MASKS = {}
 
 
@@ -382,6 +387,26 @@ def _weight_lane_sums(lead, ws):
     if split is not None and any(lanes is None for lanes in split):
         split = None
         cache = None
+    if LANE_STACK is not None and split is not None:
+        stacks = []
+        for i, w in enumerate(ws):
+            got = None if cache is None else cache.get(("stack", id(w)))
+            if got is None:
+                got = [ttnn.concat(list(split[i]), dim=0)]  # [8K, N]: lane r's rows at r * K
+                if cache is not None:
+                    cache[("stack", id(w))] = got
+            stacks.append(got[0])
+        xr = LANE_STACK(lead, len(split[0]))
+        if xr is not None:
+            outs = [_linear_mm(xr, st)(xr) for st in stacks]
+            ttnn.deallocate(xr)
+            if cache is None:
+                for st in stacks:
+                    ttnn.deallocate(st)
+                for lanes in split:
+                    for t in lanes:
+                        ttnn.deallocate(t)
+            return outs
     # the lead limb, read by every lane product, staged in L1 once when it is small (the vision qkv 14.4 MB, proj
     # 17.3 MB per chip)
     vol = 2

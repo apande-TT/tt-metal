@@ -599,3 +599,64 @@ def row_gather(x, perm):
     ]
     ttnn.generic_op([x, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
     return y
+
+
+_KR_READER = f"{_DIR}/chunk_copy_reader.cpp"
+_KR_WRITER = f"{_DIR}/k_repeat_writer.cpp"
+_KR_CHUNK = 8
+
+
+def repeat_k(x, reps):
+    """y [..., M, reps * K] = [x | x | ... | x] (reps copies side by side) for an interleaved bf16 tile tensor
+    [..., M, K] (K tile-aligned), from one read of x; None for a tensor it does not take."""
+    s = list(x.shape)
+    ps = list(x.padded_shape)
+    if x.dtype != ttnn.bfloat16 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or len(s) < 2 or s[-1] % TILE:
+        return None
+    kt = ps[-1] // TILE
+    pages = 1
+    for d in ps[:-2]:
+        pages *= d
+    pages *= (ps[-2] // TILE) * kt
+    y = ttnn.empty(
+        s[:-1] + [reps * s[-1]],
+        dtype=x.dtype,
+        layout=ttnn.TILE_LAYOUT,
+        device=x.device(),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    grid = x.device().compute_with_storage_grid_size()
+    work = _cores(grid, pages)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+    page = _FP32_TILE_BYTES // 2
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=2 * _KR_CHUNK * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=0, data_format=x.dtype, page_size=page)],
+        )
+    ]
+    rd, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        rd[c.x][c.y] = [x.buffer_address(), start, count]
+        wr[c.x][c.y] = [y.buffer_address(), start, count]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_KR_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args() + [_KR_CHUNK],
+            runtime_args=rd,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_KR_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(y).get_compile_time_args() + [_KR_CHUNK, kt, reps],
+            runtime_args=wr,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([x, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return y
