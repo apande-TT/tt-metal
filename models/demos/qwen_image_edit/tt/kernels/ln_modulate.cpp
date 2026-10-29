@@ -122,74 +122,92 @@ void kernel_main() {
         r.push_back(1);
         r.wait_front(1);
 
-        // y = ((x - mu) * r) * (1 + scale) + shift
-        for (uint32_t wt = 0; wt < Wt; ++wt) {
-            ss.wait_front(2);
+        // y = ((x - mu) * r) * (1 + scale) + shift, two tiles per DEST acquire (DST 0 / 1 and 2 / 3): the same ops per
+        // tile, each init and broadcast setup done once per pair
+        for (uint32_t wt = 0; wt < Wt; wt += 2) {
+            ss.wait_front(4);  // (1 + scale, shift) of columns wt and wt + 1
             tile_regs_acquire();
             reconfig_data_format_srca(cb_x);
             copy_init(cb_x);
             copy_tile(cb_x, wt, 0);
+            copy_tile(cb_x, wt + 1, 2);
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_mu);
             unary_bcast<ckernel::BroadcastType::COL>(cb_mu, 0, 1);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_mu, 0, 3);
             sub_binary_tile_init();
             sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+            sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(2, 3, 2);
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_r);
             unary_bcast<ckernel::BroadcastType::COL>(cb_r, 0, 1);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_r, 0, 3);
             mul_binary_tile_init();
             mul_binary_tile(0, 1, 0);
+            mul_binary_tile(2, 3, 2);
             unary_bcast_init<ckernel::BroadcastType::ROW>(cb_ss);
             unary_bcast<ckernel::BroadcastType::ROW>(cb_ss, 0, 1);
+            unary_bcast<ckernel::BroadcastType::ROW>(cb_ss, 2, 3);
             mul_binary_tile_init();
             mul_binary_tile(0, 1, 0);
+            mul_binary_tile(2, 3, 2);
             unary_bcast_init<ckernel::BroadcastType::ROW>(cb_ss);
             unary_bcast<ckernel::BroadcastType::ROW>(cb_ss, 1, 1);
+            unary_bcast<ckernel::BroadcastType::ROW>(cb_ss, 3, 3);
             add_binary_tile_init();
             add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+            add_binary_tile<ckernel::DstRoundingMode::NearestEven>(2, 3, 2);
             tile_regs_commit();
-            out.reserve_back(1);
+            out.reserve_back(2);
             if constexpr (!split) {
                 tile_regs_wait();
                 pack_reconfig_data_format(cb_out);
                 pack_tile(0, cb_out);
+                pack_tile(2, cb_out);
                 tile_regs_release();
-                out.push_back(1);
+                out.push_back(2);
             } else {
                 // as split_bf16.cpp: hi = bf16(y) (packer narrowing), lo = bf16(y - float32(hi))
-                tmp.reserve_back(1);
-                yb.reserve_back(1);
+                tmp.reserve_back(2);
+                yb.reserve_back(2);
                 tile_regs_wait();
                 pack_reconfig_data_format(cb_out);
                 pack_tile(0, cb_out);
+                pack_tile(2, cb_out);
                 pack_tile(0, cb_tmp);
+                pack_tile(2, cb_tmp);
                 pack_reconfig_data_format(cb_y);
                 pack_tile(0, cb_y);
+                pack_tile(2, cb_y);
                 tile_regs_release();
-                out.push_back(1);
-                tmp.push_back(1);
-                yb.push_back(1);
+                out.push_back(2);
+                tmp.push_back(2);
+                yb.push_back(2);
 
-                tmp.wait_front(1);
-                yb.wait_front(1);
-                lo.reserve_back(1);
+                tmp.wait_front(2);
+                yb.wait_front(2);
+                lo.reserve_back(2);
                 tile_regs_acquire();
                 reconfig_data_format_srca(cb_y);
                 copy_init(cb_y);
                 copy_tile(cb_y, 0, 0);
+                copy_tile(cb_y, 1, 2);
                 reconfig_data_format_srca(cb_tmp);
                 copy_init(cb_tmp);
                 copy_tile(cb_tmp, 0, 1);
+                copy_tile(cb_tmp, 1, 3);
                 sub_binary_tile_init();
                 sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+                sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(2, 3, 2);
                 tile_regs_commit();
                 tile_regs_wait();
                 pack_reconfig_data_format(cb_lo);
                 pack_tile(0, cb_lo);
+                pack_tile(2, cb_lo);
                 tile_regs_release();
-                lo.push_back(1);
-                tmp.pop_front(1);
-                yb.pop_front(1);
+                lo.push_back(2);
+                tmp.pop_front(2);
+                yb.pop_front(2);
             }
-            ss.pop_front(2);
+            ss.pop_front(4);
         }
         x.pop_front(Wt);
         mu.pop_front(1);

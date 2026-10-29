@@ -37,7 +37,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
     if len(x.shape) != 3 or len(scale1.shape) != 3 or list(scale1.shape) != list(shift.shape):
         return None
     B, S, W = (int(d) for d in x.shape)
-    if S % 32 or W % 32 or list(x.padded_shape) != list(x.shape):
+    if S % 32 or W % 64 or list(x.padded_shape) != list(x.shape):  # an even tile count per row (column pairs)
         return None
     sB = int(scale1.shape[0])
     if sB not in (1, B) or int(scale1.shape[1]) != 1 or int(scale1.shape[2]) != W:
@@ -59,11 +59,12 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, rows)
     page = 4096  # one float32 tile
     f32, b16 = (ttnn.float32, page), (ttnn.bfloat16, page // 2)
-    cb_list = [(0, 2 * Wt, f32), (1, 1, f32), (2, 1, f32), (3, 4, f32)]  # x: two whole rows (one in use, one read)
+    # x: two whole rows (one in use, one read); the apply pass works on column pairs, so the others hold two pairs
+    cb_list = [(0, 2 * Wt, f32), (1, 1, f32), (2, 1, f32), (3, 8, f32)]
     if split:  # hi, lo, scratch hi, scratch y
-        cb_list += [(16, 2, b16), (17, 2, b16), (24, 2, b16), (25, 2, f32)]
+        cb_list += [(16, 4, b16), (17, 4, b16), (24, 2, b16), (25, 2, f32)]
     else:
-        cb_list += [(16, 2, f32)]
+        cb_list += [(16, 4, f32)]
     cbs = [
         ttnn.CBDescriptor(
             total_size=pages * fmt[1],
