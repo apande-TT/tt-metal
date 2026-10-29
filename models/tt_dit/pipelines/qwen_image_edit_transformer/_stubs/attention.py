@@ -255,7 +255,14 @@ class TtQwenJointAttention:
             s = self._qk(q, kh, kl)
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
-        if SOFTMAX_FN is not None:  # the same chain as one kernel
+        if SOFTMAX_FN is not None and SOFTMAX_SPLIT and _precise.ENABLED:
+            # P is only ever split into its bf16 limbs for P @ V: the softmax kernel writes them (L1 like
+            # MATMUL_A_L1's split) instead of P, and hands them to _precise.matmul
+            mem = ttnn.L1_MEMORY_CONFIG if _precise.MATMUL_A_L1 else ttnn.DRAM_MEMORY_CONFIG
+            p, parts = SOFTMAX_FN(s, mask_add, ttnn.DRAM_MEMORY_CONFIG, split_mem=mem)
+            _precise.register_split(p, parts)
+            ttnn.deallocate(s)
+        elif SOFTMAX_FN is not None:  # the same chain as one kernel
             p = SOFTMAX_FN(s, mask_add, ttnn.DRAM_MEMORY_CONFIG)
             ttnn.deallocate(s)
         elif SOFTMAX_L1:  # the same ops, the logits staged in L1 and the subtract / exp done in place there
@@ -477,6 +484,9 @@ def _rope_tables(freqs, half):
 SOFTMAX_L1 = False
 # the attention softmax (mask add .. divide) as one bit-identical kernel: f(s, mask_add or None, mem) -> p
 SOFTMAX_FN = None
+# SOFTMAX_FN(..., split_mem=) -> (p, (hi, lo)): the probabilities' bf16 limbs for the precise P @ V made in the
+# softmax pass (P itself is then not written); False: SOFTMAX_FN writes P
+SOFTMAX_SPLIT = False
 
 
 def build(device, torch_module=None):

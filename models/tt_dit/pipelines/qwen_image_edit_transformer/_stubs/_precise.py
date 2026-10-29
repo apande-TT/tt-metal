@@ -241,8 +241,12 @@ def matmul(a, b, b_parts=None):
     """float32 a @ float32 b -> float32 as the 3-term bf16 split (dense accumulation). b_parts: b's
     (hi, lo) when several products share b."""
     cfg = precise_config()
+    pre = _PRESPLIT.pop(id(a), None)
     l1_limbs = MATMUL_A_L1 and SPLIT_FN is not None and a.dtype == ttnn.float32 and not a.is_sharded()
-    ah, al = SPLIT_FN(a, ttnn.L1_MEMORY_CONFIG) if l1_limbs else split_bf16(a)
+    if pre is not None and pre[0] is a:  # a's producer made its limbs (only this product uses them)
+        (ah, al), l1_limbs = pre[1], True
+    else:
+        ah, al = SPLIT_FN(a, ttnn.L1_MEMORY_CONFIG) if l1_limbs else split_bf16(a)
     bh, bl = split_bf16(b) if b_parts is None else b_parts
     if MATMUL_FN is not None:
         y = MATMUL_FN(ah, al, bh, bl)
