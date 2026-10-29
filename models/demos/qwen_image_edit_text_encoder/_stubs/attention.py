@@ -796,6 +796,8 @@ def onehot_matmul(a, b, limbs=2):
 
 
 B_LIMB_L1 = False
+# The batch (entries) from which B_LIMB_L1 stages the lead b limb in L1.
+B_LIMB_L1_MIN_BATCH = 64
 
 
 # Optional fused kernel for the weight-side lane split: B_LANE_SPLIT(w2d) -> the 8 strided-lane row-masked copies of a
@@ -840,7 +842,7 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
         vol *= d
     for d in shape[:-2]:
         batch *= d
-    small = vol <= 16 * 2**20 and batch >= 64
+    small = vol <= 16 * 2**20 and batch >= B_LIMB_L1_MIN_BATCH
     pb0_l1 = ttnn.to_memory_config(pb0, ttnn.L1_MEMORY_CONFIG) if B_LIMB_L1 and small else pb0
     acc = _LaneAcc()
     b_lanes = _b_side_lanes(pa0, pb0, transpose_b)
