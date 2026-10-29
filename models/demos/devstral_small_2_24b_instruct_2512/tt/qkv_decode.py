@@ -5,7 +5,7 @@
 decode tokens, x the input norm's bf16 width shards, replacing the DRAM-sharded matmul (~21.7 us a layer -> ~19).
 
 The stock op runs 24 workers (3 a DRAM bank), each 2 output columns over the whole K = 160 tiles: 320 tile products
-a core, math-bound. Here each of the N = 48 columns gets its own core -- 160 products a core -- on the 8 x 6
+a core, math-bound. Here each of the N = 48 columns gets its own core -- 160 products a core -- on the 6 x 8
 rectangle at (0, 0) whose 1-tile width shards nlp_create_qkv_heads_decode reads in place (2.2 -> 1.8 us):
   * both data-movement RISCs stream the core's column from a BANK-MAJOR weight copy, pushes of RB K rows (one
     contiguous read each), two in flight a RISC: RISCV_1 (NOC 1) the first W1 odd pushes, RISCV_0 (NOC 0, whose reads
@@ -38,12 +38,14 @@ _KDIR = Path(__file__).resolve().parent / "kernels"
 
 
 class StreamQKVDecode:
-    GRID = (8, 6)  # compute cores = output shard cores, one column each (row-major from (0, 0))
+    # compute cores = output shard cores, one column each (row-major from (0, 0)); grid try (run 12): 6 wide x 8 tall
+    # 19.96-20.19 us vs 8 x 6 20.6-21.3 (the NOC 1 weight stream ends ~1.5 us sooner); centred 8 x 6 at (3, 2): ~22 us
+    GRID = (6, 8)
     RB = 10  # K rows a weight push (~10.9 KB block-float8)
     CH = 10  # x tiles a multicast chunk
     SPILL_KB = 0  # K tiles between fp32 partial spills / srcA reloads (0: none, see the module docstring)
     W1 = 7  # pushes of the 16 RISCV_1 streams (8 each: the NOC 1 stream ended ~4 us after the NOC 0 one)
-    SENDER = (8, 0)  # next to the rectangle and to the norm's shards (8 x 5 at (0, 0))
+    SENDER = (6, 0)  # next to the rectangle and to the norm's shards (8 x 5 at (0, 0))
     # cpp try (run 12, NLPCreateQKVHeadsDecode): __call__(heads=...) writes q / k / v in the head layouts itself
     HEADS_OUT = True
 

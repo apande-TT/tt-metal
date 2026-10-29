@@ -477,7 +477,7 @@ PLANNED_TP = 4
 #                     column a core on 48 cores, x multicast in chunks by a sender core over both NOCs, both RISCs
 #                     streaming the bank-major column, the whole K in fp32 DEST (text PCC 0.995063 -> 0.99513, image
 #                     unchanged), each core scattering its tile's rows into the q / k / v head shards: QKV 21.7 + split
-#                     2.25 -> ~21 us a layer, one program fewer; trace decode 12.508 -> 12.405 ms.
+#                     2.25 -> ~20 us a layer, one program fewer; trace decode 12.508 -> 12.360 ms.
 
 
 def kv_capacity_for(tp):
