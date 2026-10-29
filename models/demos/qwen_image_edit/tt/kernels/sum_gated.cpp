@@ -8,7 +8,8 @@
 //                                               (without a gate, compile-time arg 1 = 0: y = r + s)
 // bit-identical to fused_block_sum(_bias) followed by ttnn.multiply(g, s) and ttnn.add(r, ...) on the device's
 // slice (float32 binary_ng is SFPU; IEEE multiply / add are commutative). s and g * s stay in DEST.
-// Tiles: cb 0 the n_in source (+ bias) tiles in order, cb 1 the residual tile, cb 2 the gate tile (row 0 valid).
+// Tiles: cb 0 the n_in source tiles in order, cb 3 the bias tile (row 0 valid), cb 1 the residual tile, cb 2 the
+// gate tile (row 0 valid).
 
 #include <cstdint>
 
@@ -24,8 +25,10 @@
 
 void kernel_main() {
     const uint32_t num_tiles = get_arg_val<uint32_t>(0);
-    constexpr uint32_t n_in = get_compile_time_arg_val(0);
+    constexpr uint32_t n_in = get_compile_time_arg_val(0);  // source tiles
     constexpr bool has_gate = get_compile_time_arg_val(1) != 0;  // false: y = r + s
+    constexpr bool has_bias = get_compile_time_arg_val(2) != 0;  // s + bias, the bias row broadcast from cb 3
+    constexpr uint32_t cb_bias = 3;
 
     constexpr uint32_t cb_src = 0;
     constexpr uint32_t cb_res = 1;
@@ -49,6 +52,15 @@ void kernel_main() {
             copy_init(cb_src);
             copy_tile(cb_src, 0, 1);
             src.pop_front(1);
+            add_binary_tile_init();
+            add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+        }
+        if constexpr (has_bias) {  // + the bias row (the rows of the stock bias tile are copies of it)
+            CircularBuffer bb(cb_bias);
+            bb.wait_front(1);
+            unary_bcast_init<ckernel::BroadcastType::ROW>(cb_bias);
+            unary_bcast<ckernel::BroadcastType::ROW>(cb_bias, 0, 1);
+            bb.pop_front(1);
             add_binary_tile_init();
             add_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
         }

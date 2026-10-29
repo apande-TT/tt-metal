@@ -155,21 +155,21 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, n_tiles)
     page = 4096  # one float32 tile
-    n_in = n + (1 if has_bias else 0)
+    n_in = n  # source tiles; the bias row arrives on cb 3
     cbs = [
         ttnn.CBDescriptor(
             total_size=pages * page,
             core_ranges=cores,
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
         )
-        for i, pages in ((0, 2 * n_in), (1, 2), (2, 2), (16, 2))
+        for i, pages in ((0, 2 * n_in), (1, 2), (2, 2), (3, 2), (16, 2))
     ]
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
-    for i in (0, 1, 2):
+    for i in (0, 1, 2, 3):
         modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
     addrs = [
@@ -215,7 +215,7 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
                 kernel_source=os.path.join(_KERNELS, "sum_gated.cpp"),
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores,
-                compile_time_args=[n_in, int(has_gate)],
+                compile_time_args=[n_in, int(has_gate), int(has_bias)],
                 runtime_args=cp_rt,
                 config=cfg,
             ),

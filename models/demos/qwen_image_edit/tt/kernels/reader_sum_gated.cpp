@@ -4,7 +4,8 @@
 
 // Reader of sum_gated.cpp, the exact all_to_all reduce's local sum with the block's gated residual update:
 // for each output tile t of this core (the device's slice [B_local, Rt_local tile rows, Wt]) it streams
-//   cb 0: the n_blocks source tiles i * block_tiles + t in source order, then (has_bias) the bias tile t % Wt
+//   cb 0: the n_blocks source tiles i * block_tiles + t in source order
+//   cb 3: (has_bias) row 0 of the bias tile of t's column (the [32, N] bias rows are copies of it)
 //   cb 1: the residual tile of t in the whole residual [B, Rt tile rows, Wt]: batch bl + b_off, tile row rt + r_off
 //         (this device's slice: its batch items or its tile rows, per device runtime args)
 //   cb 2: (has_gate) row 0 (faces 0 and 1's first rows) of the gate tile of t's batch item and column -- all
@@ -54,7 +55,9 @@ void kernel_main() {
     DataflowBuffer src(cb_src);
     DataflowBuffer rb(cb_res);
     DataflowBuffer gb(cb_gate);
-    constexpr uint32_t n_in = n_blocks + has_bias;
+    constexpr uint32_t n_in = n_blocks;
+    constexpr uint32_t cb_bias = 3;
+    DataflowBuffer bb(cb_bias);
     for (uint32_t t = start_tile; t < start_tile + num_tiles; ++t) {
         const uint32_t c = t % Wt;
         const uint32_t rt = (t / Wt) % Rt_local;
@@ -67,8 +70,11 @@ void kernel_main() {
         for (uint32_t i = 0; i < n_blocks; ++i) {
             noc.async_read(s, src, page, {.page_id = i * block_tiles + t}, {.offset_bytes = i * page});
         }
-        if constexpr (has_bias) {
-            noc.async_read(bias, src, page, {.page_id = c}, {.offset_bytes = n_blocks * page});
+        if constexpr (has_bias) {  // row 0 of the bias tile (its rows are copies): faces 0 and 1's first rows
+            bb.reserve_back(1);
+            for (uint32_t f = 0; f < 2; ++f) {
+                noc.async_read(bias, bb, row_bytes, {.page_id = c, .offset_bytes = f * face_bytes}, {.offset_bytes = f * face_bytes});
+            }
         }
         noc.async_read(res, rb, page, {.page_id = (b * Rt + rt + r_off) * Wt + c}, {.offset_bytes = 0});
         if constexpr (has_gate) {
@@ -79,6 +85,9 @@ void kernel_main() {
         }
         noc.async_read_barrier();
         src.push_back(n_in);
+        if constexpr (has_bias) {
+            bb.push_back(1);
+        }
         rb.push_back(1);
         if constexpr (has_gate) {
             gb.push_back(1);
