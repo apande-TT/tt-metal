@@ -48,6 +48,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _dit_ccl
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _dit_attention
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _dit_stack
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
@@ -278,6 +279,7 @@ class TtQwenImageEditPipeline:
         # (and the 8 weight lanes as one K-stacked product: the input repeated 8x along K by the C++ repeat_k)
         # (and the guard's input row norms squared from the bf16 lead limb straight into float32)
         # (and those row norms' squares summed in the same C++ pass that squares them: row_sumsq)
+        # (and the blocks' LayerNorm variance as the same one-read row sum of squares)
         # (and the QK^T's lead k limb read from L1 by its lane / dense / negated products at 16-entry groups too)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
             _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
@@ -287,6 +289,8 @@ class TtQwenImageEditPipeline:
             _te_attention, "NORM_SQUARE", square_ttl.square if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None
+        ), self._hook(
+            _dit_stack, "SUMSQ", row_sumsq if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "B_LIMB_L1_MIN_BATCH", 16
         ), self._hook(

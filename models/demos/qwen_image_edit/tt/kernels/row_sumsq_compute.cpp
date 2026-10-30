@@ -2,10 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Row sums of squares of a bf16 tile tensor, float32 out: per tile row, each of its Kt tiles is squared on the
-// SFPU (c_0 -> DST -> c_2, rounded to bf16) and row-reduced into a float32 running sum (c_3, reloaded exactly
-// with UnpackToDestFp32); the last tile's sum goes to c_16 (column 0 of the output tile). The square + reduce
-// round trip is the stock reduce_w_neg pattern with the negation replaced by a square.
+// Row sums of squares of a bf16 or float32 tile tensor, float32 out: per tile row, each of its Kt tiles is squared
+// on the SFPU (c_0 -> DST -> c_2, in the input's dtype; a float32 input unpacked to DST exactly) and row-reduced into
+// a float32 running sum (c_3, reloaded exactly with UnpackToDestFp32); the last tile's sum goes to c_16 (column 0
+// of the output tile). The square + reduce round trip is the stock reduce_w_neg pattern with the negation replaced
+// by a square.
 // Compile-time: Kt. Runtime: tile row count.
 
 #include <cstdint>

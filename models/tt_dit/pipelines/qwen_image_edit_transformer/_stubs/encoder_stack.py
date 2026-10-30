@@ -31,6 +31,10 @@ from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _pr
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.attention import TtQwenJointAttention
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.feed_forward import TtQwenFeedForward
 
+# Optional fused kernel for the LayerNorm variance: SUMSQ(xc) -> sum(xc * xc, dim=-1, keepdim=True) in float32 from one
+# read of xc, or None for a tensor it does not take.
+SUMSQ = None
+
 
 def _is_mesh(device):
     return isinstance(device, ttnn.MeshDevice) and device.get_num_devices() > 1
@@ -101,7 +105,11 @@ class _TtBlock:
     def _ln(self, x):  # LayerNorm without affine, float32
         mu = ttnn.mean(x, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
         xc = ttnn.subtract(x, mu)
-        var = ttnn.mean(ttnn.multiply(xc, xc), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+        ss = None if SUMSQ is None else SUMSQ(xc)
+        if ss is not None:  # the variance from one read of xc (the squares never written)
+            var = ttnn.multiply(ss, 1.0 / xc.shape[-1])
+        else:
+            var = ttnn.mean(ttnn.multiply(xc, xc), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
         return ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, self.eps)))
 
     def _modulate(self, x, shift, scale):

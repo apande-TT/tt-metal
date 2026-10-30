@@ -667,11 +667,14 @@ _RS_COMPUTE = f"{_DIR}/row_sumsq_compute.cpp"
 
 
 def row_sumsq(t):
-    """sum(t * t, dim=-1, keepdim=True) in float32 for an interleaved bf16 tile tensor [..., M, K] (K tile-aligned),
-    from one read of t (each square rounded to bf16, summed in float32); None for a tensor it does not take."""
+    """sum(t * t, dim=-1, keepdim=True) in float32 for an interleaved bf16 or float32 tile tensor [..., M, K] (K
+    tile-aligned), from one read of t (each square in t's dtype, row-reduced into a float32 running sum); None for a
+    tensor it does not take."""
     s = list(t.shape)
     ps = list(t.padded_shape)
-    if t.dtype != ttnn.bfloat16 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() or len(s) < 2 or s[-1] % TILE:
+    if t.dtype not in (ttnn.bfloat16, ttnn.float32) or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
+        return None
+    if len(s) < 2 or s[-1] % TILE:
         return None
     kt = ps[-1] // TILE
     rows = 1
@@ -698,9 +701,9 @@ def row_sumsq(t):
         )
 
     cbs = [
-        cb(0, ttnn.bfloat16, 2),
+        cb(0, t.dtype, 2),
         cb(1, ttnn.bfloat16, 1),
-        cb(2, ttnn.bfloat16, 2),
+        cb(2, t.dtype, 2),
         cb(3, ttnn.float32, 2),
         cb(_OUT_CB, ttnn.float32, 2),
     ]
@@ -712,6 +715,8 @@ def row_sumsq(t):
     compute_cfg = ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True)
     unpack = [ttnn.UnpackToDestMode.Default] * 64
     unpack[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the running sum reloads exactly
+    if t.dtype == ttnn.float32:
+        unpack[0] = ttnn.UnpackToDestMode.UnpackToDestFp32  # a float32 input squared from its exact value
     compute_cfg.unpack_to_dest_mode = unpack
     kernels = [
         ttnn.KernelDescriptor(
