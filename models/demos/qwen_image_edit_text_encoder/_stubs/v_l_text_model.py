@@ -25,6 +25,9 @@ from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtToken
 
 # row-stage hand-off gathers only one 1/stage_rows piece per row (False: every row's full copy)
 SPLIT_HANDOFF = False
+# the rows of each pipeline stage split the batch (row r runs sequences of block r mod stage_rows) instead of
+# every row of the stage running the whole batch on the same weights (False: each row runs every sequence)
+ROW_DP = False
 
 
 class TtTextModel:
@@ -107,6 +110,26 @@ class TtTextModel:
         ttnn.deallocate(g)
         return out
 
+    def _row_split(self, t):
+        """Replicated t [B, ...] -> on row r its block r mod stage_rows of B / stage_rows sequences: [t] * stages
+        split over the rows hands row r exactly that block."""
+        stages = 2 if self.row_stages else 1
+        ts = ttnn.concat([t] * stages, dim=0) if stages > 1 else t
+        p = ttnn.mesh_partition(ts, dim=0, cluster_axis=0)
+        if stages > 1:
+            ttnn.deallocate(ts)
+        return p
+
+    def _stage_out(self, x, stage, b):
+        """ROW_DP: row r holds block r mod stage_rows of the batch; -> the whole batch [b, ...] as `stage`'s rows
+        made it, on every chip (all_gather over the row axis moves bits exactly)."""
+        shape = list(x.shape)
+        g = ttnn.all_gather(x, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
+        s0 = stage * b
+        out = ttnn.slice(g, [s0] + [0] * (len(shape) - 1), [s0 + b] + shape[1:])
+        ttnn.deallocate(g)
+        return out
+
     def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None):
         """Device path: x [B, 1, s_pad, C] fp32 -> norm(layers(x)) [B, 1, s_pad, C], replicated. Rotary
         tables ([B|1, 1, s_pad, D]) and the additive causal/padding mask are prepared outside.
@@ -115,6 +138,9 @@ class TtTextModel:
         keeps every layer's roped K/V of positions [0, P); "use" runs x = positions [P, P + s) of
         sequences whose first P tokens match the stored ones, attending to the cached prefix."""
         key = lambda i, j: None if kv is None else (kv["mode"], kv["cache"], (i, j), kv["P"])  # noqa: E731
+        b = int(x.shape[0])
+        if ROW_DP and self.row_stages and self.stage_rows > 1 and b % self.stage_rows == 0:
+            return self._forward_row_dp(x, tt_cos, tt_sin, tt_mask, key)
         for j, lyr in enumerate(self.layers):
             x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(0, j))
         if self.row_stages:
@@ -122,6 +148,24 @@ class TtTextModel:
             for j, lyr in enumerate(self.layers):
                 x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(1, j))
             x = self._take_row(x, self.stage_rows)  # layers [n/2, n) done on the stage-1 rows -> everyone
+        return self.norm(x)
+
+    def _forward_row_dp(self, x, tt_cos, tt_sin, tt_mask, key):
+        """forward_padded with each stage's rows splitting the batch: the per-sequence inputs (x, and the rotary
+        tables / mask where they are per sequence) are split once; after pass 1 the stage-0 rows' blocks are
+        gathered and split again for the stage-1 rows, after pass 2 theirs are gathered on every chip. Each
+        sequence runs the same layers on the same weights, B / stage_rows of them per chip."""
+        b = int(x.shape[0])
+        split = lambda t: self._row_split(t) if t is not None and int(t.shape[0]) == b else t  # noqa: E731
+        x, tt_cos, tt_sin, tt_mask = (split(t) for t in (x, tt_cos, tt_sin, tt_mask))
+        for j, lyr in enumerate(self.layers):
+            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(0, j))
+        full = self._stage_out(x, 0, b)  # layers [0, n/2) done on the stage-0 rows
+        x = self._row_split(full)
+        ttnn.deallocate(full)
+        for j, lyr in enumerate(self.layers):
+            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask, kv=key(1, j))
+        x = self._stage_out(x, 1, b)  # layers [n/2, n) done on the stage-1 rows -> everyone
         return self.norm(x)
 
     def __call__(self, inputs_embeds=None, input_ids=None, attention_mask=None, position_ids=None, **kwargs):
