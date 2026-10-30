@@ -67,10 +67,12 @@ def fused_limb_linear(
 
     groups = cols if wide_groups and k_t < n_t and n_t % cols == 0 else 1
     if long_groups and groups == 1:
-        # most compute cores, then most senders, keeping each group's columns a whole number of full DEST blocks
+        # most compute cores, then groups whose columns are a whole number of full DEST blocks, then most senders
+        # (a group of an odd column count runs one-tile blocks: worth it only when it occupies more cores)
+        full = _DEST_TILES // (2 * mb)
         groups = max(
-            (g for g in range(1, cols + 1) if cols % g == 0 and (g == 1 or n_t % (g * _DEST_TILES // (2 * mb)) == 0)),
-            key=lambda g: (g * _rect_rows(cols // g) * (cols // g), g),
+            (g for g in range(1, cols + 1) if cols % g == 0 and n_t % g == 0),
+            key=lambda g: (g * _rect_rows(cols // g) * (cols // g), (n_t // g) % full == 0, g),
         )
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
     nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
