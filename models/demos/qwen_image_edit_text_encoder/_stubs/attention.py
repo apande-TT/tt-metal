@@ -366,6 +366,10 @@ LANE_CACHE = None
 # lane's exact one (<= 4 nonzeros per 32-group), and the lanes accumulate in the product's float32 output instead of
 # 8 float32 outputs summed afterwards.
 LANE_STACK = None
+# Optional input-side counterpart for the batched a @ b^T products: LANE_KSTACK(lead) -> ([lane 0 | ... | lane 7]
+# along K as one tensor, -lead), or None. With LANE_STACK repeating b's lead 8x along K, the 8 lane products run as
+# ONE product (K' = 8K) whose float32 output accumulates them.
+LANE_KSTACK = None
 _ROW_LANE_MASKS = {}
 
 
@@ -867,10 +871,20 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
             ttnn.deallocate(lane)
         neg0 = None
     else:
-        lanes, neg0 = _lead_lanes(pa0)
-        for lane in lanes:
-            acc.push(mm(lane, pb0_l1))
-            ttnn.deallocate(lane)
+        stacked = None
+        if LANE_KSTACK is not None and LANE_STACK is not None and transpose_b and b_rep == 1:
+            stacked = LANE_KSTACK(pa0)
+        if stacked is not None:
+            xs, neg0 = stacked
+            kr = LANE_STACK(pb0, len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided")))
+            acc.push(mm(xs, kr))
+            ttnn.deallocate(xs)
+            ttnn.deallocate(kr)
+        else:
+            lanes, neg0 = _lead_lanes(pa0)
+            for lane in lanes:
+                acc.push(mm(lane, pb0_l1))
+                ttnn.deallocate(lane)
     ex = acc.value()
     dn = mm(pa0, pb0_l1)
     first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]

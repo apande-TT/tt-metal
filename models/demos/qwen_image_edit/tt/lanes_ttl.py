@@ -206,3 +206,131 @@ def lanes8(lead):
         ys = outs
     ys = [ttnn.view(y, s) for y in ys]
     return ys[:LANES], ys[LANES]
+
+
+_STACK_OP = []
+
+
+def _make_stack_op():
+    @ttl.operation(grid="auto", options="--no-ttl-fpu-binary-ops")
+    def _lanes_stacked(x: ttnn.Tensor, masks: ttnn.Tensor, y: ttnn.Tensor, yn: ttnn.Tensor):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        rows = x.shape[0] // TILE
+        cols = x.shape[1] // TILE
+        rows_per_node = -(-rows // grid_rows)
+        cols_per_node = -(-cols // grid_cols)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(masks, shape=(1, 1), block_count=8)
+        o_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+        on = ttl.make_dataflow_buffer_like(yn, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            node_col, node_row = ttl.node(dims=2)
+            with (
+                m_dfb.wait() as m0,
+                m_dfb.wait() as m1,
+                m_dfb.wait() as m2,
+                m_dfb.wait() as m3,
+                m_dfb.wait() as m4,
+                m_dfb.wait() as m5,
+                m_dfb.wait() as m6,
+                m_dfb.wait() as m7,
+            ):
+                for local_row in range(rows_per_node):
+                    row = node_row * rows_per_node + local_row
+                    if row < rows:
+                        for local_col in range(cols_per_node):
+                            col = node_col * cols_per_node + local_col
+                            if col < cols:
+                                with x_dfb.wait() as a:
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m0)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m1)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m2)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m3)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m4)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m5)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m6)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m7)
+                                    with on.reserve() as o:
+                                        o.store(ttl.math.neg(a))
+
+        @ttl.datamovement()
+        def read():
+            node_col, node_row = ttl.node(dims=2)
+            for r in range(LANES):
+                with m_dfb.reserve() as m:
+                    tx = ttl.copy(masks[r : r + 1, 0:1], m)
+                    tx.wait()
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            with x_dfb.reserve() as a:
+                                tx = ttl.copy(x[row : row + 1, col : col + 1], a)
+                                tx.wait()
+
+        @ttl.datamovement()
+        def write():
+            node_col, node_row = ttl.node(dims=2)
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            for r in range(LANES):
+                                c = r * cols + col
+                                with o_dfb.wait() as o:
+                                    tx = ttl.copy(o, y[row : row + 1, c : c + 1])
+                                    tx.wait()
+                            with on.wait() as o:
+                                tx = ttl.copy(o, yn[row : row + 1, col : col + 1])
+                                tx.wait()
+
+    return _lanes_stacked
+
+
+def lanes8_stacked(lead):
+    """([lane 0 | lane 1 | ... | lane 7] along the last dim as ONE tensor [..., M, 8K], -lead) of a bf16 interleaved tile
+    tensor [..., M, K] (M, K tile-aligned), or None: the lanes of lanes8, side by side for a K-stacked product."""
+    s = list(lead.shape)
+    if len(s) < 2 or s[-2] % TILE or s[-1] % TILE:
+        return None
+    if lead.dtype != ttnn.bfloat16 or lead.layout != ttnn.TILE_LAYOUT or lead.is_sharded():
+        return None
+    dev = lead.device()
+    if id(dev) not in _MASKS:
+        return None
+    if not _STACK_OP:
+        _STACK_OP.append(_make_stack_op())
+    rows = 1
+    for d in s[:-1]:
+        rows *= d
+    x = ttnn.view(lead, (rows, s[-1]))
+    key = ("stacked",) + tuple(s)
+    first = key not in _COMPILED
+    if first:
+        x = ttnn.clone(x)  # ttl pins the compiling call's arguments: give it a copy to pin and free it
+    y = ttnn.empty((rows, LANES * s[-1]), dtype=lead.dtype, layout=ttnn.TILE_LAYOUT, device=dev)
+    yn = ttnn.empty_like(x)
+    _STACK_OP[0](x, _MASKS[id(dev)], y, yn)
+    if first:
+        _COMPILED.add(key)
+        ttnn.deallocate(x)
+        y2, yn2 = ttnn.clone(y), ttnn.clone(yn)
+        ttnn.deallocate(y)
+        ttnn.deallocate(yn)
+        y, yn = y2, yn2
+    return ttnn.view(y, s[:-1] + [LANES * s[-1]]), ttnn.view(yn, s)

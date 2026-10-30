@@ -280,6 +280,7 @@ class TtQwenImageEditPipeline:
         # (and the guard's input row norms squared from the bf16 lead limb straight into float32)
         # (and those row norms' squares summed in the same C++ pass that squares them: row_sumsq)
         # (and the blocks' LayerNorm variance as the same one-read row sum of squares)
+        # (and the QK^T's 8 lane products as one K-stacked product: q's lanes side by side along K by tt-lang)
         # (and the QK^T's lead k limb read from L1 by its lane / dense / negated products at 16-entry groups too)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
             _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
@@ -291,6 +292,8 @@ class TtQwenImageEditPipeline:
             _te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None
         ), self._hook(
             _dit_stack, "SUMSQ", row_sumsq if self.weight_lane_split else None
+        ), self._hook(
+            _te_attention, "LANE_KSTACK", lanes_ttl.lanes8_stacked if self.lane_split else None
         ), self._hook(
             _te_attention, "B_LIMB_L1_MIN_BATCH", 16
         ), self._hook(
