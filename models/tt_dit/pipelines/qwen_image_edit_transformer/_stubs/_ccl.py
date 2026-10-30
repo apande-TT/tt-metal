@@ -164,21 +164,52 @@ A2A_GATED_SUM_FN = None
 # the all_gather (which then gathers the updated residual): the same multiply and add per element on 1/n of the
 # rows instead of on the whole replicated tensor. Requested per call through gated_residual(); False: never
 GATED_RESIDUAL = False
+# a gated update split over the tokens may keep its result as this device's own token slice (a Sliced, no
+# all_gather of the updated residual) when its caller asks (gated_residual(..., keep=True)); False: always gathered
+KEEP_SLICES = False
 _PENDING = []  # [GatedResidual] registered by gated_residual(), consumed in order by matching reduces
 
 
-class GatedResidual:
-    """One pending r + g * reduce(y): `out` holds the updated residual once a reduce has applied it."""
+class Sliced:
+    """This device's 1/n slice (dim `dim` of the [B, S, W] stream, over mesh axis `axis`) of a stream of shape
+    `shape`, as the all_to_all reduce left it: device k holds slice k, so all_gather restores the stream."""
 
-    def __init__(self, gate, residual):
-        self.gate, self.residual, self.out = gate, residual, None
+    def __init__(self, t, dim, axis, shape):
+        self.t, self.dim, self.axis, self.shape = t, dim, axis, list(shape)
+
+    def gather_part(self, t):
+        """all_gather of a tensor laid out like the slice (e.g. a per-slice result) along the slice's dim."""
+        return ttnn.all_gather(
+            t,
+            dim=self.dim,
+            cluster_axis=self.axis,
+            num_links=1,
+            topology=ttnn.Topology.Linear,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def gather(self):
+        return self.gather_part(self.t)
+
+
+def unslice(x):
+    return x.gather() if isinstance(x, Sliced) else x
+
+
+class GatedResidual:
+    """One pending r + g * reduce(y): `out` holds the updated residual once a reduce has applied it (a Sliced when
+    `keep` and the reduce split the tokens)."""
+
+    def __init__(self, gate, residual, keep=False):
+        self.gate, self.residual, self.out, self.keep = gate, residual, None, keep
 
 
 @contextlib.contextmanager
-def gated_residual(*pairs):
+def gated_residual(*pairs, keep=False):
     """Offer (gate, residual) pairs to the reduces run inside the block: a reduce whose output has the
-    residual's shape takes the first such pair and returns r + g * sum (entry.out) instead of the sum."""
-    entries = [GatedResidual(g, r) for g, r in pairs] if GATED_RESIDUAL else []
+    residual's shape takes the first such pair and returns r + g * sum (entry.out) instead of the sum.
+    keep: the updated residual may stay this device's token slice (KEEP_SLICES)."""
+    entries = [GatedResidual(g, r, keep and KEEP_SLICES) for g, r in pairs] if GATED_RESIDUAL else []
     _PENDING.extend(entries)
     try:
         yield entries
@@ -232,9 +263,14 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
     gated_done = False
     kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if A2A_SUM_L1 else {}
     out = None
+    # a residual already sliced over the tokens is this device's slice; a kept result stays one (in DRAM: it
+    # lives until the next block's update)
+    local = gated is not None and isinstance(gated.residual, Sliced)
+    keep = gated is not None and gated.keep and d == 2
+    residual = gated.residual.t if local else gated.residual if gated is not None else None
     if gated is not None and A2A_GATED_SUM_FN is not None:
-        mem = kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG)
-        out = A2A_GATED_SUM_FN(g, n, part, mem, bias, gated.gate, gated.residual, d, ax)
+        mem = ttnn.DRAM_MEMORY_CONFIG if keep else kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG)
+        out = A2A_GATED_SUM_FN(g, n, part, mem, bias, gated.gate, residual, d, ax)
     if out is not None:  # the sum, bias and gated residual update in one pass
         ttnn.deallocate(g)
         gated_done = True
@@ -250,13 +286,19 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
     if not gated_done:
         ttnn.deallocate(g)
     if gated is not None and not gated_done:
-        r4 = ttnn.mesh_partition(ttnn.reshape(gated.residual, lead), dim=d, cluster_axis=ax)
+        if local:
+            r4 = ttnn.reshape(residual, part)
+        else:
+            r4 = ttnn.mesh_partition(ttnn.reshape(residual, lead), dim=d, cluster_axis=ax)
         g4 = ttnn.reshape(gated.gate, [1] * (4 - len(shape)) + list(gated.gate.shape))
         if int(g4.shape[d]) > 1:
             g4 = ttnn.mesh_partition(g4, dim=d, cluster_axis=ax)
         s = out
-        out = ttnn.add(r4, ttnn.multiply(g4, s))
+        out = ttnn.add(r4, ttnn.multiply(g4, s), **({"memory_config": ttnn.DRAM_MEMORY_CONFIG} if keep else {}))
         ttnn.deallocate(s)
+    if keep:
+        gated.out = Sliced(ttnn.reshape(out, shape[:-2] + [int(part[2]), shape[-1]]), len(shape) - 2, ax, shape)
+        return gated.out
     out = ttnn.all_gather(
         out, dim=d, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )

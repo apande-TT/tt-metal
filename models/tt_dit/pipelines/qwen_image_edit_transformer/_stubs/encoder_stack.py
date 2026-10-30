@@ -118,7 +118,32 @@ class _TtBlock:
         var = ttnn.mean(ttnn.multiply(xc, xc), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
         return ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, self.eps)))
 
+    def _modulate_slice(self, x, shift, scale):
+        """x a _ccl.Sliced token slice: LN + modulation of this device's tokens only (LayerNorm is per token, the
+        tables are per batch item), then all_gather of the result's bf16 limbs -> a stand-in of the full stream's
+        shape whose limbs are registered (nothing reads its values); None when it does not fit."""
+        if not (MODULATE_FN is not None and MODULATE_SPLIT and _precise.ENABLED and SKIP_SAME_CAST):
+            return None
+        r = MODULATE_FN(x.t, ttnn.add(scale, 1.0), shift, self.eps, split=True)
+        if r is None:
+            return None
+        y, (hi, lo) = r
+        ttnn.deallocate(y)
+        parts = (x.gather_part(hi), x.gather_part(lo))
+        ttnn.deallocate(hi)
+        ttnn.deallocate(lo)
+        full = ttnn.allocate_tensor_on_device(
+            ttnn.Shape(x.shape), ttnn.float32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
+        )
+        _precise.register_split(full, parts)
+        return full
+
     def _modulate(self, x, shift, scale):
+        if isinstance(x, _ccl.Sliced):
+            y = self._modulate_slice(x, shift, scale)
+            if y is not None:
+                return y
+            x = x.gather()
         if MODULATE_FN is not None:
             if MODULATE_SPLIT and _precise.ENABLED and SKIP_SAME_CAST:
                 # the modulated activation is only ever split into its bf16 limbs (q/k/v, FF up): make them here
@@ -142,19 +167,25 @@ class _TtBlock:
 
         # residual += gate * branch; a TP reduce may apply it on its own slice (_ccl.gated_residual), else here
         def gated(r, g, branch, entry):
-            return entry.out if entry is not None and entry.out is not None else ttnn.add(r, ttnn.multiply(g, branch))
+            if entry is not None and entry.out is not None:
+                return entry.out
+            return ttnn.add(_ccl.unslice(r), ttnn.multiply(g, branch))
 
         # need_txt False (set on the last block by its caller): the text stream's outputs are not used after this
-        # block, so its attention output projection, FF and residual updates are skipped (txt is returned as is)
+        # block, so its attention output projection, FF and residual updates are skipped (txt is returned as is).
+        # The image stream may stay each device's token slice between its updates (_ccl.KEEP_SLICES): only its
+        # modulated activation's limbs are gathered. The text stream splits by batch item, one LN tile row per core
+        # either way, so it stays whole.
         need_txt = getattr(self, "need_txt", True)
-        pairs = ((i_g1, img), (t_g1, txt)) if need_txt else ((i_g1, img),)
-        with _ccl.gated_residual(*pairs) as e:
+        with _ccl.gated_residual((i_g1, img), keep=True) as e_img, _ccl.gated_residual(
+            *(((t_g1, txt),) if need_txt else ())
+        ) as e_txt:
             a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary, need_txt=need_txt)
-        img = gated(img, i_g1, a_img, e[0] if e else None)
+        img = gated(img, i_g1, a_img, e_img[0] if e_img else None)
         if need_txt:
-            txt = gated(txt, t_g1, a_txt, e[1] if e else None)
+            txt = gated(txt, t_g1, a_txt, e_txt[0] if e_txt else None)
 
-        with _ccl.gated_residual((i_g2, img)) as e:
+        with _ccl.gated_residual((i_g2, img), keep=True) as e:
             f = self.img_ff(self._modulate(img, i_sh2, i_sc2))
         img = gated(img, i_g2, f, e[0] if e else None)
         if need_txt:
@@ -183,7 +214,7 @@ class TtQwenBlockStack:
 
     def __call__(self, *args, **kwargs):
         img, txt = self.run_streams(*args, **kwargs)
-        return ttnn.concat([txt, img], dim=1)
+        return ttnn.concat([_ccl.unslice(txt), _ccl.unslice(img)], dim=1)
 
     def run_streams(
         self,
@@ -195,15 +226,19 @@ class TtQwenBlockStack:
         joint_attention_kwargs=None,
         modulate_index=None,
     ):
-        """Apply every block; returns the (img, txt) float32 streams without concatenating them."""
+        """Apply every block; returns the (img, txt) float32 streams without concatenating them (img may be a
+        _ccl.Sliced token slice with _ccl.KEEP_SLICES; _ccl.unslice gathers it)."""
         assert modulate_index is None, "modulate_index path not ported"
         d = self.device
-        img = _as_tt(hidden_states, d)
-        txt = _as_tt(encoder_hidden_states, d)
-        if img.dtype != ttnn.float32:
-            img = ttnn.typecast(img, ttnn.float32)
-        if txt.dtype != ttnn.float32:
-            txt = ttnn.typecast(txt, ttnn.float32)
+
+        def stream(t):
+            if isinstance(t, _ccl.Sliced):
+                return t
+            t = _as_tt(t, d)
+            return t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+
+        img = stream(hidden_states)
+        txt = stream(encoder_hidden_states)
 
         temb_arg = temb
         temb = _as_tt(temb, d)
