@@ -115,6 +115,9 @@ class TtQwenTextEncoder:
         _te_attention.A2A_RESIDUAL_FN = fused_block_sum_gated
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
+        # and the rows of each LM pipeline stage split the batch (B / 4 sequences per row) instead of all four rows
+        # running every sequence on the same weights
+        v_l_text_model.ROW_DP = True
         # the vision attention's exact-lane products: one batch-parallel full-K block per core on the grid
         _te_attention.EXACT_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # and the LM attention's plain limb products (QK^T, P @ V; ttnn's own pick: 42 cores) on it too
