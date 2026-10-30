@@ -190,7 +190,33 @@ void kernel_main() {
 
         // e = exp(x - bcast_col(mx)), padding <- 0, each e tile in its x tile's place
         mx.wait_front(1);
-        for (uint32_t wt = 0; wt < Wt; ++wt) {
+        // no padding: two tiles per DEST acquire (DST 0 / 1 and 2 / 3), each init and broadcast once per pair; the
+        // same ops per tile
+        for (uint32_t wt = 0; num_pad == 0 && Wt % 2 == 0 && wt < Wt; wt += 2) {
+            x.wait_front(2);
+            tile_regs_acquire();
+            unary_bcast_init<ckernel::BroadcastType::COL>(cb_mx);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_mx, 0, 1);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_mx, 0, 3);
+            copy_init(cb_x);
+            copy_tile(cb_x, 0, 0);
+            copy_tile(cb_x, 1, 2);
+            sub_binary_tile_init();
+            sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(0, 1, 0);
+            sub_binary_tile<ckernel::DstRoundingMode::NearestEven>(2, 3, 2);
+            exp_tile_init<false>();
+            exp_tile<false>(0);
+            exp_tile<false>(2);
+            tile_regs_commit();
+            x.pop_front(2);
+            x.reserve_back(2);
+            tile_regs_wait();
+            pack_tile(0, cb_x);
+            pack_tile(2, cb_x);
+            tile_regs_release();
+            x.push_back(2);
+        }
+        for (uint32_t wt = 0; !(num_pad == 0 && Wt % 2 == 0) && wt < Wt; ++wt) {
             x.wait_front(1);
             tile_regs_acquire();
             unary_bcast_init<ckernel::BroadcastType::COL>(cb_mx);
@@ -222,7 +248,27 @@ void kernel_main() {
 
         // p = e / bcast_col(den)
         den.wait_front(1);
-        for (uint32_t wt = 0; wt < Wt; ++wt) {
+        for (uint32_t wt = 0; !split && Wt % 2 == 0 && wt < Wt; wt += 2) {  // pairs, as the exp pass
+            out.reserve_back(2);
+            tile_regs_acquire();
+            unary_bcast_init<ckernel::BroadcastType::COL>(cb_den);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_den, 0, 1);
+            unary_bcast<ckernel::BroadcastType::COL>(cb_den, 0, 3);
+            copy_init(cb_x);
+            copy_tile(cb_x, 0, 0);
+            copy_tile(cb_x, 1, 2);
+            div_binary_tile_init();
+            div_binary_tile(0, 1, 0);
+            div_binary_tile(2, 3, 2);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, cb_out);
+            pack_tile(2, cb_out);
+            tile_regs_release();
+            out.push_back(2);
+            x.pop_front(2);
+        }
+        for (uint32_t wt = 0; !(!split && Wt % 2 == 0) && wt < Wt; ++wt) {
             out.reserve_back(1);
             tile_regs_acquire();
             if constexpr (split) {

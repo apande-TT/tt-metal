@@ -59,7 +59,7 @@ def fused_softmax_rows(s, mask_add, mem, split_mem=None):
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, N * H * Ht)
     page = 4096  # one float32 tile
     pages = [(0, 2 * batch), (2, Wt), (3, 1), (4, 1)]  # s stream, x / e row, max, sum
-    pages += [(17, 2), (24, 2), (25, 2)] if split else [(16, 2)]  # split: lo, scratch hi, scratch p; else out
+    pages += [(17, 2), (24, 2), (25, 2)] if split else [(16, 4)]  # split: lo, scratch hi, scratch p; else out (two pairs)
     if has_mask:
         pages.append((1, Wt))  # the current batch's mask row
     w_mod, h_mod = Sk % 32, Sq % 32
