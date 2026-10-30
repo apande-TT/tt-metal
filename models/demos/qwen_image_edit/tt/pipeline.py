@@ -25,7 +25,7 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
-from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl
+from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
     guard_tail,
@@ -281,6 +281,8 @@ class TtQwenImageEditPipeline:
             _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
         ), self._hook(_dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024), self._hook(
             _te_attention, "NORM_BF16_SQUARE", True
+        ), self._hook(
+            _te_attention, "NORM_SQUARE", square_ttl.square if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "B_LIMB_L1_MIN_BATCH", 16
         ), self._hook(

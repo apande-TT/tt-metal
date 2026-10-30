@@ -233,10 +233,17 @@ _COL_NORMS = {}
 
 # Square a bf16 input straight into float32 in _norm_last (no float32 copy of it first). Off by default.
 NORM_BF16_SQUARE = False
+# Optional kernel for that square kept in bf16: NORM_SQUARE(t) -> t * t (bf16), or None for a t it does not take.
+NORM_SQUARE = None
 
 
 def _norm_last(t, keepdim=True):
     """L2 norm over the last dim, float32."""
+    sq = None if NORM_SQUARE is None or t.dtype != ttnn.bfloat16 else NORM_SQUARE(t)
+    if sq is not None:  # bf16 squares, summed in float32
+        y = ttnn.sum(sq, dim=-1, keepdim=keepdim, compute_kernel_config=precise_config())
+        ttnn.deallocate(sq)
+        return ttnn.sqrt(ttnn.typecast(y, ttnn.float32) if y.dtype != ttnn.float32 else y)
     if NORM_BF16_SQUARE and t.dtype == ttnn.bfloat16:
         return ttnn.sqrt(ttnn.sum(ttnn.multiply(t, t, dtype=ttnn.float32), dim=-1, keepdim=keepdim))
     t32 = t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
