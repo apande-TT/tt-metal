@@ -16,6 +16,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import (
+    _ccl,
     ada_layer_norm_continuous,
     decoder_head,
     patch_embed,
@@ -131,5 +132,6 @@ class TtQwenImageTransformer:
             txt, img = blk(
                 img, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary, joint_attention_kwargs=jak
             )
+        img = _ccl.unslice(img)  # the blocks may hand the image stream on as each device's token slice
         img = self.norm_out(img, temb)
         return self.proj_out(img)

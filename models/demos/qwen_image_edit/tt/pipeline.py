@@ -254,6 +254,9 @@ class QwenImageEditTT:
         _tr_ccl.GATED_RESIDUAL = True
         _tr_ccl.A2A_GATED_SUM_FN = fused_block_sum_gated  # with the local sum, bias and update as one C++ program
         _tr_ccl.A2A_RECV_L1_BYTES = 32 * 1024 * 1024  # the text stream's received partials (25 MB) in L1
+        # the image stream stays each device's token slice between the blocks' updates: its LN + modulation runs on
+        # the slice and only the modulated activation's bf16 limbs are gathered, not the float32 residual
+        _tr_ccl.KEEP_SLICES = True
         # the precise paths' float32 -> (hi, lo) bf16 splits as one C++ kernel pass (transformer + text encoder)
         _tr_precise.SPLIT_FN = fused_split_bf16
         _te_attention.SPLIT_FN = fused_split_bf16
