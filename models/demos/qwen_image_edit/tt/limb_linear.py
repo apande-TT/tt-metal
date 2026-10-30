@@ -30,12 +30,17 @@ def _largest_divisor(n, cap):
     return max(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity=ttnn.MathFidelity.HiFi4):
+def fused_limb_linear(
+    hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity=ttnn.MathFidelity.HiFi4, long_groups=False
+):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
     wide output (K < N) also runs as one group of whole output rows per core, like a long-K one. bias_rows: float32
     [32, N] (the bias row replicated over a tile's rows), added to the product in the same pass:
-    (hi @ w + lo @ w) + b, the separate float32 bias add's order. fidelity: both limbs' products' math fidelity."""
+    (hi @ w + lo @ w) + b, the separate float32 bias add's order. fidelity: both limbs' products' math fidelity.
+    long_groups: a long-K one (or wide_groups=False) whose rows fill only part of the grid splits its columns over
+    the column groups that occupy the most cores (one sender each, streaming its slice in parallel); same
+    products and sums per output tile."""
     if w.dtype != ttnn.bfloat16 or hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16:
         return None
     hs, ws = [int(d) for d in hi.padded_shape], [int(d) for d in w.padded_shape]
@@ -55,13 +60,22 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity
     # column groups: a wide output (K < N) splits its columns over the grid columns, each grid column taking its
     # own slice of the weight from its own sender, so a core's work (and the weight it is sent) shrinks with N;
     # a long-K one (K >= N) is one group, every core taking whole output rows
+    def _rect_rows(gw):
+        # compute rectangle: whole grid rows (leaving one row for the senders), each group's units dealt
+        # round-robin over its gw x rect_rows cores
+        return max((r for r in range(1, grid.y) if (rows // mb) % (r * gw) == 0), default=0)
+
     groups = cols if wide_groups and k_t < n_t and n_t % cols == 0 else 1
+    if long_groups and groups == 1:
+        # most compute cores, then most senders, keeping each group's columns a whole number of full DEST blocks
+        groups = max(
+            (g for g in range(1, cols + 1) if cols % g == 0 and (g == 1 or n_t % (g * _DEST_TILES // (2 * mb)) == 0)),
+            key=lambda g: (g * _rect_rows(cols // g) * (cols // g), g),
+        )
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
     nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
     kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (2 slots in cb 1)
-    # compute rectangle: whole grid rows (leaving one row for the senders), each group's units dealt round-robin
-    # over its gw x rect_rows cores
-    rect_rows = max((r for r in range(1, grid.y) if (rows // mb) % (r * gw) == 0), default=0)
+    rect_rows = _rect_rows(gw)
     if rect_rows == 0:
         return None
     n_cores = rect_rows * gw  # per group
@@ -73,8 +87,8 @@ def fused_limb_linear(hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity
     rect = ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rect_rows - 1))
     senders = [ttnn.CoreCoord(g * gw, rect_rows) for g in range(groups)]
     compute_cores = ttnn.CoreRangeSet([rect])
-    sender_cores = ttnn.CoreRangeSet([ttnn.CoreRange(senders[0], senders[-1])])
-    all_cores = ttnn.CoreRangeSet([rect, ttnn.CoreRange(senders[0], senders[-1])])
+    sender_cores = ttnn.CoreRangeSet([ttnn.CoreRange(s, s) for s in senders])
+    all_cores = ttnn.CoreRangeSet([rect] + [ttnn.CoreRange(s, s) for s in senders])
 
     def _cb(index, dtype, page, n):
         return ttnn.CBDescriptor(
