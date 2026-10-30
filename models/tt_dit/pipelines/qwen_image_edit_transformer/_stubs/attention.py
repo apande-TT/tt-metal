@@ -181,6 +181,16 @@ class TtQwenJointAttention:
         return ttnn.permute(x, (0, 2, 1, 3))
 
     def _rms(self, x, w):  # float32, elementwise on SFPU
+        if QK_NORM_L1:  # the same ops, x * x and x * r staged in L1 (freed as soon as they are read)
+            l1 = ttnn.L1_MEMORY_CONFIG
+            xx = ttnn.multiply(x, x, memory_config=l1)
+            ms = ttnn.mean(xx, dim=-1, keepdim=True, compute_kernel_config=self.hifi, memory_config=l1)
+            ttnn.deallocate(xx)
+            r = ttnn.rsqrt(ttnn.add(ms, self.eps, memory_config=l1), memory_config=l1)
+            xr = ttnn.multiply(x, r, memory_config=l1)
+            out = ttnn.multiply(xr, w, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(xr)
+            return out
         ms = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
         r = ttnn.rsqrt(ttnn.add(ms, self.eps))
         return ttnn.multiply(ttnn.multiply(x, r), w)
@@ -191,9 +201,17 @@ class TtQwenJointAttention:
         if ROPE_SWAP:  # x * [cos | cos] + [x2 | x1] * [-sin | sin]: the same fp32 products and sums
             cc, ss = _rope_tables(freqs, self.half)
             B, H, S = x.shape[0], x.shape[1], x.shape[2]
-            x1 = ttnn.slice(x, (0, 0, 0, 0), (B, H, S, self.half))
-            x2 = ttnn.slice(x, (0, 0, 0, self.half), (B, H, S, 2 * self.half))
-            sw = ttnn.concat([x2, x1], dim=-1)
+            kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if QK_NORM_L1 else {}
+            x1 = ttnn.slice(x, (0, 0, 0, 0), (B, H, S, self.half), **kw)
+            x2 = ttnn.slice(x, (0, 0, 0, self.half), (B, H, S, 2 * self.half), **kw)
+            sw = ttnn.concat([x2, x1], dim=-1, **kw)
+            if QK_NORM_L1:  # the halves and their swap in L1, freed once read
+                ttnn.deallocate(x1)
+                ttnn.deallocate(x2)
+                xc = ttnn.multiply(x, cc)
+                sws = ttnn.multiply(sw, ss)
+                ttnn.deallocate(sw)
+                return ttnn.add(xc, sws)
             return ttnn.add(ttnn.multiply(x, cc), ttnn.multiply(sw, ss))
         S = freqs.shape[0]
         f = ttnn.reshape(freqs, (1, 1, S, 2 * self.half))
@@ -482,6 +500,8 @@ def _rope_tables(freqs, half):
 
 # the attention softmax's float32 logits in L1 (subtract / exp in place), only the probabilities written to DRAM
 SOFTMAX_L1 = False
+# the q / k RMSNorm's x * x and x * r and the RoPE's halves and their swap in L1 (False: DRAM)
+QK_NORM_L1 = False
 # the attention softmax (mask add .. divide) as one bit-identical kernel: f(s, mask_add or None, mem) -> p
 SOFTMAX_FN = None
 # SOFTMAX_FN(..., split_mem=) -> (p, (hi, lo)): the probabilities' bf16 limbs for the precise P @ V made in the
