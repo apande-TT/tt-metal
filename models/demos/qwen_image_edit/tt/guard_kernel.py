@@ -660,3 +660,84 @@ def repeat_k(x, reps):
     ]
     ttnn.generic_op([x, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
     return y
+
+
+_RS_READER = f"{_DIR}/row_sumsq_reader.cpp"
+_RS_COMPUTE = f"{_DIR}/row_sumsq_compute.cpp"
+
+
+def row_sumsq(t):
+    """sum(t * t, dim=-1, keepdim=True) in float32 for an interleaved bf16 tile tensor [..., M, K] (K tile-aligned),
+    from one read of t (each square rounded to bf16, summed in float32); None for a tensor it does not take."""
+    s = list(t.shape)
+    ps = list(t.padded_shape)
+    if t.dtype != ttnn.bfloat16 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() or len(s) < 2 or s[-1] % TILE:
+        return None
+    kt = ps[-1] // TILE
+    rows = 1
+    for d in ps[:-2]:
+        rows *= d
+    rows *= ps[-2] // TILE
+    y = ttnn.empty(
+        s[:-1] + [1],
+        dtype=ttnn.float32,
+        layout=ttnn.TILE_LAYOUT,
+        device=t.device(),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    grid = t.device().compute_with_storage_grid_size()
+    work = _cores(grid, rows)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb(index, dtype, pages):
+        page = _FP32_TILE_BYTES if dtype == ttnn.float32 else _FP32_TILE_BYTES // 2
+        return ttnn.CBDescriptor(
+            total_size=pages * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=page)],
+        )
+
+    cbs = [
+        cb(0, ttnn.bfloat16, 2),
+        cb(1, ttnn.bfloat16, 1),
+        cb(2, ttnn.bfloat16, 2),
+        cb(3, ttnn.float32, 2),
+        cb(_OUT_CB, ttnn.float32, 2),
+    ]
+    rd, cp, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        rd[c.x][c.y] = [t.buffer_address(), start, count]
+        cp[c.x][c.y] = [count]
+        wr[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True)
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    unpack[3] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the running sum reloads exactly
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_RS_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(t).get_compile_time_args() + [kt],
+            runtime_args=rd,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_RS_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[kt],
+            runtime_args=cp,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=wr,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([t, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return y
