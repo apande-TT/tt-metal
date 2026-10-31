@@ -236,6 +236,7 @@ class QwenImageEditTT:
         # and q / k / v each written head-major straight from the two streams' projections by one C++ copy program
         # (joint_heads.fused_joint_heads), with no [txt; img] join
         _tr_attention.JOINT_HEADS_FN = fused_joint_heads
+        _tr_attention.JOINT_HEADS_DIRECT = True  # and the q/k/v limb linears write those heads themselves (no copy)
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
         _tr_attention.QK_NORM_L1 = True  # the q / k norm and RoPE intermediates in L1
         _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
@@ -280,7 +281,14 @@ class QwenImageEditTT:
         )
         # and a column-parallel one's float32 bias added in that same pass (no separate bias add over the output)
         _tr_precise.LIMB_LINEAR_BIAS_FN = lambda hi, lo, w, bias_rows: fused_limb_linear(
-            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False, bias_rows=bias_rows, chunk_tiles=128
+            hi,
+            lo,
+            w,
+            ttnn.DRAM_MEMORY_CONFIG,
+            wide_groups=False,
+            bias_rows=bias_rows,
+            chunk_tiles=128,
+            heads_out=_tr_precise.HEADS_OUT,
         )
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them

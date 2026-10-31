@@ -40,6 +40,7 @@ def fused_limb_linear(
     fidelity=ttnn.MathFidelity.HiFi4,
     long_groups=False,
     chunk_tiles=32,
+    heads_out=None,
 ):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
@@ -50,7 +51,9 @@ def fused_limb_linear(
     the column groups that occupy the most cores (one sender each, streaming its slice in parallel); same
     products and sums per output tile. lo None: hi holds both limbs, stacked bf16 [2, ..., M, K] (hi, then lo) or
     paired (typed float32 [..., M, K], each 4 KB page bf16 tile t of hi then of lo, as ln_rows packed writes them).
-    chunk_tiles: weight tiles per multicast chunk (each chunk is one sender / receivers handshake)."""
+    chunk_tiles: weight tiles per multicast chunk (each chunk is one sender / receivers handshake).
+    heads_out: (q, k, v, row_off) -- head-major float32 [B, H, J, D] tensors and this projection's first joint row: the
+    output's [q | k | v] column blocks (N = 3 H D) are written there (rows from row_off) and q is returned."""
     packed = lo is None
     paired = packed and hi.dtype == ttnn.float32
     if packed:
@@ -102,7 +105,19 @@ def fused_limb_linear(
     units = rows // mb // n_cores
 
     out_shape = list(hi.shape)[1 if packed and not paired else 0 : -1] + [int(w.shape[-1])]
-    out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
+    heads_rt = [0] * 8
+    if heads_out is not None:
+        q, k, v, row_off = heads_out
+        Bq, H, J, D = (int(d) for d in q.padded_shape)
+        if len(out_shape) != 3 or int(out_shape[0]) != Bq or 3 * H * D != ws[-1] or D % 32 or J % 32 or row_off % 32:
+            return None
+        if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in (q, k, v)):
+            return None
+        heads_rt = [q.buffer_address(), k.buffer_address(), v.buffer_address(), int(out_shape[1]) // 32, J // 32]
+        heads_rt += [row_off // 32, H, D // 32]
+        out = q
+    else:
+        out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
     lo_off = rows * k_t if packed and not paired else 0  # lo's first page in the stacked tensor
     lo_byte = 2048 if paired else 0  # lo's byte offset in a paired page
     rect = ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rect_rows - 1))
@@ -142,7 +157,12 @@ def fused_limb_linear(
                     lo_off,
                     lo_byte,
                 ]
-                wr_rt[x][y] = [out.buffer_address(), first, g * n_g, 0 if bias_rows is None else bias_rows.buffer_address()]
+                wr_rt[x][y] = [
+                    out.buffer_address(),
+                    first,
+                    g * n_g,
+                    0 if bias_rows is None else bias_rows.buffer_address(),
+                ] + heads_rt
         start = device.worker_core_from_logical_core(ttnn.CoreCoord(x0, 0))
         end = device.worker_core_from_logical_core(ttnn.CoreCoord(x0 + gw - 1, rect_rows - 1))
         sd_rt[sender.x][sender.y] = [w.buffer_address(), start.x, start.y, end.x, end.y, g * n_g]
@@ -175,7 +195,13 @@ def fused_limb_linear(
             compile_time_args=[n_t, n_g, mb, nb, units, n_cores]
             + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
             + [int(bias_rows is not None)]
-            + list(ttnn.TensorAccessorArgs(out if bias_rows is None else bias_rows).get_compile_time_args()),
+            + list(ttnn.TensorAccessorArgs(out if bias_rows is None else bias_rows).get_compile_time_args())
+            + [int(heads_out is not None)]
+            + [
+                a
+                for t in (heads_out[:3] if heads_out is not None else (out,) * 3)
+                for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()
+            ],
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -198,5 +224,7 @@ def fused_limb_linear(
         ),
     ]
     prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-    io = [hi] + ([] if packed else [lo]) + [w] + ([] if bias_rows is None else [bias_rows]) + [out]
-    return ttnn.generic_op(io, prog)
+    outs = list(heads_out[:3]) if heads_out is not None else [out]
+    io = [hi] + ([] if packed else [lo]) + [w] + ([] if bias_rows is None else [bias_rows]) + outs
+    y = ttnn.generic_op(io, prog)
+    return out if heads_out is not None else y
