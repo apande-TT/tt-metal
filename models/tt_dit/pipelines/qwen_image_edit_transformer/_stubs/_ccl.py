@@ -177,11 +177,12 @@ class Sliced:
     def __init__(self, t, dim, axis, shape):
         self.t, self.dim, self.axis, self.shape = t, dim, axis, list(shape)
 
-    def gather_part(self, t):
-        """all_gather of a tensor laid out like the slice (e.g. a per-slice result) along the slice's dim."""
+    def gather_part(self, t, lead=0):
+        """all_gather of a tensor laid out like the slice (e.g. a per-slice result) along the slice's dim; lead: the
+        tensor's extra leading dims (e.g. stacked limbs [2, ...])."""
         return ttnn.all_gather(
             t,
-            dim=self.dim,
+            dim=self.dim + lead,
             cluster_axis=self.axis,
             num_links=1,
             topology=ttnn.Topology.Linear,

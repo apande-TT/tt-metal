@@ -78,6 +78,22 @@ SPLIT_FN = None
 _PRESPLIT = {}
 
 
+class PackedLimbs:
+    """x's limbs stacked in one bf16 tensor t [2, ...] (hi, then lo), e.g. gathered in one collective. Fused limb
+    linears read both limbs from t (LIMB_LINEAR_FN / LIMB_LINEAR_BIAS_FN with lo None); unpack() slices them apart
+    for anything else."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def unpack(self):
+        shape = [int(d) for d in self.t.shape]
+        start = [0] * len(shape)
+        hi = ttnn.slice(self.t, start, [1] + shape[1:])
+        lo = ttnn.slice(self.t, [1] + start[1:], shape)
+        return ttnn.reshape(hi, shape[1:]), ttnn.reshape(lo, shape[1:])
+
+
 def register_split(x, parts):
     """x's (hi, lo) limbs, made by its producer as SPLIT_FN would: the next split_bf16(x) returns them."""
     _PRESPLIT[id(x)] = (x, parts)
@@ -99,7 +115,13 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     """float32 x @ bf16 w -> float32, x as bf16 hi + lo; bias (float32) added separately. parts: x's
     (hi, lo) from split_bf16 when several projections share x (split once, not once per projection)."""
     cfg = precise_config()
-    hi, lo = split_bf16(x) if parts is None else parts
+    limbs = split_bf16(x) if parts is None else parts
+    if isinstance(limbs, PackedLimbs):  # both limbs in one tensor: the fused limb linear reads them there
+        y = _packed_linear(limbs.t, w, bias)
+        if y is not None:
+            return y
+        limbs = limbs.unpack()
+    hi, lo = limbs
     if (
         LIMB_LINEAR_BIAS_FN is not None
         and LO_FIDELITY is None
@@ -134,6 +156,25 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
     if bias is not None:
         y = ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
     return y
+
+
+def _packed_linear(t, w, bias):
+    """linear() of stacked limbs t through the fused limb linear (lo None), or None when it does not take them."""
+    if LO_FIDELITY is not None:
+        return None
+    if (
+        LIMB_LINEAR_BIAS_FN is not None
+        and bias is not None
+        and bias.dtype == ttnn.float32
+        and math.prod(int(d) for d in list(bias.shape)[:-1]) == 1
+    ):
+        return LIMB_LINEAR_BIAS_FN(t, None, w, _bias_rows(bias))
+    if LIMB_LINEAR_FN is None:
+        return None
+    y = LIMB_LINEAR_FN(t, None, w)
+    if y is None or bias is None:
+        return y
+    return ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
 
 
 def _bias_rows(bias):

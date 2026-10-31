@@ -72,6 +72,9 @@ MODULATE_FN = None
 # MODULATE_FN(..., split=True) -> (y, (hi, lo)): the modulated activation's bf16 limbs made in the same pass and
 # registered with _precise.register_split (y itself is then not written: its consumers only split it)
 MODULATE_SPLIT = False
+# a sliced stream's MODULATE_FN(..., split=True, packed=True) writes its limbs stacked in one tensor, gathered by one
+# all_gather and read from there by the fused limb linears (_precise.PackedLimbs); False: two limb tensors, two gathers
+GATHER_PACKED = False
 
 
 class _TtBlock:
@@ -128,14 +131,19 @@ class _TtBlock:
         if x.dim == 0 and int(shift.shape[0]) > 1:  # a slice of the batch items: their own modulation rows
             scale1 = ttnn.mesh_partition(scale1, dim=0, cluster_axis=x.axis)
             shift = ttnn.mesh_partition(shift, dim=0, cluster_axis=x.axis)
-        r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True)
+        r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True, **({"packed": True} if GATHER_PACKED else {}))
         if r is None:
             return None
-        y, (hi, lo) = r
+        y, limbs = r
         ttnn.deallocate(y)
-        parts = (x.gather_part(hi), x.gather_part(lo))
-        ttnn.deallocate(hi)
-        ttnn.deallocate(lo)
+        if GATHER_PACKED:
+            parts = _precise.PackedLimbs(x.gather_part(limbs, lead=1))
+            ttnn.deallocate(limbs)
+        else:
+            hi, lo = limbs
+            parts = (x.gather_part(hi), x.gather_part(lo))
+            ttnn.deallocate(hi)
+            ttnn.deallocate(lo)
         full = ttnn.allocate_tensor_on_device(
             ttnn.Shape(x.shape), ttnn.float32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG
         )
