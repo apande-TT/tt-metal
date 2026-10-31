@@ -68,6 +68,11 @@ LIMB_LINEAR_BIAS_FN = None
 EXACT_QK_LIMBS_L1 = False
 
 
+# set by a caller for its next linear only: (q, k, v, row_off) head-major tensors a fused limb linear (LIMB_LINEAR_FN /
+# LIMB_LINEAR_BIAS_FN that honours it) writes its [q | k | v] output into, returning q; None: an ordinary output
+HEADS_OUT = None
+
+
 # optional replacement for the hi/lo split of a float32 tensor: a callable x32 -> (hi, lo), e.g. a fused
 # kernel; None: typecast / typecast / subtract / typecast
 SPLIT_FN = None

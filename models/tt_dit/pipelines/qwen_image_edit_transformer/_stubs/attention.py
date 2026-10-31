@@ -260,6 +260,38 @@ class TtQwenJointAttention:
         mm = lambda a, b: ttnn.matmul(a, b, transpose_b=True, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         return ttnn.add(ttnn.add(mm(qh, kh), mm(qh, kl)), mm(ql, kh))
 
+    def _qkv_heads(self, hs, ehs, hp, ep):
+        """JOINT_HEADS_DIRECT: the two streams' fused q/k/v projections write head-major q / k / v [B, H, L + S, D]
+        themselves (the text rows first, _precise.HEADS_OUT), with no [txt; img] join or head split copy. None when the
+        linears do not take it (the caller then projects and splits as before)."""
+        if not _precise.ENABLED:
+            return None
+        B, L, S = int(hs.shape[0]), int(ehs.shape[1]), int(hs.shape[1])
+        if L % 32 or S % 32 or int(ehs.shape[0]) != B:
+            return None
+        shape = ttnn.Shape([B, self.local_heads, L + S, self.head_dim])
+        q, k, v = (
+            ttnn.allocate_tensor_on_device(shape, ttnn.float32, ttnn.TILE_LAYOUT, self.device, ttnn.DRAM_MEMORY_CONFIG)
+            for _ in range(3)
+        )
+        done = []
+        for x, wb, parts, row_off in ((ehs, self.txt_qkv, ep, 0), (hs, self.img_qkv, hp, L)):
+            _precise.HEADS_OUT = (q, k, v, row_off)
+            try:
+                y = self._proj(x, wb, parts=parts)
+            finally:
+                _precise.HEADS_OUT = None
+            done.append(y is q)
+            if y is not q:
+                ttnn.deallocate(y)
+        if not all(done):
+            if any(done):  # one stream already wrote its heads and the other did not: no way back to its output
+                raise RuntimeError("JOINT_HEADS_DIRECT: only one of the two q/k/v projections took the head output")
+            for t in (q, k, v):
+                ttnn.deallocate(t)
+            return None
+        return q, k, v
+
     def _attend(self, q, kh, kl, v, mask_add, shared=None):
         """shared (precise + SHARE_SPLIT): (K's folded operand or None, V's (hi, lo)), built once for
         the image and text queries that attend to the same joint K / V."""
@@ -354,17 +386,22 @@ class TtQwenJointAttention:
         joint = None
         if self.fused_qkv and JOINT_HEADS and JOINT_QUERIES:  # one [txt; img] row block, heads / norm / rope once
             n = self.local_heads * self.head_dim
-            yi = self._proj(hs, self.img_qkv, parts=hp)
-            yt = self._proj(ehs, self.txt_qkv, parts=ep)
-            L, S_img = yt.shape[1], yi.shape[1]
             hd, H = self.head_dim, self.local_heads
-            qkv = None
-            if JOINT_HEADS_FN is not None:  # each of q / k / v straight from the two projections, no join
+            qkv = self._qkv_heads(hs, ehs, hp, ep) if JOINT_HEADS_DIRECT else None
+            if qkv is not None:
+                yi = yt = None
+                L, S_img = int(ehs.shape[1]), int(hs.shape[1])
+            else:
+                yi = self._proj(hs, self.img_qkv, parts=hp)
+                yt = self._proj(ehs, self.txt_qkv, parts=ep)
+                L, S_img = yt.shape[1], yi.shape[1]
+            if qkv is None and JOINT_HEADS_FN is not None:  # each of q / k / v straight from the two projections
                 qkv = [JOINT_HEADS_FN(yt, yi, o, H, hd, ttnn.DRAM_MEMORY_CONFIG) for o in (0, n, 2 * n)]
                 qkv = None if any(t is None for t in qkv) else qkv
             y = None if qkv is not None else ttnn.concat([yt, yi], dim=1)
-            ttnn.deallocate(yi)
-            ttnn.deallocate(yt)
+            for t in (yi, yt):
+                if t is not None:
+                    ttnn.deallocate(t)
             wq, wk = self._joint_norm_w(L, S_img)
             fj = _joint_freqs(txt_f, img_f)
             if qkv is not None:
@@ -476,6 +513,9 @@ NLP_SPLIT = False
 # JOINT_HEADS's q / k / v as fn(txt, img, col_off, heads, head_dim, mem) -> [B, heads, L + S, head_dim] (or None:
 # the join + split above), each read straight from the two streams' projections
 JOINT_HEADS_FN = None
+# the fused q/k/v projections write the joint head-major q / k / v directly (_precise.HEADS_OUT; False: projection
+# outputs, then JOINT_HEADS_FN or a join + head split)
+JOINT_HEADS_DIRECT = False
 NLP_MERGE = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
