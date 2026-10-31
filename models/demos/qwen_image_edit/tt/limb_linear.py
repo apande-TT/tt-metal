@@ -31,7 +31,15 @@ def _largest_divisor(n, cap):
 
 
 def fused_limb_linear(
-    hi, lo, w, mem, wide_groups=True, bias_rows=None, fidelity=ttnn.MathFidelity.HiFi4, long_groups=False
+    hi,
+    lo,
+    w,
+    mem,
+    wide_groups=True,
+    bias_rows=None,
+    fidelity=ttnn.MathFidelity.HiFi4,
+    long_groups=False,
+    chunk_tiles=32,
 ):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
@@ -41,7 +49,8 @@ def fused_limb_linear(
     long_groups: a long-K one (or wide_groups=False) whose rows fill only part of the grid splits its columns over
     the column groups that occupy the most cores (one sender each, streaming its slice in parallel); same
     products and sums per output tile. lo None: hi holds both limbs, stacked bf16 [2, ..., M, K] (hi, then lo) or
-    paired (typed float32 [..., M, K], each 4 KB page bf16 tile t of hi then of lo, as ln_rows packed writes them)."""
+    paired (typed float32 [..., M, K], each 4 KB page bf16 tile t of hi then of lo, as ln_rows packed writes them).
+    chunk_tiles: weight tiles per multicast chunk (each chunk is one sender / receivers handshake)."""
     packed = lo is None
     paired = packed and hi.dtype == ttnn.float32
     if packed:
@@ -85,7 +94,7 @@ def fused_limb_linear(
         )
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
     nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
-    kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (3 slots in cb 1)
+    kc = _largest_divisor(k_t, max(1, chunk_tiles // nb))  # chunk_tiles x 2 KB weight chunks (3 slots in cb 1)
     rect_rows = _rect_rows(gw)
     if rect_rows == 0:
         return None
