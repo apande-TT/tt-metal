@@ -31,10 +31,13 @@ void kernel_main() {
     for (uint32_t p = 0; p < count; p += chunk) {
         const uint32_t n = count - p < chunk ? count - p : chunk;
         cb.wait_front(chunk);
-        for (uint32_t j = 0; j < n; ++j) {
-            const uint32_t src_page = start + p + j;
-            const uint32_t base = (src_page / kt) * reps * kt + src_page % kt;
-            for (uint32_t r = 0; r < reps; ++r) {
+        // copy-major: the chunk's consecutive pages for one copy, then the next copy -- consecutive pages spread over
+        // the DRAM banks, where one tile's 8 copies (page stride Kt, a multiple of the bank count at Kt = 96) would
+        // all land in the same bank back to back
+        for (uint32_t r = 0; r < reps; ++r) {
+            for (uint32_t j = 0; j < n; ++j) {
+                const uint32_t src_page = start + p + j;
+                const uint32_t base = (src_page / kt) * reps * kt + src_page % kt;
                 noc.async_write(cb, dst, bytes, {.offset_bytes = j * bytes}, {.page_id = base + r * kt});
             }
         }
