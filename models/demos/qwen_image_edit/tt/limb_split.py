@@ -63,7 +63,7 @@ def _split(x, compute_kernel, gelu, out_mem=None):
             for cx in range(r.start.x, r.end.x + 1):
                 for cy in range(r.start.y, r.end.y + 1):
                     rd_rt[cx][cy] = [x.buffer_address(), per, start]
-                    wr_rt[cx][cy] = [hi.buffer_address(), lo.buffer_address(), per, start]
+                    wr_rt[cx][cy] = [hi.buffer_address(), lo.buffer_address(), per, start, 0]
                     cp_rt[cx][cy] = [per]
                     start += per
     cfg = ttnn.ComputeConfigDescriptor()

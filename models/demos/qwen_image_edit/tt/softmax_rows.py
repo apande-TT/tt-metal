@@ -93,7 +93,7 @@ def fused_softmax_rows(s, mask_add, mem, split_mem=None):
                 for y in range(r.start.y, r.end.y + 1):
                     rd_rt[x][y] = [s.buffer_address(), mask_addr, per, start]
                     wr_rt[x][y] = (
-                        [hi.buffer_address(), lo.buffer_address(), per * Wt, start * Wt]
+                        [hi.buffer_address(), lo.buffer_address(), per * Wt, start * Wt, 0]
                         if split
                         else [out.buffer_address(), per * Wt, start * Wt]
                     )
