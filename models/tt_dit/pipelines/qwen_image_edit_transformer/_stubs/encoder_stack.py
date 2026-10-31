@@ -137,7 +137,8 @@ class _TtBlock:
         y, limbs = r
         ttnn.deallocate(y)
         if GATHER_PACKED:
-            parts = _precise.PackedLimbs(x.gather_part(limbs, lead=1))
+            # stacked [2, ...] limbs gather along the slice dim one further in; paired ones are laid out like x
+            parts = _precise.PackedLimbs(x.gather_part(limbs, lead=0 if limbs.dtype == ttnn.float32 else 1))
             ttnn.deallocate(limbs)
         else:
             hi, lo = limbs

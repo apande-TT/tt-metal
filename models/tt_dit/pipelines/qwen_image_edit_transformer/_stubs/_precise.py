@@ -79,14 +79,16 @@ _PRESPLIT = {}
 
 
 class PackedLimbs:
-    """x's limbs stacked in one bf16 tensor t [2, ...] (hi, then lo), e.g. gathered in one collective. Fused limb
-    linears read both limbs from t (LIMB_LINEAR_FN / LIMB_LINEAR_BIAS_FN with lo None); unpack() slices them apart
-    for anything else."""
+    """x's limbs in one tensor t, e.g. gathered in one collective: stacked bf16 [2, ...] (hi, then lo), or paired
+    (t typed float32 like x, each page holding a bf16 tile of hi then of lo). Fused limb linears read both limbs from t
+    (LIMB_LINEAR_FN / LIMB_LINEAR_BIAS_FN with lo None); unpack() slices stacked ones apart for anything else."""
 
     def __init__(self, t):
         self.t = t
 
     def unpack(self):
+        if self.t.dtype == ttnn.float32:  # limbs paired per page: only the fused limb linear reads that layout
+            raise NotImplementedError("paired limbs need the fused limb linear (LIMB_LINEAR_FN / LIMB_LINEAR_BIAS_FN)")
         shape = [int(d) for d in self.t.shape]
         start = [0] * len(shape)
         hi = ttnn.slice(self.t, start, [1] + shape[1:])
