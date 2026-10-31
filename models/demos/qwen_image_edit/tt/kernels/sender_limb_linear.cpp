@@ -4,10 +4,10 @@
 
 // Weight sender of the two-limb linear (limb_linear.cpp), on one core outside the compute rectangle. For every
 // work unit round it streams its column group's slice of the weight (Ntg columns from n0) once, column block
-// (nb tiles) outer and K chunk (kc tiles) inner, each chunk read from DRAM into one of the two cb 1 slots
+// (nb tiles) outer and K chunk (kc tiles) inner, each chunk read from DRAM into one of three cb 1 slots
 // (tile kk * nb + c = w[k0 + kk, n0 + c]) and multicast to the same L1 address on every compute core of its
-// group once all of them have freed that slot. Three slots: the next chunk's DRAM reads overlap this one's multicast. The sender's own cb 1 is
-// only a staging ring (no consumer here): it alternates the two slots at the receivers' cb 1 addresses.
+// group once all of them have freed that slot; the next chunk's DRAM reads overlap this one's wait and multicast.
+// The sender's own cb 1 is only a staging ring (no consumer here): its slots sit at the receivers' cb 1 addresses.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
