@@ -75,6 +75,8 @@ inline void row_mean_of(CircularBuffer& x, uint32_t inv_w_bits) {
 
 void kernel_main() {
     const uint32_t num_rows = get_arg_val<uint32_t>(0);
+    const uint32_t c0 = get_arg_val<uint32_t>(1);  // the apply pass's columns [c0, c1) (the whole row: 0, Wt)
+    const uint32_t c1 = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t inv_w_bits = get_compile_time_arg_val(1);  // float32 bits of 1 / W
@@ -124,7 +126,7 @@ void kernel_main() {
 
         // y = ((x - mu) * r) * (1 + scale) + shift, two tiles per DEST acquire (DST 0 / 1 and 2 / 3): the same ops per
         // tile, each init and broadcast setup done once per pair
-        for (uint32_t wt = 0; wt < Wt; wt += 2) {
+        for (uint32_t wt = c0; wt < c1; wt += 2) {
             ss.wait_front(4);  // (1 + scale, shift) of columns wt and wt + 1
             tile_regs_acquire();
             reconfig_data_format_srca(cb_x);

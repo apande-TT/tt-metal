@@ -56,7 +56,10 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
 
     grid = device.compute_with_storage_grid_size()
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
-    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, rows)
+    # fewer rows than cores: each row on `parts` cores, every one making the row's mean and rsqrt (the same ops,
+    # no exchange) and applying / writing its own 1 / parts of the columns (whole column pairs)
+    parts = max(p for p in (1, 2, 4) if p == 1 or (rows * p <= grid.x * grid.y and Wt % (2 * p) == 0))
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, rows * parts)
     page = 4096  # one float32 tile
     f32, b16 = (ttnn.float32, page), (ttnn.bfloat16, page // 2)
     # x: two whole rows (one in use, one read); the apply pass works on column pairs, so the others hold two pairs
@@ -76,17 +79,25 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [x.buffer_address(), scale1.buffer_address(), shift.buffer_address()]
     start = 0
+    cw = Wt // parts  # columns per part
     for group, per in ((group1, per1), (group2, per2)):
         for r in group.ranges():
             for cx in range(r.start.x, r.end.x + 1):
                 for cy in range(r.start.y, r.end.y + 1):
-                    rd_rt[cx][cy] = addrs + [per, start]
+                    if parts == 1:  # rows [start, start + per), every column
+                        row, n, c0, c1 = start, per, 0, Wt
+                    else:  # one (row, part) unit: row start // parts, columns of part start % parts
+                        row, n = start // parts, 1
+                        c0 = (start % parts) * cw
+                        c1 = c0 + cw
+                    t0, nt = row * Wt + c0, n * (c1 - c0)
+                    rd_rt[cx][cy] = addrs + [n, row, c0, c1]
                     wr_rt[cx][cy] = (
-                        [hi.buffer_address(), lo.buffer_address(), per * Wt, start * Wt]
+                        [hi.buffer_address(), lo.buffer_address(), nt, t0]
                         if split
-                        else [out.buffer_address(), per * Wt, start * Wt]
+                        else [out.buffer_address(), nt, t0]
                     )
-                    cp_rt[cx][cy] = [per]
+                    cp_rt[cx][cy] = [n, c0, c1]
                     start += per
     # as binary_ng / unary / the accurate float32 reduce: float32 inputs unpacked to DEST, float32 DEST, precise SFPU
     cfg = ttnn.ComputeConfigDescriptor()

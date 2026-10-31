@@ -5,7 +5,8 @@
 // Reader of ln_modulate.cpp: for each tile row i of this core it reads the row's Wt x tiles once (`batch` tiles per
 // barrier; the compute keeps the row in cb_x for its three passes), then for the apply pass
 // the (1 + scale) and shift tiles of each column for i's batch item (b = i / St; one table row when the tables are
-// shared) -- only their row 0 (faces 0 and 1's first rows), the one the ROW broadcast reads. Runtime args: x, (1 + scale), shift addresses, the tile row count and the first one.
+// shared) -- only their row 0 (faces 0 and 1's first rows), the one the ROW broadcast reads. Runtime args: x, (1 + scale), shift addresses, the tile row count and the first one, and the
+// apply pass's column range [c0, c1).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -18,6 +19,8 @@ void kernel_main() {
     const uint32_t sh_addr = get_arg_val<uint32_t>(2);
     const uint32_t num = get_arg_val<uint32_t>(3);
     const uint32_t start = get_arg_val<uint32_t>(4);
+    const uint32_t c0 = get_arg_val<uint32_t>(5);  // the apply pass's columns [c0, c1) (the whole row: 0, Wt)
+    const uint32_t c1 = get_arg_val<uint32_t>(6);
 
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t St = get_compile_time_arg_val(1);
@@ -50,7 +53,7 @@ void kernel_main() {
             x.push_back(batch);
         }
         const uint32_t tab = batched ? (i / St) * Wt : 0;
-        for (uint32_t wt = 0; wt < Wt; ++wt) {
+        for (uint32_t wt = c0; wt < c1; ++wt) {
             ss.reserve_back(2);
             // only row 0 of a table tile is read by the ROW broadcast: faces 0 and 1's first rows
             for (uint32_t f = 0; f < 2; ++f) {
