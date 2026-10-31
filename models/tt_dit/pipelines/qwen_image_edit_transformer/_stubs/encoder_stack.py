@@ -119,12 +119,16 @@ class _TtBlock:
         return ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, self.eps)))
 
     def _modulate_slice(self, x, shift, scale):
-        """x a _ccl.Sliced token slice: LN + modulation of this device's tokens only (LayerNorm is per token, the
-        tables are per batch item), then all_gather of the result's bf16 limbs -> a stand-in of the full stream's
-        shape whose limbs are registered (nothing reads its values); None when it does not fit."""
+        """x a _ccl.Sliced slice (its tokens or its batch items): LN + modulation of this device's rows only
+        (LayerNorm is per token, the tables per batch item), then all_gather of the result's bf16 limbs -> a stand-in
+        of the full stream's shape whose limbs are registered (nothing reads its values); None when it does not fit."""
         if not (MODULATE_FN is not None and MODULATE_SPLIT and _precise.ENABLED and SKIP_SAME_CAST):
             return None
-        r = MODULATE_FN(x.t, ttnn.add(scale, 1.0), shift, self.eps, split=True)
+        scale1 = ttnn.add(scale, 1.0)
+        if x.dim == 0 and int(shift.shape[0]) > 1:  # a slice of the batch items: their own modulation rows
+            scale1 = ttnn.mesh_partition(scale1, dim=0, cluster_axis=x.axis)
+            shift = ttnn.mesh_partition(shift, dim=0, cluster_axis=x.axis)
+        r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True)
         if r is None:
             return None
         y, (hi, lo) = r
@@ -173,12 +177,11 @@ class _TtBlock:
 
         # need_txt False (set on the last block by its caller): the text stream's outputs are not used after this
         # block, so its attention output projection, FF and residual updates are skipped (txt is returned as is).
-        # The image stream may stay each device's token slice between its updates (_ccl.KEEP_SLICES): only its
-        # modulated activation's limbs are gathered. The text stream splits by batch item, one LN tile row per core
-        # either way, so it stays whole.
+        # Both streams may stay each device's slice between their updates (_ccl.KEEP_SLICES: the image's tokens, the
+        # text's batch items): only their modulated activations' limbs are gathered.
         need_txt = getattr(self, "need_txt", True)
         with _ccl.gated_residual((i_g1, img), keep=True) as e_img, _ccl.gated_residual(
-            *(((t_g1, txt),) if need_txt else ())
+            *(((t_g1, txt),) if need_txt else ()), keep=True
         ) as e_txt:
             a_img, a_txt = self.attn(img_m, txt_m, attention_mask=mask, image_rotary_emb=rotary, need_txt=need_txt)
         img = gated(img, i_g1, a_img, e_img[0] if e_img else None)
@@ -189,7 +192,7 @@ class _TtBlock:
             f = self.img_ff(self._modulate(img, i_sh2, i_sc2))
         img = gated(img, i_g2, f, e[0] if e else None)
         if need_txt:
-            with _ccl.gated_residual((t_g2, txt)) as e:
+            with _ccl.gated_residual((t_g2, txt), keep=True) as e:
                 f = self.txt_ff(self._modulate(txt, t_sh2, t_sc2))
             txt = gated(txt, t_g2, f, e[0] if e else None)
         return img, txt

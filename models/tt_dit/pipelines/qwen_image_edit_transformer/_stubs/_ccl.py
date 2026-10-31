@@ -164,7 +164,7 @@ A2A_GATED_SUM_FN = None
 # the all_gather (which then gathers the updated residual): the same multiply and add per element on 1/n of the
 # rows instead of on the whole replicated tensor. Requested per call through gated_residual(); False: never
 GATED_RESIDUAL = False
-# a gated update split over the tokens may keep its result as this device's own token slice (a Sliced, no
+# a gated update may keep its result as this device's own slice (its tokens or its batch items: a Sliced, no
 # all_gather of the updated residual) when its caller asks (gated_residual(..., keep=True)); False: always gathered
 KEEP_SLICES = False
 _PENDING = []  # [GatedResidual] registered by gated_residual(), consumed in order by matching reduces
@@ -266,7 +266,7 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
     # a residual already sliced over the tokens is this device's slice; a kept result stays one (in DRAM: it
     # lives until the next block's update)
     local = gated is not None and isinstance(gated.residual, Sliced)
-    keep = gated is not None and gated.keep and d == 2
+    keep = gated is not None and gated.keep
     residual = gated.residual.t if local else gated.residual if gated is not None else None
     if gated is not None and A2A_GATED_SUM_FN is not None:
         mem = ttnn.DRAM_MEMORY_CONFIG if keep else kw.get("memory_config", ttnn.DRAM_MEMORY_CONFIG)
@@ -297,7 +297,8 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
         out = ttnn.add(r4, ttnn.multiply(g4, s), **({"memory_config": ttnn.DRAM_MEMORY_CONFIG} if keep else {}))
         ttnn.deallocate(s)
     if keep:
-        gated.out = Sliced(ttnn.reshape(out, shape[:-2] + [int(part[2]), shape[-1]]), len(shape) - 2, ax, shape)
+        lead_dims = 4 - len(shape)  # the 4-D layout's extra leading dims
+        gated.out = Sliced(ttnn.reshape(out, [int(v) for v in part][lead_dims:]), d - lead_dims, ax, shape)
         return gated.out
     out = ttnn.all_gather(
         out, dim=d, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear, memory_config=ttnn.DRAM_MEMORY_CONFIG
