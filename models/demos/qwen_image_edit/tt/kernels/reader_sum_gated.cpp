@@ -26,6 +26,7 @@ void kernel_main() {
     const uint32_t r_off = get_arg_val<uint32_t>(5);
     const uint32_t num_tiles = get_arg_val<uint32_t>(6);
     const uint32_t start_tile = get_arg_val<uint32_t>(7);
+    const uint32_t rb_off = get_arg_val<uint32_t>(8);  // the residual's batch offset (b_off, or 0 for a local slice)
 
     constexpr uint32_t block_tiles = get_compile_time_arg_val(0);
     constexpr uint32_t n_blocks = get_compile_time_arg_val(1);
@@ -61,7 +62,8 @@ void kernel_main() {
     for (uint32_t t = start_tile; t < start_tile + num_tiles; ++t) {
         const uint32_t c = t % Wt;
         const uint32_t rt = (t / Wt) % Rt_local;
-        const uint32_t b = t / (Wt * Rt_local) + b_off;
+        const uint32_t bl = t / (Wt * Rt_local);  // batch item within the slice
+        const uint32_t b = bl + b_off;
         src.reserve_back(n_in);
         rb.reserve_back(1);
         if constexpr (has_gate) {
@@ -76,7 +78,7 @@ void kernel_main() {
                 noc.async_read(bias, bb, row_bytes, {.page_id = c, .offset_bytes = f * face_bytes}, {.offset_bytes = f * face_bytes});
             }
         }
-        noc.async_read(res, rb, page, {.page_id = (b * Rt + rt + r_off) * Wt + c}, {.offset_bytes = 0});
+        noc.async_read(res, rb, page, {.page_id = ((bl + rb_off) * Rt + rt + r_off) * Wt + c}, {.offset_bytes = 0});
         if constexpr (has_gate) {
             const uint32_t gp = gate_batched ? b * Wt + c : c;
             for (uint32_t f = 0; f < 2; ++f) {

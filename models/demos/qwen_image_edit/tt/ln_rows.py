@@ -58,7 +58,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False):
     all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
     # fewer rows than cores: each row on `parts` cores, every one making the row's mean and rsqrt (the same ops,
     # no exchange) and applying / writing its own 1 / parts of the columns (whole column pairs)
-    parts = max(p for p in (1, 2, 4) if p == 1 or (rows * p <= grid.x * grid.y and Wt % (2 * p) == 0))
+    parts = max(p for p in (1, 2, 4, 8) if p == 1 or (rows * p <= grid.x * grid.y and Wt % (2 * p) == 0))
     _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, rows * parts)
     page = 4096  # one float32 tile
     f32, b16 = (ttnn.float32, page), (ttnn.bfloat16, page // 2)
