@@ -21,6 +21,7 @@ import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import (
     _precise,
     ada_layer_norm_continuous,
+    attention,
     qwen_embed_rope,
     qwen_image_transformer_block,
     qwen_timestep_proj_embeddings,
@@ -96,6 +97,12 @@ class TtQwenImageTransformer:
         hs = self.img_in(latent_in)
         txt = self.txt_in(self.txt_norm(prompt_embeds))
         temb = self.time_text_embed(timestep, hs)
-        for blk in self.transformer_blocks:
-            txt, hs = blk(hidden_states=hs, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary)
+        last = len(self.transformer_blocks) - 1
+        for i, blk in enumerate(self.transformer_blocks):
+            # (the head reads only the image stream: the last block's text-stream output is not computed)
+            attention.SKIP_TXT_OUT = i == last
+            try:
+                txt, hs = blk(hidden_states=hs, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary)
+            finally:
+                attention.SKIP_TXT_OUT = False
         return self.proj_out(self.norm_out(hs, temb))

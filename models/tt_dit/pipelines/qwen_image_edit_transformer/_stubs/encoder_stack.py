@@ -126,9 +126,10 @@ class _TtBlock:
 
         # the gated residual updates x + g * y as one ternary pass each (the product, then the sum)
         img = ttnn.addcmul(img, i_g1, a_img)
-        txt = ttnn.addcmul(txt, t_g1, a_txt)
-
         img = ttnn.addcmul(img, i_g2, self.img_ff(self._modulate(img, i_sh2, i_sc2)))
+        if a_txt is None:  # the text stream's output is discarded (attention.SKIP_TXT_OUT): it is not updated
+            return img, txt
+        txt = ttnn.addcmul(txt, t_g1, a_txt)
         txt = ttnn.addcmul(txt, t_g2, self.txt_ff(self._modulate(txt, t_sh2, t_sc2)))
         return img, txt
 

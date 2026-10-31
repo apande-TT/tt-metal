@@ -38,10 +38,13 @@ import torch
 import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _precise
 
-
 # Optional kernel for the head split of one projection: HEAD_SPLIT(x, heads, None, parts=1) -> x [B, S, H * D] as
 # [B, H, S, D] (the reshape + permute below), and with merge=True the inverse; None for a tensor it does not take.
 HEAD_SPLIT = None
+# The caller discards this call's text-stream output (the last block's: the transformer's head reads only the image
+# stream): the text queries' attention and out-projection are skipped and None is returned for txt. The text keys and
+# values still enter the joint attention.
+SKIP_TXT_OUT = False
 
 
 def _is_mesh(device):
@@ -338,6 +341,8 @@ class TtQwenJointAttention:
             mask_add = ttnn.multiply(ttnn.subtract(m, 1.0), 1e30)
 
         img = self._out(self._attend(qi, kh, kl, v, mask_add), self.img_out)
+        if SKIP_TXT_OUT:
+            return img, None
         txt = self._out(self._attend(qt, kh, kl, v, mask_add), self.txt_out)
         return img, txt
 
