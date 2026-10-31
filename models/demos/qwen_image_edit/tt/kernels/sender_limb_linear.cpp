@@ -6,7 +6,7 @@
 // work unit round it streams its column group's slice of the weight (Ntg columns from n0) once, column block
 // (nb tiles) outer and K chunk (kc tiles) inner, each chunk read from DRAM into one of the two cb 1 slots
 // (tile kk * nb + c = w[k0 + kk, n0 + c]) and multicast to the same L1 address on every compute core of its
-// group once all of them have freed that slot. The sender's own cb 1 is
+// group once all of them have freed that slot. Three slots: the next chunk's DRAM reads overlap this one's multicast. The sender's own cb 1 is
 // only a staging ring (no consumer here): it alternates the two slots at the receivers' cb 1 addresses.
 
 #include "api/dataflow/dataflow_api.h"
@@ -50,39 +50,46 @@ void kernel_main() {
     Semaphore<> receiver_sem(receiver_sem_id);
     receiver_sem.set(VALID);  // the local value multicast to the receivers once a chunk has landed
 
-    uint32_t slot = 0;
-    for (uint32_t round = 0; round < rounds; ++round) {
-        for (uint32_t nblk = 0; nblk < Ntg / nb; ++nblk) {
-            for (uint32_t kch = 0; kch < Kt / kc; ++kch) {
-                noc.async_write_barrier();  // the multicast that last used this slot has left L1
-                const uint32_t off = slot * chunk_bytes;
-                for (uint32_t kk = 0; kk < kc; ++kk) {
-                    for (uint32_t c = 0; c < nb; ++c) {
-                        const uint32_t id = (kch * kc + kk) * Nt + n0 + nblk * nb + c;
-                        noc.async_read(w, dw, page, {.page_id = id}, {.offset_bytes = off + (kk * nb + c) * page});
-                    }
-                }
-                noc.async_read_barrier();
-
-                sender_sem.wait(num_dests);  // every receiver has freed this slot
-                sender_sem.set(0);
-                const uint32_t addr = base + off;
-                const MulticastEndpoint mcast_dst;
-                noc.async_write_multicast(
-                    CoreLocalMem<uint32_t>(addr),
-                    mcast_dst,
-                    chunk_bytes,
-                    num_dests,
-                    {},
-                    {.noc_x_start = x_start, .noc_y_start = y_start, .noc_x_end = x_end, .noc_y_end = y_end, .addr = addr},
-                    true);
-#ifdef ARCH_BLACKHOLE
-                noc.async_writes_flushed();
-#endif
-                receiver_sem.set_multicast(noc, x_start, y_start, x_end, y_end, num_dests);
-                slot ^= 1;
+    // three staging slots, the receivers' cb 1 three chunks deep: chunk i + 1 is read from DRAM into the slot whose
+    // multicast (chunk i - 2) has left L1 while chunk i waits for the receivers and is multicast
+    constexpr uint32_t slots = 3;
+    constexpr uint32_t chunks_per_round = (Ntg / nb) * (Kt / kc);
+    constexpr uint32_t total = rounds * chunks_per_round;
+    auto read_chunk = [&](uint32_t i) {
+        const uint32_t c = i % chunks_per_round;
+        const uint32_t nblk = c / (Kt / kc);
+        const uint32_t kch = c % (Kt / kc);
+        const uint32_t off = (i % slots) * chunk_bytes;
+        for (uint32_t kk = 0; kk < kc; ++kk) {
+            for (uint32_t cc = 0; cc < nb; ++cc) {
+                const uint32_t id = (kch * kc + kk) * Nt + n0 + nblk * nb + cc;
+                noc.async_read(w, dw, page, {.page_id = id}, {.offset_bytes = off + (kk * nb + cc) * page});
             }
         }
+    };
+    read_chunk(0);
+    for (uint32_t i = 0; i < total; ++i) {
+        noc.async_read_barrier();   // chunk i has landed
+        noc.async_write_barrier();  // the multicasts so far (chunk i - 1 and older) have left L1
+        if (i + 1 < total) {
+            read_chunk(i + 1);  // into chunk i - 2's slot
+        }
+        sender_sem.wait(num_dests);  // every receiver has freed the slot chunk i goes to
+        sender_sem.set(0);
+        const uint32_t addr = base + (i % slots) * chunk_bytes;
+        const MulticastEndpoint mcast_dst;
+        noc.async_write_multicast(
+            CoreLocalMem<uint32_t>(addr),
+            mcast_dst,
+            chunk_bytes,
+            num_dests,
+            {},
+            {.noc_x_start = x_start, .noc_y_start = y_start, .noc_x_end = x_end, .noc_y_end = y_end, .addr = addr},
+            true);
+#ifdef ARCH_BLACKHOLE
+        noc.async_writes_flushed();
+#endif
+        receiver_sem.set_multicast(noc, x_start, y_start, x_end, y_end, num_dests);
     }
     noc.async_write_barrier();
 }

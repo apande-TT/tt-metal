@@ -84,7 +84,7 @@ def fused_limb_linear(
         )
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
     nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
-    kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (2 slots in cb 1)
+    kc = _largest_divisor(k_t, max(1, 32 // nb))  # 64 KB weight chunks (3 slots in cb 1)
     rect_rows = _rect_rows(gw)
     if rect_rows == 0:
         return None
@@ -109,7 +109,7 @@ def fused_limb_linear(
 
     cbs = [
         _cb(0, ttnn.bfloat16, 2048, 2 * mb * k_t),
-        _cb(1, ttnn.bfloat16, 2048, 2 * kc * nb),
+        _cb(1, ttnn.bfloat16, 2048, 3 * kc * nb),  # three weight chunk slots (the sender's staging ring)
         _cb(16, ttnn.float32, 4096, 2 * mb * nb),
     ]
     if bias_rows is not None:
