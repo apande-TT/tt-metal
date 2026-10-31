@@ -30,8 +30,9 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
     """x [B, S, W] float32 TILE (interleaved, S and W tile multiples), scale1 = 1 + scale and shift [B or 1, 1, W]
     float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit.
     split: -> (y, (hi, lo)) with y's bf16 limbs as limb_split.fused_split_bf16 makes them (DRAM), and y itself
-    allocated but NOT written -- for a caller whose only use of y is that split. packed (with split): the limbs as one
-    bf16 tensor [2, B, S, W] (hi, then lo) -> (y, packed)."""
+    allocated but NOT written -- for a caller whose only use of y is that split. packed (with split): the limbs paired
+    in one tensor typed float32 [B, S, W] whose 4 KB page t holds bf16 tile t of hi then of lo -> (y, paired) (moved
+    by a collective in whole 4 KB pages; fused_limb_linear reads it with lo None)."""
     ts = (x, scale1, shift)
     if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
@@ -49,9 +50,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
     out = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG)
     if split:
         if packed:
-            hi = ttnn.allocate_tensor_on_device(
-                ttnn.Shape([2] + list(x.shape)), ttnn.bfloat16, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
-            )
+            hi = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
             lo = hi
         else:
             hi = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG)
@@ -100,7 +99,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
                     t0, nt = row * Wt + c0, n * (c1 - c0)
                     rd_rt[cx][cy] = addrs + [n, row, c0, c1]
                     wr_rt[cx][cy] = (
-                        [hi.buffer_address(), lo.buffer_address(), nt, t0, rows * Wt if packed else 0]
+                        [hi.buffer_address(), lo.buffer_address(), nt, t0, 0xFFFFFFFF if packed else 0]
                         if split
                         else [out.buffer_address(), nt, t0]
                     )

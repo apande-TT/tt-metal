@@ -40,15 +40,16 @@ def fused_limb_linear(
     (hi @ w + lo @ w) + b, the separate float32 bias add's order. fidelity: both limbs' products' math fidelity.
     long_groups: a long-K one (or wide_groups=False) whose rows fill only part of the grid splits its columns over
     the column groups that occupy the most cores (one sender each, streaming its slice in parallel); same
-    products and sums per output tile. lo None: hi is both limbs stacked [2, ..., M, K] (hi, then lo), read from the one
-    tensor."""
+    products and sums per output tile. lo None: hi holds both limbs, stacked bf16 [2, ..., M, K] (hi, then lo) or
+    paired (typed float32 [..., M, K], each 4 KB page bf16 tile t of hi then of lo, as ln_rows packed writes them)."""
     packed = lo is None
+    paired = packed and hi.dtype == ttnn.float32
     if packed:
         lo = hi
-    if w.dtype != ttnn.bfloat16 or hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16:
+    if w.dtype != ttnn.bfloat16 or (not paired and (hi.dtype != ttnn.bfloat16 or lo.dtype != ttnn.bfloat16)):
         return None
     hs, ws = [int(d) for d in hi.padded_shape], [int(d) for d in w.padded_shape]
-    if packed:
+    if packed and not paired:
         if hs[0] != 2:
             return None
         hs = hs[1:]
@@ -91,9 +92,10 @@ def fused_limb_linear(
     n_cores = rect_rows * gw  # per group
     units = rows // mb // n_cores
 
-    out_shape = list(hi.shape)[1 if packed else 0 : -1] + [int(w.shape[-1])]
+    out_shape = list(hi.shape)[1 if packed and not paired else 0 : -1] + [int(w.shape[-1])]
     out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
-    lo_off = rows * k_t if packed else 0  # lo's first page in the stacked tensor
+    lo_off = rows * k_t if packed and not paired else 0  # lo's first page in the stacked tensor
+    lo_byte = 2048 if paired else 0  # lo's byte offset in a paired page
     rect = ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(cols - 1, rect_rows - 1))
     senders = [ttnn.CoreCoord(g * gw, rect_rows) for g in range(groups)]
     compute_cores = ttnn.CoreRangeSet([rect])
@@ -129,6 +131,7 @@ def fused_limb_linear(
                     sender_phys.x,
                     sender_phys.y,
                     lo_off,
+                    lo_byte,
                 ]
                 wr_rt[x][y] = [out.buffer_address(), first, g * n_g, 0 if bias_rows is None else bias_rows.buffer_address()]
         start = device.worker_core_from_logical_core(ttnn.CoreCoord(x0, 0))

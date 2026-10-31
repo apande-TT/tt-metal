@@ -21,6 +21,7 @@ void kernel_main() {
     const uint32_t sender_x = get_arg_val<uint32_t>(3);
     const uint32_t sender_y = get_arg_val<uint32_t>(4);
     const uint32_t lo_off = get_arg_val<uint32_t>(5);  // lo's page offset (both limbs in one stacked tensor; else 0)
+    const uint32_t lo_byte = get_arg_val<uint32_t>(6);  // lo's byte offset in hi's page (limbs paired per page; else 0)
 
     constexpr uint32_t Kt = get_compile_time_arg_val(0);
     constexpr uint32_t Nt = get_compile_time_arg_val(1);
@@ -53,7 +54,8 @@ void kernel_main() {
             for (uint32_t kt = 0; kt < Kt; ++kt) {
                 const uint32_t id = (row0 + r) * Kt + kt;
                 noc.async_read(hi, da, page, {.page_id = id}, {.offset_bytes = (r * Kt + kt) * page});
-                noc.async_read(lo, da, page, {.page_id = id + lo_off}, {.offset_bytes = ((mb + r) * Kt + kt) * page});
+                noc.async_read(
+                    lo, da, page, {.page_id = id + lo_off, .offset_bytes = lo_byte}, {.offset_bytes = ((mb + r) * Kt + kt) * page});
             }
         }
         noc.async_read_barrier();
