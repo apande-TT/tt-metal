@@ -105,7 +105,7 @@ class TtQwenTextEncoder:
         grid = device.compute_with_storage_grid_size()
         _te_attention.LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         _te_attention.LINEAR_BLOCK = True
-        _te_attention.LINEAR_BLOCK_TRANSPOSE = True
+        _te_attention.LINEAR_BLOCK_TRANSPOSE = True  # (single-tile-row shares stay one row: the whole grid)
         # the exact fp32 TP all-reduce gathers and sums in L1, in chunks of at most 48 MB per gather
         _te_attention.EXACT_REDUCE_L1_BYTES = 48 * 1024 * 1024
         # where the batch splits over the TP devices: all_to_all + local adds + all_gather instead
