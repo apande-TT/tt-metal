@@ -72,9 +72,17 @@ MODULATE_FN = None
 # MODULATE_FN(..., split=True) -> (y, (hi, lo)): the modulated activation's bf16 limbs made in the same pass and
 # registered with _precise.register_split (y itself is then not written: its consumers only split it)
 MODULATE_SPLIT = False
+# the six modulation tables as [B, dim] (B <= 32: item b in row b of one tile row) instead of reshaped to [B, 1, dim];
+# the fused LayerNorm and gated-sum kernels read row b, the stock fallbacks reshape (False: [B, 1, dim])
+TABLE_ROWS = False
 # a sliced stream's MODULATE_FN(..., split=True, packed=True) writes its limbs stacked in one tensor, gathered by one
 # all_gather and read from there by the fused limb linears (_precise.PackedLimbs); False: two limb tensors, two gathers
 GATHER_PACKED = False
+
+
+def _t3(t):
+    """A [B, dim] modulation table (TABLE_ROWS) as [B, 1, dim] for ttnn broadcasting; 3-D tables as they are."""
+    return ttnn.reshape(t, (int(t.shape[0]), 1, int(t.shape[1]))) if len(t.shape) == 2 else t
 
 
 class _TtBlock:
@@ -113,6 +121,8 @@ class _TtBlock:
         y = self._gather(y)  # [B, 6*dim] (column shards concatenate in order)
         B = y.shape[0]
         d = self.dim
+        if TABLE_ROWS and B <= 32:  # [B, dim] tables (item b in row b of one tile row), no [B, 1, dim] reshape
+            return [ttnn.slice(y, (0, i * d), (B, (i + 1) * d)) for i in range(6)]
         return [ttnn.reshape(ttnn.slice(y, (0, i * d), (B, (i + 1) * d)), (B, 1, d)) for i in range(6)]
 
     def _ln(self, x):  # LayerNorm without affine, float32
@@ -129,8 +139,9 @@ class _TtBlock:
             return None
         scale1 = ttnn.add(scale, 1.0)
         if x.dim == 0 and int(shift.shape[0]) > 1:  # a slice of the batch items: their own modulation rows
-            scale1 = ttnn.mesh_partition(scale1, dim=0, cluster_axis=x.axis)
-            shift = ttnn.mesh_partition(shift, dim=0, cluster_axis=x.axis)
+            # (a [B, dim] table is first made [B, 1, dim]: its items share one tile row, which cannot be split)
+            scale1 = ttnn.mesh_partition(_t3(scale1), dim=0, cluster_axis=x.axis)
+            shift = ttnn.mesh_partition(_t3(shift), dim=0, cluster_axis=x.axis)
         r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True, **({"packed": True} if GATHER_PACKED else {}))
         if r is None:
             return None
@@ -167,6 +178,7 @@ class _TtBlock:
             y = MODULATE_FN(x, ttnn.add(scale, 1.0), shift, self.eps)
             if y is not None:
                 return y
+        shift, scale = _t3(shift), _t3(scale)
         return ttnn.add(ttnn.multiply(self._ln(x), ttnn.add(scale, 1.0)), shift)
 
     def __call__(self, img, txt, silu_temb, rotary, mask, temb_parts=None):
@@ -182,7 +194,7 @@ class _TtBlock:
         def gated(r, g, branch, entry):
             if entry is not None and entry.out is not None:
                 return entry.out
-            return ttnn.add(_ccl.unslice(r), ttnn.multiply(g, branch))
+            return ttnn.add(_ccl.unslice(r), ttnn.multiply(_t3(g), branch))
 
         # need_txt False (set on the last block by its caller): the text stream's outputs are not used after this
         # block, so its attention output projection, FF and residual updates are skipped (txt is returned as is).

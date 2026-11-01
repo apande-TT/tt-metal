@@ -222,7 +222,7 @@ def gated_residual(*pairs, keep=False):
 
 def _take_gated(y):
     for e in _PENDING:
-        if list(e.residual.shape) == list(y.shape) and len(e.gate.shape) == len(y.shape):
+        if list(e.residual.shape) == list(y.shape) and len(e.gate.shape) in (len(y.shape), len(y.shape) - 1):
             _PENDING.remove(e)
             return e
     return None
@@ -291,7 +291,10 @@ def _a2a_sum(y, ax, n, bias=None, gated=None):
             r4 = ttnn.reshape(residual, part)
         else:
             r4 = ttnn.mesh_partition(ttnn.reshape(residual, lead), dim=d, cluster_axis=ax)
-        g4 = ttnn.reshape(gated.gate, [1] * (4 - len(shape)) + list(gated.gate.shape))
+        gate = gated.gate
+        if len(gate.shape) == len(shape) - 1:  # a [B, W] table (one row per item): as [B, 1, W]
+            gate = ttnn.reshape(gate, [int(gate.shape[0]), 1, int(gate.shape[-1])])
+        g4 = ttnn.reshape(gate, [1] * (4 - len(shape)) + list(gate.shape))
         if int(g4.shape[d]) > 1:
             g4 = ttnn.mesh_partition(g4, dim=d, cluster_axis=ax)
         s = out
