@@ -28,7 +28,7 @@ def _f32_bits(v):
 
 def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False):
     """x [B, S, W] float32 TILE (interleaved, S and W tile multiples), scale1 = 1 + scale and shift [B or 1, 1, W]
-    float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit.
+    (or [B or 1, W], B <= 32: item b in row b) float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit.
     split: -> (y, (hi, lo)) with y's bf16 limbs as limb_split.fused_split_bf16 makes them (DRAM), and y itself
     allocated but NOT written -- for a caller whose only use of y is that split. packed (with split): the limbs paired
     in one tensor typed float32 [B, S, W] whose 4 KB page t holds bf16 tile t of hi then of lo -> (y, paired) (moved
@@ -36,13 +36,17 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
     ts = (x, scale1, shift)
     if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
-    if len(x.shape) != 3 or len(scale1.shape) != 3 or list(scale1.shape) != list(shift.shape):
+    if len(x.shape) != 3 or len(scale1.shape) not in (2, 3) or list(scale1.shape) != list(shift.shape):
         return None
     B, S, W = (int(d) for d in x.shape)
     if S % 32 or W % 64 or list(x.padded_shape) != list(x.shape):  # an even tile count per row (column pairs)
         return None
+    # tables [B or 1, 1, W] (item b in its own tile row) or [B or 1, W] (item b in row b of one tile row)
+    table_rows = len(scale1.shape) == 2
     sB = int(scale1.shape[0])
-    if sB not in (1, B) or int(scale1.shape[1]) != 1 or int(scale1.shape[2]) != W:
+    if sB not in (1, B) or int(scale1.shape[-1]) != W or (not table_rows and int(scale1.shape[1]) != 1):
+        return None
+    if table_rows and sB > 32:
         return None
     Wt, St = W // 32, S // 32
     rows = B * St
@@ -97,7 +101,7 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
                         c0 = (start % parts) * cw
                         c1 = c0 + cw
                     t0, nt = row * Wt + c0, n * (c1 - c0)
-                    rd_rt[cx][cy] = addrs + [n, row, c0, c1]
+                    rd_rt[cx][cy] = addrs + [n, row, c0, c1, int(table_rows)]
                     wr_rt[cx][cy] = (
                         [hi.buffer_address(), lo.buffer_address(), nt, t0, 0xFFFFFFFF if packed else 0]
                         if split

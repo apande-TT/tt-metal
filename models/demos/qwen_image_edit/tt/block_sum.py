@@ -139,8 +139,18 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
     _, b_loc, s_loc, w = (int(v) for v in part)
     if w != W or S % 32 or s_loc % 32 or W % 32 or list(residual.padded_shape) != list(residual.shape):
         return None
+    # gate [B or 1, 1, W] (item b in its own tile row) or [B or 1, W] (item b in row b of one tile row); B the whole
+    # batch (also when the residual is this device's batch slice)
     gB = int(gate.shape[0]) if has_gate else 1
-    if has_gate and (len(gate.shape) != 3 or int(gate.shape[1]) != 1 or int(gate.shape[2]) != W or gB not in (1, B)):
+    gate_rows = has_gate and len(gate.shape) == 2
+    full_b = b_loc * n if split_dim == 1 else B
+    if has_gate and (
+        len(gate.shape) not in (2, 3)
+        or int(gate.shape[-1]) != W
+        or (not gate_rows and int(gate.shape[1]) != 1)
+        or gB not in (1, full_b)
+        or (gate_rows and gB > 32)
+    ):
         return None
     gate = gate if has_gate else residual  # the reader's (unused) gate accessor
     Wt, Rt, Rt_loc = W // 32, S // 32, s_loc // 32
@@ -190,7 +200,7 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
             for r in group.ranges():
                 for cx in range(r.start.x, r.end.x + 1):
                     for cy in range(r.start.y, r.end.y + 1):
-                        rd_rt[cx][cy] = addrs + [b_off, r_off, per, start, rb_off]
+                        rd_rt[cx][cy] = addrs + [b_off, r_off, per, start, rb_off, int(gate_rows)]
                         wr_rt[cx][cy] = [out.buffer_address(), per, start]
                         cp_rt[cx][cy] = [per]
                         start += per

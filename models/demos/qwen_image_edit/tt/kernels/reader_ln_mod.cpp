@@ -21,6 +21,9 @@ void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(4);
     const uint32_t c0 = get_arg_val<uint32_t>(5);  // the apply pass's columns [c0, c1) (the whole row: 0, Wt)
     const uint32_t c1 = get_arg_val<uint32_t>(6);
+    // the tables as rows: [B or 1, W] with batch item b in row b of each table tile (else [B or 1, 1, W], one tile
+    // row per item, its row 0)
+    const uint32_t table_rows = get_arg_val<uint32_t>(7);
 
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t St = get_compile_time_arg_val(1);
@@ -52,14 +55,19 @@ void kernel_main() {
             noc.async_read_barrier();
             x.push_back(batch);
         }
-        const uint32_t tab = batched ? (i / St) * Wt : 0;
+        const uint32_t item = batched ? i / St : 0;
+        const uint32_t tab = table_rows ? 0 : item * Wt;
+        // the item's row within the table tile: faces (2 * (r / 16) + f), face row r % 16
+        const uint32_t r = table_rows ? item : 0;
+        const uint32_t src0 = (r / 16) * 2 * face_bytes + (r % 16) * row_bytes;
         for (uint32_t wt = c0; wt < c1; ++wt) {
             ss.reserve_back(2);
-            // only row 0 of a table tile is read by the ROW broadcast: faces 0 and 1's first rows
+            // one row of a table tile is all the ROW broadcast reads: it lands in row 0 (faces 0 and 1's first rows)
             for (uint32_t f = 0; f < 2; ++f) {
                 const uint32_t o = f * face_bytes;
-                noc.async_read(scs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = o}, {.offset_bytes = o});
-                noc.async_read(shs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = o}, {.offset_bytes = page + o});
+                noc.async_read(scs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = src0 + o}, {.offset_bytes = o});
+                noc.async_read(
+                    shs, ss, row_bytes, {.page_id = tab + wt, .offset_bytes = src0 + o}, {.offset_bytes = page + o});
             }
             noc.async_read_barrier();
             ss.push_back(2);
