@@ -294,6 +294,8 @@ class TtQwenImageEditPipeline:
         ), self._hook(
             _dit_stack, "SUMSQ", row_sumsq if self.weight_lane_split else None
         ), self._hook(
+            _te_attention, "LANE_STACK_FIDELITY", ttnn.MathFidelity.HiFi3
+        ), self._hook(
             _te_attention, "LANE_KSTACK", lanes_ttl.lanes8_stacked if self.lane_split else None
         ), self._hook(
             _dit_ccl, "_CHUNK_BYTES", 128 * 1024 * 1024
