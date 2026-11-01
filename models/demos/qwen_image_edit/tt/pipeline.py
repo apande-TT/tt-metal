@@ -231,17 +231,28 @@ class TtQwenImageEditPipeline:
                 stack.enter_context(self._hook(_te_attention, name, fn))
             yield
 
+    @contextlib.contextmanager
+    def _encoder_extras(self):
+        """The denoiser's exact-linear levers for the text encoder's stages too: the guard bound's row sums of squares
+        in one C++ pass (row_sumsq) and the weight-side lanes as one K-stacked product (repeat_k)."""
+        with self._hook(_te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None), self._hook(
+            _te_attention, "LANE_STACK", repeat_k if self.weight_lane_split else None
+        ):
+            yield
+
     def vision_encode(self, up):
         # (the attention P @ V products' exact lanes on V's rows: the C++ weight-lane split of the smaller operand)
         # (and the merged rows' unpermutation as an exact row gather, not one-hot products)
         with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._hook(
             _vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None
-        ), self._hook(_te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None), self._fused_tail():
+        ), self._hook(
+            _te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None
+        ), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
-        with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail():
+        with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
