@@ -370,6 +370,9 @@ LANE_STACK = None
 # along K as one tensor, -lead), or None. With LANE_STACK repeating b's lead 8x along K, the 8 lane products run as
 # ONE product (K' = 8K) whose float32 output accumulates them.
 LANE_KSTACK = None
+# Take the weight-side K-stack only when it moves fewer bytes: the 8x input copy is ~32 M K bytes written + read,
+# the 8 float32 lane outputs and their sums ~64 M N -- so K <= LANE_STACK_MAX_K_PER_N * N (0 = always).
+LANE_STACK_MAX_K_PER_N = 0
 # Math fidelity of the K-stacked weight-lane products (HiFi4: each lane's bf16 x bf16 tile products exact).
 LANE_STACK_FIDELITY = ttnn.MathFidelity.HiFi4
 _ROW_LANE_MASKS = {}
@@ -412,7 +415,9 @@ def _weight_lane_sums(lead, ws):
     if split is not None and any(lanes is None for lanes in split):
         split = None
         cache = None
-    if LANE_STACK is not None and split is not None:
+    n_all = sum(w.shape[-1] for w in ws)
+    fits = not LANE_STACK_MAX_K_PER_N or lead.shape[-1] <= LANE_STACK_MAX_K_PER_N * n_all
+    if LANE_STACK is not None and split is not None and fits:
         stacks = []
         for i, w in enumerate(ws):
             got = None if cache is None else cache.get(("stack", id(w)))

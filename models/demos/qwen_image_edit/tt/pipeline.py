@@ -312,6 +312,8 @@ class TtQwenImageEditPipeline:
         ), self._hook(
             _te_attention, "LANE_KSTACK", lanes_ttl.lanes8_stacked if self.lane_split else None
         ), self._hook(
+            _te_attention, "LANE_STACK_MAX_K_PER_N", 4
+        ), self._hook(
             _dit_ccl, "_CHUNK_BYTES", 128 * 1024 * 1024
         ), self._hook(
             _te_attention, "B_LIMB_L1_MIN_BATCH", 16
