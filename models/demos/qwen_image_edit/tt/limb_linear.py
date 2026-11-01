@@ -41,6 +41,7 @@ def fused_limb_linear(
     long_groups=False,
     chunk_tiles=32,
     heads_out=None,
+    full_dest=False,
 ):
     """hi, lo: bf16 TILE [..., M, K] limbs; w: bf16 TILE [K, N]. -> float32 [..., M, N] = hi @ w + lo @ w in `mem`,
     or None when the shapes do not fit the kernel (the caller then runs the stock matmuls). wide_groups=False: a
@@ -53,7 +54,8 @@ def fused_limb_linear(
     paired (typed float32 [..., M, K], each 4 KB page bf16 tile t of hi then of lo, as ln_rows packed writes them).
     chunk_tiles: weight tiles per multicast chunk (each chunk is one sender / receivers handshake).
     heads_out: (q, k, v, row_off) -- head-major float32 [B, H, J, D] tensors and this projection's first joint row: the
-    output's [q | k | v] column blocks (N = 3 H D) are written there (rows from row_off) and q is returned."""
+    output's [q | k | v] column blocks (N = 3 H D) are written there (rows from row_off) and q is returned. full_dest:
+    DEST in full-sync mode (8 float32 tiles): output blocks twice as wide, fewer weight chunks per K pass."""
     packed = lo is None
     paired = packed and hi.dtype == ttnn.float32
     if packed:
@@ -86,17 +88,18 @@ def fused_limb_linear(
         # round-robin over its gw x rect_rows cores
         return max((r for r in range(1, grid.y) if (rows // mb) % (r * gw) == 0), default=0)
 
+    dest_tiles = 2 * _DEST_TILES if full_dest else _DEST_TILES
     groups = cols if wide_groups and k_t < n_t and n_t % cols == 0 else 1
     if long_groups and groups == 1:
         # most compute cores, then groups whose columns are a whole number of full DEST blocks, then most senders
         # (a group of an odd column count runs one-tile blocks: worth it only when it occupies more cores)
-        full = _DEST_TILES // (2 * mb)
+        full = dest_tiles // (2 * mb)
         groups = max(
             (g for g in range(1, cols + 1) if cols % g == 0 and n_t % g == 0),
             key=lambda g: (g * _rect_rows(cols // g) * (cols // g), (n_t // g) % full == 0, g),
         )
     gw, n_g = cols // groups, n_t // groups  # grid columns and output column tiles per group
-    nb = _largest_divisor(n_g, _DEST_TILES // (2 * mb))  # hi and lo accumulate in their own DEST tiles
+    nb = _largest_divisor(n_g, dest_tiles // (2 * mb))  # hi and lo accumulate in their own DEST tiles
     kc = _largest_divisor(k_t, max(1, chunk_tiles // nb))  # chunk_tiles x 2 KB weight chunks (3 slots in cb 1)
     rect_rows = _rect_rows(gw)
     if rect_rows == 0:
@@ -171,6 +174,7 @@ def fused_limb_linear(
     cfg.math_fidelity = fidelity
     cfg.fp32_dest_acc_en = True
     cfg.math_approx_mode = False
+    cfg.dst_full_sync_en = full_dest
     if bias_rows is not None:
         modes = [ttnn.UnpackToDestMode.Default] * 32
         modes[2] = ttnn.UnpackToDestMode.UnpackToDestFp32  # the bias tiles unpacked to DEST as float32

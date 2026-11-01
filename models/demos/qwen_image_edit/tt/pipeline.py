@@ -277,7 +277,7 @@ class QwenImageEditTT:
         # down) per-grid-column groups measured 2x slower for the same work (512 x 1536 x 3072: 8.5 vs FF up's 4.1 ms)
         # in up to 256 KB weight chunks: a quarter of the sender / receivers handshakes of 64 KB ones
         _tr_precise.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(
-            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False, chunk_tiles=128
+            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False, chunk_tiles=128, full_dest=True
         )
         # and a column-parallel one's float32 bias added in that same pass (no separate bias add over the output)
         _tr_precise.LIMB_LINEAR_BIAS_FN = lambda hi, lo, w, bias_rows: fused_limb_linear(
@@ -289,6 +289,7 @@ class QwenImageEditTT:
             bias_rows=bias_rows,
             chunk_tiles=128,
             heads_out=_tr_precise.HEADS_OUT,
+            full_dest=True,  # 8 float32 DEST tiles: 4-column output blocks
         )
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
