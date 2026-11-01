@@ -180,7 +180,7 @@ class TtQwenJointAttention:
         x = ttnn.reshape(x, (B, S, self.local_heads, self.head_dim))
         return ttnn.permute(x, (0, 2, 1, 3))
 
-    def _rms(self, x, w):  # float32, elementwise on SFPU
+    def _rms(self, x, w, l1_out=False):  # float32, elementwise on SFPU
         if QK_NORM_L1:  # the same ops, x * x and x * r staged in L1 (freed as soon as they are read)
             l1 = ttnn.L1_MEMORY_CONFIG
             xx = ttnn.multiply(x, x, memory_config=l1)
@@ -188,7 +188,9 @@ class TtQwenJointAttention:
             ttnn.deallocate(xx)
             r = ttnn.rsqrt(ttnn.add(ms, self.eps, memory_config=l1), memory_config=l1)
             xr = ttnn.multiply(x, r, memory_config=l1)
-            out = ttnn.multiply(xr, w, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            # l1_out (QK_ROPE_L1, a caller that hands it straight to _rope): the normalised q / k in L1 too
+            out_mem = l1 if l1_out and QK_ROPE_L1 else ttnn.DRAM_MEMORY_CONFIG
+            out = ttnn.multiply(xr, w, memory_config=out_mem)
             ttnn.deallocate(xr)
             return out
         ms = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
@@ -208,6 +210,17 @@ class TtQwenJointAttention:
             if QK_NORM_L1:  # the halves and their swap in L1, freed once read
                 ttnn.deallocate(x1)
                 ttnn.deallocate(x2)
+                if QK_ROPE_L1 and x.memory_config().buffer_type == ttnn.BufferType.L1:
+                    # x (the L1 normalised q / k) and both products in L1 too; only the result goes to DRAM
+                    l1 = ttnn.L1_MEMORY_CONFIG
+                    xc = ttnn.multiply(x, cc, memory_config=l1)
+                    ttnn.deallocate(x)
+                    sws = ttnn.multiply(sw, ss, memory_config=l1)
+                    ttnn.deallocate(sw)
+                    out = ttnn.add(xc, sws, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                    ttnn.deallocate(xc)
+                    ttnn.deallocate(sws)
+                    return out
                 xc = ttnn.multiply(x, cc)
                 sws = ttnn.multiply(sw, ss)
                 ttnn.deallocate(sw)
@@ -417,8 +430,9 @@ class TtQwenJointAttention:
                 )
             else:
                 q, k, v = self._heads(y), self._heads(y, n), self._heads(y, 2 * n)
-            q = self._rope(self._rms(q, wq), fj)
-            k = self._rope(self._rms(k, wk), fj)
+            l1n = fj is not None  # the normalised q / k go straight to the rope: they may stay in L1
+            q = self._rope(self._rms(q, wq, l1_out=l1n), fj)
+            k = self._rope(self._rms(k, wk, l1_out=l1n), fj)
             if vdt != ttnn.float32:
                 v = ttnn.typecast(v, vdt)
             if y is not None:
@@ -542,6 +556,8 @@ def _rope_tables(freqs, half):
 SOFTMAX_L1 = False
 # the q / k RMSNorm's x * x and x * r and the RoPE's halves and their swap in L1 (False: DRAM)
 QK_NORM_L1 = False
+# with QK_NORM_L1, also the normalised q / k and the RoPE's two products in L1 (only the roped q / k in DRAM)
+QK_ROPE_L1 = False
 # the attention softmax (mask add .. divide) as one bit-identical kernel: f(s, mask_add or None, mem) -> p
 SOFTMAX_FN = None
 # SOFTMAX_FN(..., split_mem=) -> (p, (hi, lo)): the probabilities' bf16 limbs for the precise P @ V made in the
