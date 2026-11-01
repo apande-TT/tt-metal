@@ -138,11 +138,14 @@ class _TtBlock:
         if not (MODULATE_FN is not None and MODULATE_SPLIT and _precise.ENABLED and SKIP_SAME_CAST):
             return None
         scale1 = ttnn.add(scale, 1.0)
+        kw = {"packed": True} if GATHER_PACKED else {}
         if x.dim == 0 and int(shift.shape[0]) > 1:  # a slice of the batch items: their own modulation rows
-            # (a [B, dim] table is first made [B, 1, dim]: its items share one tile row, which cannot be split)
-            scale1 = ttnn.mesh_partition(_t3(scale1), dim=0, cluster_axis=x.axis)
-            shift = ttnn.mesh_partition(_t3(shift), dim=0, cluster_axis=x.axis)
-        r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True, **({"packed": True} if GATHER_PACKED else {}))
+            if len(shift.shape) == 2:  # whole [B, dim] tables, each device reading its own items' rows
+                kw["batch_split"] = (int(x.shape[0]) // int(x.t.shape[0]), x.axis)
+            else:
+                scale1 = ttnn.mesh_partition(scale1, dim=0, cluster_axis=x.axis)
+                shift = ttnn.mesh_partition(shift, dim=0, cluster_axis=x.axis)
+        r = MODULATE_FN(x.t, scale1, shift, self.eps, split=True, **kw)
         if r is None:
             return None
         y, limbs = r
