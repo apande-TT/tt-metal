@@ -156,6 +156,8 @@ class TtQwenTextEncoder:
         _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(
             hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, fidelity=ttnn.MathFidelity.HiFi3,  # both limbs' products at HiFi3
             long_groups=True,  # columns split over parallel senders so the rows' cores fill the grid
+            chunk_tiles=128,  # in weight chunks of up to 256 KB (fewer sender / receivers handshakes)
+            full_dest=True,  # with 8 float32 DEST tiles: 4-column output blocks
         )
         # the two-limb linears it declines (LM MLP down: K = 4736) take their lower-limb product at HiFi3
         _te_attention.LO_FIDELITY = ttnn.MathFidelity.HiFi3
