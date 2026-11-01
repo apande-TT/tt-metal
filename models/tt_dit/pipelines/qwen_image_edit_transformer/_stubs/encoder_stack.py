@@ -34,6 +34,21 @@ from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs.feed_forward imp
 # Optional fused kernel for the LayerNorm variance: SUMSQ(xc) -> sum(xc * xc, dim=-1, keepdim=True) in float32 from one
 # read of xc, or None for a tensor it does not take.
 SUMSQ = None
+# Optional fused kernel for the modulated LayerNorm's tail: MODULATE(xc, r, s, h) -> ((xc * r) * s) + h with
+# r = 1/std across a tile [B, S, 32] and s = 1 + scale, h = shift down a tile [B, 32, D]; None for shapes it does not
+# take. One pass instead of the multiply, multiply, add passes over the [B, S, D] float32 stream.
+MODULATE = None
+_ONES = {}
+
+
+def _ones(device):
+    """(ones [1, 32], ones [32, 1]) float32, built once per device (no host upload inside an observed forward)."""
+    if id(device) not in _ONES:
+        _ONES[id(device)] = (
+            ttnn.Tensor([1.0] * 32, [1, 32], ttnn.float32, ttnn.TILE_LAYOUT, device),
+            ttnn.Tensor([1.0] * 32, [32, 1], ttnn.float32, ttnn.TILE_LAYOUT, device),
+        )
+    return _ONES[id(device)]
 
 
 def _is_mesh(device):
@@ -113,6 +128,23 @@ class _TtBlock:
         return ttnn.multiply(xc, ttnn.rsqrt(ttnn.add(var, self.eps)))
 
     def _modulate(self, x, shift, scale):
+        if MODULATE is not None and len(x.shape) == 3:
+            mu = ttnn.mean(x, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+            xc = ttnn.subtract(x, mu)
+            ss = None if SUMSQ is None else SUMSQ(xc)
+            if ss is not None:
+                var = ttnn.multiply(ss, 1.0 / xc.shape[-1])
+            else:
+                var = ttnn.mean(ttnn.multiply(xc, xc), dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+            ones_r, ones_c = _ones(x.device())
+            r = ttnn.multiply(ttnn.rsqrt(ttnn.add(var, self.eps)), ones_r)  # [B, S, 32]
+            s = ttnn.multiply(ttnn.add(scale, 1.0), ones_c)  # [B, 32, D]
+            h = ttnn.multiply(shift, ones_c)  # [B, 32, D]
+            y = MODULATE(xc, r, s, h)
+            for t in (xc, r, s, h):
+                ttnn.deallocate(t)
+            if y is not None:
+                return y
         return ttnn.add(ttnn.multiply(self._ln(x), ttnn.add(scale, 1.0)), shift)
 
     def __call__(self, img, txt, silu_temb, rotary, mask):

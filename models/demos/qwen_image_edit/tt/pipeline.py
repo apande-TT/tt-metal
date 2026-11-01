@@ -30,6 +30,7 @@ from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
     guard_tail,
     head_split,
+    modulate_tail,
     repeat_k,
     row_gather,
     row_sumsq,
@@ -293,6 +294,8 @@ class TtQwenImageEditPipeline:
             _te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None
         ), self._hook(
             _dit_stack, "SUMSQ", row_sumsq if self.weight_lane_split else None
+        ), self._hook(
+            _dit_stack, "MODULATE", modulate_tail if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "LANE_STACK_FIDELITY", ttnn.MathFidelity.HiFi3
         ), self._hook(

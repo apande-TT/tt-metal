@@ -746,3 +746,81 @@ def row_sumsq(t):
     ]
     ttnn.generic_op([t, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
     return y
+
+
+_MOD_READER = f"{_DIR}/modulate_reader.cpp"
+_MOD_COMPUTE = f"{_DIR}/modulate_compute.cpp"
+
+
+def modulate_tail(xc, r, s, h):
+    """((xc * r) * s) + h for a centred float32 tile tensor xc [B, S, D], with r [B, S, 32] (each row's 1/std across a
+    tile), s and h [B, 32, D] (each sample's (1 + scale) / shift down a tile): the modulated LayerNorm's three
+    broadcast passes in one, bit-identical. Consumes nothing (the caller frees). None for shapes it does not take."""
+    if len(xc.shape) != 3 or not _plain(xc, list(xc.shape)):
+        return None
+    ps = list(xc.padded_shape)
+    b, st, ct = ps[0], ps[1] // TILE, ps[2] // TILE
+    if list(r.padded_shape) != [b, ps[1], TILE] or list(s.padded_shape) != [b, TILE, ps[2]]:
+        return None
+    if list(h.padded_shape) != [b, TILE, ps[2]] or any(t.dtype != ttnn.float32 for t in (r, s, h)):
+        return None
+    n_tiles = b * st * ct
+    y = ttnn.empty_like(xc)
+    grid = xc.device().compute_with_storage_grid_size()
+    work = _cores(grid, n_tiles)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb(index):
+        return ttnn.CBDescriptor(
+            total_size=2 * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+
+    cbs = [cb(0), cb(1), cb(2), cb(3), cb(_OUT_CB)]
+    rd, cp, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    addrs = [t.buffer_address() for t in (xc, r, s, h)]
+    for c, start, count in work:
+        rd[c.x][c.y] = addrs + [count, start]
+        cp[c.x][c.y] = [count]
+        wr[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
+    )
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    for k in range(4):
+        unpack[k] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    reader_cta = []
+    for t in (xc, r, s, h):
+        reader_cta.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_MOD_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=reader_cta + [ct, st],
+            runtime_args=rd,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_MOD_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[],
+            runtime_args=cp,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=wr,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([xc, r, s, h, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return y
