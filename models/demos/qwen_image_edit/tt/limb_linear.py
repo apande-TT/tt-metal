@@ -143,7 +143,8 @@ def fused_limb_linear(
     ]
     if bias_rows is not None:
         cbs.append(_cb(2, ttnn.float32, 4096, 2 * nb))
-    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_cores, initial_value=0) for i in (0, 1)]
+    # 0, 2, 3: per-slot weight credits (receivers -> sender); 1: delivered-chunk count (sender -> receivers)
+    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_cores, initial_value=0) for i in (0, 1, 2, 3)]
     rd_rt, wr_rt, sd_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     for g, sender in enumerate(senders):
         x0 = g * gw
@@ -188,7 +189,7 @@ def fused_limb_linear(
             kernel_source=os.path.join(_KERNELS, "reader_limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=compute_cores,
-            compile_time_args=rd_ct + [0, 1],
+            compile_time_args=rd_ct + [0, 1, 2, 3],
             runtime_args=rd_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -213,7 +214,7 @@ def fused_limb_linear(
             kernel_source=os.path.join(_KERNELS, "sender_limb_linear.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=sender_cores,
-            compile_time_args=sd_ct + [0, 1],
+            compile_time_args=sd_ct + [0, 1, 2, 3],
             runtime_args=sd_rt,
             # NOC 0: the multicast rectangle runs from its (start) to its (end) corner
             config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),

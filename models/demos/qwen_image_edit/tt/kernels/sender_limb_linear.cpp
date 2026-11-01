@@ -36,6 +36,8 @@ void kernel_main() {
     constexpr auto w_args = TensorAccessorArgs<7>();
     constexpr uint32_t sender_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset());
     constexpr uint32_t receiver_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset() + 1);
+    constexpr uint32_t slot1_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset() + 2);
+    constexpr uint32_t slot2_sem_id = get_compile_time_arg_val(w_args.next_compile_time_args_offset() + 3);
 
     constexpr uint32_t cb_w = 1;
     const uint32_t page = get_local_cb_interface(cb_w).fifo_page_size;
@@ -46,9 +48,12 @@ void kernel_main() {
     Noc noc;
     DataflowBuffer dw(cb_w);
     const uint32_t base = dw.get_write_ptr();
-    Semaphore<> sender_sem(sender_sem_id);
     Semaphore<> receiver_sem(receiver_sem_id);
-    receiver_sem.set(VALID);  // the local value multicast to the receivers once a chunk has landed
+    // credits, one counter per slot: each receiver grants slot s once per use, and only after it has received the
+    // slot's previous chunk (which went out once every receiver had granted that use), so slot s's counter reaches
+    // num_dests * (use + 1) exactly when every receiver has freed it; the count of delivered chunks (receiver_sem,
+    // local copy) is multicast after each chunk
+    Semaphore<> credit[3] = {Semaphore<>(sender_sem_id), Semaphore<>(slot1_sem_id), Semaphore<>(slot2_sem_id)};
 
     // three staging slots, the receivers' cb 1 three chunks deep: chunk i + 1 is read from DRAM into the slot whose
     // multicast (chunk i - 2) has left L1 while chunk i waits for the receivers and is multicast
@@ -74,8 +79,7 @@ void kernel_main() {
         if (i + 1 < total) {
             read_chunk(i + 1);  // into chunk i - 2's slot
         }
-        sender_sem.wait(num_dests);  // every receiver has freed the slot chunk i goes to
-        sender_sem.set(0);
+        credit[i % slots].wait_min(num_dests * (i / slots + 1));  // every receiver has freed chunk i's slot
         const uint32_t addr = base + (i % slots) * chunk_bytes;
         const MulticastEndpoint mcast_dst;
         noc.async_write_multicast(
@@ -89,7 +93,14 @@ void kernel_main() {
 #ifdef ARCH_BLACKHOLE
         noc.async_writes_flushed();
 #endif
+        receiver_sem.set(i + 1);  // the previous count's multicast has left L1 (write barrier above)
         receiver_sem.set_multicast(noc, x_start, y_start, x_end, y_end, num_dests);
     }
     noc.async_write_barrier();
+    // every credit has arrived (the last wait counted them all) and every count has left: leave both semaphores at
+    // 0 for the next program on these cores (a cached program's semaphores keep their last values)
+    for (auto& c : credit) {
+        c.set(0);
+    }
+    receiver_sem.set(0);
 }
