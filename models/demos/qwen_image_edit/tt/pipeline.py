@@ -239,6 +239,7 @@ class QwenImageEditTT:
         _tr_attention.JOINT_HEADS_DIRECT = True  # and the q/k/v limb linears write those heads themselves (no copy)
         _tr_attention.SOFTMAX_L1 = True  # the softmax's float32 logits in L1, subtract / exp in place
         _tr_attention.QK_NORM_L1 = True  # the q / k norm and RoPE intermediates in L1
+        _tr_attention.QK_ROPE_L1 = True  # and the normalised q / k and the RoPE products as well
         _tr_attention.SOFTMAX_FN = fused_softmax_rows  # and the whole softmax as one bit-identical C++ kernel
         # (SOFTMAX_SPLIT, P's bf16 limbs written by the softmax: -6 ms/step and one clean 50-step PCC run, but the
         # same fused fp32/bf16 limb tail hung the e2e PCC run twice in variants -- left off)
