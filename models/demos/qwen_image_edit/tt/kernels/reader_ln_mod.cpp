@@ -24,6 +24,7 @@ void kernel_main() {
     // the tables as rows: [B or 1, W] with batch item b in row b of each table tile (else [B or 1, 1, W], one tile
     // row per item, its row 0)
     const uint32_t table_rows = get_arg_val<uint32_t>(7);
+    const uint32_t item_off = get_arg_val<uint32_t>(8);  // table item of this device's first batch item
 
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t St = get_compile_time_arg_val(1);
@@ -55,7 +56,7 @@ void kernel_main() {
             noc.async_read_barrier();
             x.push_back(batch);
         }
-        const uint32_t item = batched ? i / St : 0;
+        const uint32_t item = batched ? i / St + item_off : 0;
         const uint32_t tab = table_rows ? 0 : item * Wt;
         // the item's row within the table tile: faces (2 * (r / 16) + f), face row r % 16
         const uint32_t r = table_rows ? item : 0;

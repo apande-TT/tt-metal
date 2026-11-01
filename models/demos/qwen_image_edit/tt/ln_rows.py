@@ -26,13 +26,15 @@ def _f32_bits(v):
     return int(np.array([v], dtype=np.float32).view(np.uint32)[0])
 
 
-def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False):
+def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False, batch_split=None):
     """x [B, S, W] float32 TILE (interleaved, S and W tile multiples), scale1 = 1 + scale and shift [B or 1, 1, W]
     (or [B or 1, W], B <= 32: item b in row b) float32 TILE -> LN(x) * scale1 + shift, bit-identical to the ttnn chain; None when the shapes do not fit.
     split: -> (y, (hi, lo)) with y's bf16 limbs as limb_split.fused_split_bf16 makes them (DRAM), and y itself
     allocated but NOT written -- for a caller whose only use of y is that split. packed (with split): the limbs paired
     in one tensor typed float32 [B, S, W] whose 4 KB page t holds bf16 tile t of hi then of lo -> (y, paired) (moved
-    by a collective in whole 4 KB pages; fused_limb_linear reads it with lo None)."""
+    by a collective in whole 4 KB pages; fused_limb_linear reads it with lo None). batch_split: (n, cluster_axis) when x
+    is each device's B batch items of a stream split over n devices along that mesh axis and the [B * n, W] row
+    tables are whole: device k reads items k * B + b (one program per device, no table partition)."""
     ts = (x, scale1, shift)
     if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
@@ -44,7 +46,10 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
     # tables [B or 1, 1, W] (item b in its own tile row) or [B or 1, W] (item b in row b of one tile row)
     table_rows = len(scale1.shape) == 2
     sB = int(scale1.shape[0])
-    if sB not in (1, B) or int(scale1.shape[-1]) != W or (not table_rows and int(scale1.shape[1]) != 1):
+    n_split = batch_split[0] if batch_split is not None else 1
+    if batch_split is not None and (not table_rows or sB != B * n_split):
+        return None
+    if sB not in (1, B, B * n_split) or int(scale1.shape[-1]) != W or (not table_rows and int(scale1.shape[1]) != 1):
         return None
     if table_rows and sB > 32:
         return None
@@ -86,29 +91,33 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
         )
         for i, pages, fmt in cb_list
     ]
-    rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [x.buffer_address(), scale1.buffer_address(), shift.buffer_address()]
-    start = 0
     cw = Wt // parts  # columns per part
-    for group, per in ((group1, per1), (group2, per2)):
-        for r in group.ranges():
-            for cx in range(r.start.x, r.end.x + 1):
-                for cy in range(r.start.y, r.end.y + 1):
-                    if parts == 1:  # rows [start, start + per), every column
-                        row, n, c0, c1 = start, per, 0, Wt
-                    else:  # one (row, part) unit: row start // parts, columns of part start % parts
-                        row, n = start // parts, 1
-                        c0 = (start % parts) * cw
-                        c1 = c0 + cw
-                    t0, nt = row * Wt + c0, n * (c1 - c0)
-                    rd_rt[cx][cy] = addrs + [n, row, c0, c1, int(table_rows)]
-                    wr_rt[cx][cy] = (
-                        [hi.buffer_address(), lo.buffer_address(), nt, t0, 0xFFFFFFFF if packed else 0]
-                        if split
-                        else [out.buffer_address(), nt, t0]
-                    )
-                    cp_rt[cx][cy] = [n, c0, c1]
-                    start += per
+
+    def runtime_args(item_off):  # item_off: the table item of this device's first batch item
+        rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        start = 0
+        for group, per in ((group1, per1), (group2, per2)):
+            for r in group.ranges():
+                for cx in range(r.start.x, r.end.x + 1):
+                    for cy in range(r.start.y, r.end.y + 1):
+                        if parts == 1:  # rows [start, start + per), every column
+                            row, n, c0, c1 = start, per, 0, Wt
+                        else:  # one (row, part) unit: row start // parts, columns of part start % parts
+                            row, n = start // parts, 1
+                            c0 = (start % parts) * cw
+                            c1 = c0 + cw
+                        t0, nt = row * Wt + c0, n * (c1 - c0)
+                        rd_rt[cx][cy] = addrs + [n, row, c0, c1, int(table_rows), item_off]
+                        wr_rt[cx][cy] = (
+                            [hi.buffer_address(), lo.buffer_address(), nt, t0, 0xFFFFFFFF if packed else 0]
+                            if split
+                            else [out.buffer_address(), nt, t0]
+                        )
+                        cp_rt[cx][cy] = [n, c0, c1]
+                        start += per
+        return rd_rt, wr_rt, cp_rt
+
     # as binary_ng / unary / the accurate float32 reduce: float32 inputs unpacked to DEST, float32 DEST, precise SFPU
     cfg = ttnn.ComputeConfigDescriptor()
     cfg.math_fidelity = ttnn.MathFidelity.HiFi4
@@ -118,38 +127,51 @@ def fused_ln_modulate(x, scale1, shift, eps, mem=None, split=False, packed=False
     for i in (0, 1, 2, 3, 25):
         modes[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
-    kernels = [
-        ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "reader_ln_mod.cpp"),
-            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-            core_ranges=cores,
-            compile_time_args=reader_ct,
-            runtime_args=rd_rt,
-            config=ttnn.ReaderConfigDescriptor(),
-        ),
-        ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "writer_two_outputs.cpp") if split else os.path.join(_TT_METAL, _WRITER),
-            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-            core_ranges=cores,
-            compile_time_args=(
-                list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
-                + list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
-                if split
-                else [16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+    def kernels(rd_rt, wr_rt, cp_rt):
+        return [
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "reader_ln_mod.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=reader_ct,
+                runtime_args=rd_rt,
+                config=ttnn.ReaderConfigDescriptor(),
             ),
-            runtime_args=wr_rt,
-            config=ttnn.WriterConfigDescriptor(),
-        ),
-        ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "ln_modulate.cpp"),
-            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-            core_ranges=cores,
-            compile_time_args=[Wt, _f32_bits(1.0 / W), _f32_bits(eps), 1 if split else 0],
-            runtime_args=cp_rt,
-            config=cfg,
-        ),
-    ]
-    prog = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "writer_two_outputs.cpp") if split else os.path.join(_TT_METAL, _WRITER),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=(
+                    list(ttnn.TensorAccessorArgs(hi).get_compile_time_args())
+                    + list(ttnn.TensorAccessorArgs(lo).get_compile_time_args())
+                    if split
+                    else [16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+                ),
+                runtime_args=wr_rt,
+                config=ttnn.WriterConfigDescriptor(),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "ln_modulate.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=[Wt, _f32_bits(1.0 / W), _f32_bits(eps), 1 if split else 0],
+                runtime_args=cp_rt,
+                config=cfg,
+            ),
+        ]
+    def program(item_off):
+        return ttnn.ProgramDescriptor(kernels=kernels(*runtime_args(item_off)), semaphores=[], cbs=cbs)
+
+    if batch_split is None:
+        prog = program(0)
+    else:  # one program per device along the split axis: device k's items start at table item k * B
+        ax = batch_split[1]
+        rows_m, cols_m = (int(v) for v in tuple(device.shape))
+        prog = ttnn.MeshProgramDescriptor()
+        for k in range(rows_m if ax == 0 else cols_m):
+            lo_c = ttnn.MeshCoordinate(k, 0) if ax == 0 else ttnn.MeshCoordinate(0, k)
+            hi_c = ttnn.MeshCoordinate(k, cols_m - 1) if ax == 0 else ttnn.MeshCoordinate(rows_m - 1, k)
+            prog[ttnn.MeshCoordinateRange(lo_c, hi_c)] = program(k * B)
     if split:
         ttnn.generic_op([x, scale1, shift, hi] + ([] if packed else [lo]), prog)
         return out, (hi if packed else (hi, lo))
