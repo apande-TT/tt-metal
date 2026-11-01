@@ -410,7 +410,9 @@ def _block_config(x, w):
         return None
     m_t, k_t, n_t = m // TILE, ws[-2] // TILE, ws[-1] // TILE
     rows, cols = (grid.x, grid.y) if LINEAR_BLOCK_TRANSPOSE else (grid.y, grid.x)
-    even = lambda v: v + (v % 2)  # noqa: E731
+    # rounded up to even only past one tile: a single-tile-row share would otherwise double to two and leave half
+    # the grid rows idle (the LM MLP down on its 8 suffix tile rows: 32 of 64 cores)
+    even = lambda v: v + (v % 2) if v > 1 else v  # noqa: E731
     per_m, per_n = even(-(-m_t // rows)), even(-(-n_t // cols))
     best = None
     for out_h in _divisors(per_m):
