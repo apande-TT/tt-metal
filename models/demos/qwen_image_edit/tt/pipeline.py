@@ -226,6 +226,7 @@ class QwenImageEditTT:
 
         _tr_attention.HEADS_INPUT_L1 = True  # the head split reads its input from L1
         _tr_attention.HEADS_BY_SLICES = True  # heads in/out by per-head slices, not a padded permute
+        _tr_attention.MERGE_L1 = True  # the merge's per-head slices in L1
         # the image and text queries as one joint query block: one exact QK^T / softmax / P @ V per attention
         _tr_attention.JOINT_QUERIES = True
         # with the two streams' fused q/k/v outputs joined as [txt; img] rows first: one head split, norm and rope
