@@ -359,8 +359,16 @@ class TtQwenJointAttention:
             return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
         if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
             D = self.head_dim
-            parts = [ttnn.slice(o, (0, h, 0, 0), (B, h + 1, Sq, D)) for h in range(self.local_heads)]
-            o = parts[0] if len(parts) == 1 else ttnn.concat(parts, dim=-1)
+            l1 = MERGE_L1 and self.local_heads > 1  # the per-head slices in L1, freed once concatenated
+            kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
+            parts = [ttnn.slice(o, (0, h, 0, 0), (B, h + 1, Sq, D), **kw) for h in range(self.local_heads)]
+            if len(parts) == 1:
+                o = parts[0]
+            else:
+                o = ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                if l1:
+                    for t in parts:
+                        ttnn.deallocate(t)
             return ttnn.reshape(o, (B, Sq, self.local_heads * D))
         o = ttnn.permute(o, (0, 2, 1, 3))
         return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
@@ -531,6 +539,8 @@ JOINT_HEADS_FN = None
 # outputs, then JOINT_HEADS_FN or a join + head split)
 JOINT_HEADS_DIRECT = False
 NLP_MERGE = False
+# HEADS_BY_SLICES merge: the per-head slices in L1 (the concat still writes DRAM)
+MERGE_L1 = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
 ROPE_SWAP = False
