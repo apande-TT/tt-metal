@@ -327,6 +327,7 @@ class QwenImageEditTT:
         _tr_stack.MODULATE_FN = fused_ln_modulate
         _tr_stack.MODULATE_SPLIT = True  # writing its bf16 limbs (the q/k/v and FF-up inputs) instead of float32
         _tr_stack.TABLE_ROWS = True  # the modulation tables as [B, dim] rows the kernels index (no reshape per table)
+        _tr_stack.MOD_GATHER_L1 = True  # with the modulation's gather in L1 while its tables are sliced out
         _tr_stack.GATHER_PACKED = True  # a sliced stream's limbs stacked in one tensor: one all_gather, not two
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
 
