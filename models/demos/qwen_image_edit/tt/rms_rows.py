@@ -31,8 +31,9 @@ def _f32_bits(v):
 
 
 def fused_rms_norm(x, w, eps, mem=None):
-    """x [..., S, W] float32 TILE (interleaved, W a multiple of 32), w [1, W] float32 TILE
-    -> (x * rsqrt(mean(x * x, -1) + eps)) * w, bit-identical to the ttnn op chain."""
+    """x [..., S, W] float32 TILE (interleaved, W a multiple of 32), w [1, W] float32 TILE (or a per-row
+    [1, 1, S, W] table, broadcast over x's leading dims) -> (x * rsqrt(mean(x * x, -1) + eps)) * w, bit-identical
+    to the ttnn op chain."""
     assert x.dtype == ttnn.float32 and x.layout == ttnn.TILE_LAYOUT, "float32 TILE x"
     assert w.dtype == ttnn.float32 and w.layout == ttnn.TILE_LAYOUT, "float32 TILE w"
     W = int(x.shape[-1])
@@ -42,6 +43,10 @@ def fused_rms_norm(x, w, eps, mem=None):
     for d in x.padded_shape:
         vol *= int(d)
     rows = vol // 1024 // Wt
+    # a per-row weight: its tile rows, the w tile of x's tile row r being r % w_rows (0: one [1, W] row)
+    w_rows = int(w.padded_shape[-2]) // 32 if len(w.shape) == 4 and int(w.shape[-2]) > 1 else 0
+    if w_rows:
+        assert list(w.shape)[-2:] == list(x.shape)[-2:] and int(x.padded_shape[-2]) == int(x.shape[-2]), "per-row w"
     mem = mem or ttnn.DRAM_MEMORY_CONFIG
     device = x.device()
     rs = ttnn.allocate_tensor_on_device(
@@ -61,11 +66,11 @@ def fused_rms_norm(x, w, eps, mem=None):
     return ttnn.generic_op(
         [x, rs, w, out],
         _program(device, rows * Wt, out, [(0, 2), (1, 2), (2, 2), (16, 2)], [Wt, 1, 1] + accessors, addrs,
-                 "rms_apply.cpp", [Wt], with_start=True),
+                 "rms_apply.cpp", [Wt, 1 if w_rows else 0], with_start=True, reader_extra=[w_rows]),
     )
 
 
-def _program(device, work, out, pages, reader_ct, addrs, compute, compute_ct, with_start):
+def _program(device, work, out, pages, reader_ct, addrs, compute, compute_ct, with_start, reader_extra=()):
     """reader_rms_rows.cpp + the stock tile writer of `out` + `compute`, over `work` units (tile rows or tiles)
     split across the grid; every unit makes one output tile."""
     grid = device.compute_with_storage_grid_size()
@@ -86,7 +91,7 @@ def _program(device, work, out, pages, reader_ct, addrs, compute, compute_ct, wi
         for r in group.ranges():
             for x in range(r.start.x, r.end.x + 1):
                 for y in range(r.start.y, r.end.y + 1):
-                    rd_rt[x][y] = addrs + [per, start]
+                    rd_rt[x][y] = addrs + [per, start] + list(reader_extra)
                     wr_rt[x][y] = [out.buffer_address(), per, start]
                     cp_rt[x][y] = [per, start] if with_start else [per]
                     start += per

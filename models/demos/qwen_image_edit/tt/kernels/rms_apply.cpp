@@ -9,6 +9,8 @@
 // t stays in DEST instead of a float32 tensor. rs (column 0 valid) is the row scale of rms_scale.cpp, one tile
 // per tile row; w (row 0 valid) the [1, W] float32 weight, tile t % Wt. Tiles arrive in order: x, w per output
 // tile, and rs whenever the output tile starts a new tile row.
+// row_w: w is a per-row [1, 1, S, W] table instead (broadcast over the leading dims only): its tile is multiplied
+// as is (copy_tile + mul_binary_tile, the stock binary_ng's same-shape float32 SFPU multiply), no row broadcast.
 
 #include <cstdint>
 
@@ -32,6 +34,7 @@ void kernel_main() {
     const uint32_t start_tile = get_arg_val<uint32_t>(1);
 
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
+    constexpr bool row_w = get_compile_time_arg_val(1) != 0;
 
     CircularBuffer x(cb_x);
     CircularBuffer rs(cb_rs);
@@ -57,8 +60,13 @@ void kernel_main() {
         copy_tile(cb_x, 0, 0);
         mul_binary_tile_init();
         mul_binary_tile(0, 1, 0);
-        unary_bcast_init<ckernel::BroadcastType::ROW>(cb_w);
-        unary_bcast<ckernel::BroadcastType::ROW>(cb_w, 0, 1);
+        if constexpr (row_w) {
+            copy_init(cb_w);
+            copy_tile(cb_w, 0, 1);
+        } else {
+            unary_bcast_init<ckernel::BroadcastType::ROW>(cb_w);
+            unary_bcast<ckernel::BroadcastType::ROW>(cb_w, 0, 1);
+        }
         mul_binary_tile_init();
         mul_binary_tile(0, 1, 0);
         tile_regs_commit();

@@ -51,6 +51,7 @@ from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, en
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
+from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
@@ -163,6 +164,22 @@ def _limb_linear_config(x, w):
     return grid if grid is not None and int(x.shape[-2]) // 32 < grid.y else None
 
 
+def _qk_rms(x, w, eps, mem):
+    """The transformer's q / k RMSNorm through rms_rows.fused_rms_norm (bit-identical to its six-op chain) where
+    the shapes fit: float32 TILE interleaved x [B, H, S, D] (D tile aligned, S unpadded) and w [1, 1, 1, D] or a
+    per-row [1, 1, S, D] table; None otherwise (the caller runs the chain)."""
+    if len(x.shape) != 4 or len(w.shape) != 4 or x.is_sharded() or w.is_sharded():
+        return None
+    if any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT for t in (x, w)):
+        return None
+    D, S = int(x.shape[-1]), int(x.shape[-2])
+    if D % 32 or int(x.padded_shape[-1]) != D or list(w.shape)[:2] != [1, 1] or int(w.shape[-1]) != D:
+        return None
+    if int(w.shape[-2]) != 1 and (int(w.shape[-2]) != S or S % 32 or int(x.padded_shape[-2]) != S):
+        return None
+    return fused_rms_norm(x, w, eps, mem)
+
+
 class QwenImageEditTT:
     """Resident TT pipeline. Build with build_pipeline()."""
 
@@ -235,6 +252,7 @@ class QwenImageEditTT:
         _tr_attention.JOINT_HEADS = True
         _tr_attention.ROPE_SWAP = True  # rope as x * [cos | cos] + swap(x) * [-sin | sin] on cached tables
         _tr_attention.ROPE_FN = fused_rope  # as one C++ kernel (no halves, swap or products written)
+        _tr_attention.RMS_FN = _qk_rms  # and the q / k RMSNorm as the two rms_rows C++ programs
         _tr_attention.NLP_SPLIT = True  # the joint q/k/v heads split by one nlp_create_qkv_heads tile copy
         # and q / k / v each written head-major straight from the two streams' projections by one C++ copy program
         # (joint_heads.fused_joint_heads), with no [txt; img] join

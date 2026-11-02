@@ -7,7 +7,9 @@
 //     `batch` tiles (batch divides Wt).
 //   mode 1 (rms_apply.cpp): for each output tile t of this core, rs tile t / Wt when t starts a new tile row
 //     (or is the first), then x tile t and w tile t % Wt, one barrier per output tile.
-// Runtime args: x, rs, w addresses, the tile row / tile count and the first one.
+// Runtime args: x, rs, w addresses, the tile row / tile count and the first one, and (mode 1) w_rows: 0 for a
+// [1, W] weight (tile t % Wt), else the tile rows St of a per-row [1, 1, S, W] weight (tile (t / Wt % St) * Wt +
+// t % Wt).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -52,6 +54,7 @@ void kernel_main() {
         const auto ws = TensorAccessor(w_args, w_addr);
         DataflowBuffer rs(cb_rs);
         DataflowBuffer w(cb_w);
+        const uint32_t w_rows = get_arg_val<uint32_t>(5);
         uint32_t row = 0xFFFFFFFF;
         for (uint32_t t = start; t < start + num; ++t) {
             if (t / Wt != row) {
@@ -64,7 +67,8 @@ void kernel_main() {
             x.reserve_back(1);
             w.reserve_back(1);
             noc.async_read(xs, x, page, {.page_id = t}, {.offset_bytes = 0});
-            noc.async_read(ws, w, page, {.page_id = t % Wt}, {.offset_bytes = 0});
+            const uint32_t w_tile = w_rows ? (t / Wt % w_rows) * Wt + t % Wt : t % Wt;
+            noc.async_read(ws, w, page, {.page_id = w_tile}, {.offset_bytes = 0});
             noc.async_read_barrier();
             x.push_back(1);
             w.push_back(1);
