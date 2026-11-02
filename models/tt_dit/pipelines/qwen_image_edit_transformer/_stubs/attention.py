@@ -181,6 +181,11 @@ class TtQwenJointAttention:
         return ttnn.permute(x, (0, 2, 1, 3))
 
     def _rms(self, x, w, l1_out=False):  # float32, elementwise on SFPU
+        if RMS_FN is not None:  # the same chain in one call (None where it does not take the shapes)
+            l1 = QK_NORM_L1 and l1_out and QK_ROPE_L1
+            out = RMS_FN(x, w, self.eps, ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG)
+            if out is not None:
+                return out
         if QK_NORM_L1:  # the same ops, x * x and x * r staged in L1 (freed as soon as they are read)
             l1 = ttnn.L1_MEMORY_CONFIG
             xx = ttnn.multiply(x, x, memory_config=l1)
@@ -550,6 +555,9 @@ MERGE_L1 = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
 ROPE_SWAP = False
+# fn(x, w, eps, mem) -> the q / k RMSNorm (x * rsqrt(mean(x * x, -1) + eps)) * w in one call (w [1, 1, 1, D] or a
+# per-row [1, 1, S, D] table), or None where it does not take the shapes (None: the stock chain)
+RMS_FN = None
 # with ROPE_SWAP: fn(x, [cos | cos], [sin | sin], mem) -> x * [cos | cos] + rotate_half(x) * [sin | sin] in one pass
 # (e.g. rope_rows.fused_rope: -x2 * sin is x2 * -sin exactly), or None where it does not take the shapes
 ROPE_FN = None
