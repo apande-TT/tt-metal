@@ -26,6 +26,10 @@ _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 
 
+# where the [.., 1] row scale between the two programs lives (one float32 tile per tile row; freed after the apply)
+RS_MEMORY_CONFIG = ttnn.DRAM_MEMORY_CONFIG
+
+
 def _f32_bits(v):
     return int(np.array([v], dtype=np.float32).view(np.uint32)[0])
 
@@ -50,7 +54,7 @@ def fused_rms_norm(x, w, eps, mem=None):
     mem = mem or ttnn.DRAM_MEMORY_CONFIG
     device = x.device()
     rs = ttnn.allocate_tensor_on_device(
-        ttnn.Shape(list(x.shape)[:-1] + [1]), ttnn.float32, ttnn.TILE_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
+        ttnn.Shape(list(x.shape)[:-1] + [1]), ttnn.float32, ttnn.TILE_LAYOUT, device, RS_MEMORY_CONFIG
     )
     out = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
     batch = next(b for b in (4, 2, 1) if Wt % b == 0)
@@ -63,11 +67,13 @@ def fused_rms_norm(x, w, eps, mem=None):
         _program(device, rows, rs, [(0, 2 * batch), (16, 2)], [Wt, 0, batch] + accessors, addrs,
                  "rms_scale.cpp", [Wt, _f32_bits(1.0 / W), _f32_bits(eps)], with_start=False),
     )
-    return ttnn.generic_op(
+    out = ttnn.generic_op(
         [x, rs, w, out],
         _program(device, rows * Wt, out, [(0, 2), (1, 2), (2, 2), (16, 2)], [Wt, 1, 1] + accessors, addrs,
                  "rms_apply.cpp", [Wt, 1 if w_rows else 0], with_start=True, reader_extra=[w_rows]),
     )
+    ttnn.deallocate(rs)
+    return out
 
 
 def _program(device, work, out, pages, reader_ct, addrs, compute, compute_ct, with_start, reader_extra=()):
