@@ -43,6 +43,25 @@ from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMS
 # the precise attention moves heads in and out of the fused projections by per-head slices + concat
 # instead of reshape + permute (which pads the head count to a tile in the permuted layout)
 HEADS_BY_SLICES = False
+# with HEADS_BY_SLICES: the per-head slices of a head split / merge in L1 (freed once concatenated into DRAM) when
+# together they take at most this many bytes (0: DRAM)
+HEADS_L1_BYTES = 0
+
+
+def _concat_heads(parts, dim):
+    """concat of per-head slices into DRAM; L1 slices are freed once read."""
+    out = ttnn.concat(parts, dim=dim, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    for t in parts:
+        if t.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(t)
+    return out
+
+
+def _heads_kw(n, nbytes):
+    l1 = n > 1 and HEADS_L1_BYTES and nbytes <= HEADS_L1_BYTES
+    return {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
+
+
 # MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
 # (the split hook's optional output memory config; freed after both products. 0: in x's memory)
 MLP_LIMBS_L1_BYTES = 0
@@ -214,8 +233,11 @@ class TtTextAttention:
 
         def _heads(lo, n):
             if HEADS_BY_SLICES:  # one tile-aligned column block per head, stacked on dim 1 (no padded permute)
-                parts = [ttnn.slice(qkv, [0, 0, 0, (lo + h) * D], [b, 1, s_pad, (lo + h + 1) * D]) for h in range(n)]
-                return parts[0] if n == 1 else ttnn.concat(parts, dim=1)
+                kw = _heads_kw(n, b * s_pad * n * D * 4)
+                parts = [
+                    ttnn.slice(qkv, [0, 0, 0, (lo + h) * D], [b, 1, s_pad, (lo + h + 1) * D], **kw) for h in range(n)
+                ]
+                return parts[0] if n == 1 else _concat_heads(parts, 1)
             t = ttnn.slice(qkv, [0, 0, 0, lo * D], [b, 1, s_pad, (lo + n) * D])
             t = ttnn.reshape(t, (b, s_pad, n, D))
             return ttnn.permute(t, (0, 2, 1, 3))
@@ -256,7 +278,8 @@ class TtTextAttention:
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
-            o = ttnn.concat([ttnn.slice(o, [0, h, 0, 0], [b, h + 1, s_pad, D]) for h in range(hl)], dim=-1)
+            kw = _heads_kw(hl, b * s_pad * hl * D * 4)
+            o = _concat_heads([ttnn.slice(o, [0, h, 0, 0], [b, h + 1, s_pad, D], **kw) for h in range(hl)], -1)
         else:
             o = ttnn.permute(o, (0, 2, 1, 3))
             o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
