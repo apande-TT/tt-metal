@@ -22,7 +22,11 @@ tensor parallelism -- no sharding/collective needed here.
 from __future__ import annotations
 
 import ttnn
-from models.common.rmsnorm import RMSNorm  # kept per ADAPT requirement
+
+try:
+    from models.common.rmsnorm import RMSNorm  # kept per ADAPT requirement
+except ImportError:  # models/common/rmsnorm pulls in models.tt_transformers, absent from the serving image
+    RMSNorm = None
 
 
 class TtNemotronHRMSNorm:
@@ -109,7 +113,8 @@ class TtNemotronHRMSNorm:
         if shape[-2] == 32 and all(v == 1 for v in shape[:-2]) and W % 32 == 0:  # decode: one tile row
             mem, pc = self._row_shard(W)
             xs = ttnn.to_memory_config(hs, mem)
-            ttnn.deallocate(hs)
+            if hs is not hidden_states:  # the caller's tensor stays the caller's
+                ttnn.deallocate(hs)
             out = ttnn.rms_norm(
                 xs,
                 weight=self._w,
@@ -122,7 +127,8 @@ class TtNemotronHRMSNorm:
             out = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
         else:
             out = ttnn.rms_norm(hs, weight=self._w, epsilon=self.eps, compute_kernel_config=self.ckc)
-            ttnn.deallocate(hs)
+            if hs is not hidden_states:
+                ttnn.deallocate(hs)
         return out if dtype == ttnn.float32 else ttnn.typecast(out, dtype)
 
 

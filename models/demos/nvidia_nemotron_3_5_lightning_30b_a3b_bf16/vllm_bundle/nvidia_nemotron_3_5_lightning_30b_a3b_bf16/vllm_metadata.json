@@ -2,7 +2,17 @@
   "arch": "NemotronHForCausalLM",
   "main_class": "adapter:TTNemotronHForCausalLM",
   "weights": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
-  "note": "Single-sequence generator over the demo pipeline; serve with --max-num-seqs 1 --max-model-len 128 and MESH_DEVICE=\"(2, 2)\".",
-  "max_num_seqs": 1,
-  "max_model_len": 128
+  "note": "Generator over tt/serve.py, up to 32 concurrent sequences (one device row per request: its own Mamba state and K/V cache); serve with --max-num-seqs 32 --max-model-len 2048 --max-num-batched-tokens 4096, --additional-config '{\"tt\": {\"sample_on_device_mode\": \"decode_only\"}}' (decode tokens sampled on the chip) and MESH_DEVICE=\"(1, 4)\".",
+  "max_num_seqs": 32,
+  "max_model_len": 2048,
+  "additional_config": {
+    "tt": {
+      "sample_on_device_mode": "decode_only",
+      "trace_region_size": 200000000
+    }
+  },
+  "serve_args": [
+    "--max-num-batched-tokens",
+    "4096"
+  ]
 }

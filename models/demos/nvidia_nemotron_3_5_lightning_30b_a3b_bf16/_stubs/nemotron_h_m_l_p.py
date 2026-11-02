@@ -21,7 +21,11 @@ its input by the same halves, then all_reduce the partial sums).
 from __future__ import annotations
 
 import ttnn
-from models.tt_transformers.tt.mlp import MLP  # kept per ADAPT requirement
+
+try:
+    from models.tt_transformers.tt.mlp import MLP  # kept per ADAPT requirement
+except ImportError:  # the canonical class is documentation for this stub, not a runtime dependency;
+    MLP = None  # the serving image ships only this demo + models/common
 
 
 class TtNemotronHMLP:

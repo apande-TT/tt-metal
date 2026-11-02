@@ -52,7 +52,11 @@ import torch
 
 import ttnn
 from models.demos.nvidia_nemotron_3_5_lightning_30b_a3b_bf16._stubs import _dram_mm, _ssm_cache
-from models.tt_transformers.tt.attention import Attention  # kept per ADAPT requirement
+
+try:
+    from models.tt_transformers.tt.attention import Attention  # kept per ADAPT requirement
+except ImportError:  # the canonical class is documentation for this stub, not a runtime dependency;
+    Attention = None  # the serving image ships only this demo + models/common
 
 
 class TtNemotronHAttention:

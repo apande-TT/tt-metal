@@ -424,6 +424,22 @@ class TtNemotronHLayer:
 # --------------------------------------------------------------------------- #
 #  the pipeline
 # --------------------------------------------------------------------------- #
+# transformers renamed NemotronH's block types between releases (5.12: mamba / attention / moe;
+# 5.17: linear_attention / full_attention / moe). The stubs are keyed to the older spelling, so
+# normalize whatever the installed transformers reports before anything branches on it.
+_BLOCK_TYPE_ALIASES = {
+    "linear_attention": "mamba",
+    "mamba2": "mamba",
+    "full_attention": "attention",
+    "self_attention": "attention",
+}
+
+
+def _canonical_block_type(bt) -> str:
+    bt = str(bt).lower()
+    return _BLOCK_TYPE_ALIASES.get(bt, bt)
+
+
 def _assign_variants(block_types):
     """Map each block index to a layer variant, for ANY depth.
 
@@ -467,7 +483,7 @@ class NemotronHPipeline:
         hf_blocks = list(model.model.layers)
         if layers is not None:
             hf_blocks = hf_blocks[:layers]
-        self.block_types = [b.block_type for b in hf_blocks]
+        self.block_types = [_canonical_block_type(b.block_type) for b in hf_blocks]
         self.variants = _assign_variants(self.block_types)
 
         # ---- the repeated stack: a plain list of same-typed elements ------- #

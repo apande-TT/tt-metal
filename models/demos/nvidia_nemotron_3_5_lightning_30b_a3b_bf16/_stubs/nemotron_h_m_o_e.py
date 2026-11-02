@@ -46,7 +46,11 @@ from __future__ import annotations
 import torch
 
 import ttnn
-from models.tt_transformers.tt.mixtral_moe import TtMoeLayer  # kept per ADAPT requirement
+
+try:
+    from models.tt_transformers.tt.mixtral_moe import TtMoeLayer  # kept per ADAPT requirement
+except ImportError:  # the canonical class is documentation for this stub, not a runtime dependency;
+    TtMoeLayer = None  # the serving image ships only this demo + models/common
 
 
 class TtNemotronHMOE:
@@ -201,11 +205,15 @@ class TtNemotronHMOE:
         hs_bf = ttnn.typecast(hs, ttnn.bfloat16)
         out = None
         for e in range(E):
-            up = ttnn.matmul(hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (B,T,inter) bf16
+            up = ttnn.matmul(
+                hs_bf, self._up[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid
+            )  # (B,T,inter) bf16
             act = ttnn.relu(up)
             ttnn.deallocate(up)
             act = ttnn.multiply(act, act)  # relu2
-            down = ttnn.matmul(act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid)  # (B,T,hidden) bf16
+            down = ttnn.matmul(
+                act, self._down[e], compute_kernel_config=self._expert_ckc, core_grid=self._core_grid
+            )  # (B,T,hidden) bf16
             ttnn.deallocate(act)
             down_f = ttnn.typecast(down, ttnn.float32)
             ttnn.deallocate(down)
