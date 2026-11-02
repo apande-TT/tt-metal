@@ -159,10 +159,17 @@ def _a2a_sum(y, n, cluster_axis):
     if A2A_FOLD and A2A_SUM_FN is not None and part[0] > 1 and shape[2] % 32 == 0:
         rows = [1, 1, part[0] * shape[2], shape[3]]  # device j's items j * B / n .. stay rows of block j
         g = _a2a(ttnn.reshape(y, [n] + rows[1:]), cluster_axis)
-        out = A2A_SUM_FN(ttnn.reshape(g, [n] + rows[1:]), n, rows, ttnn.DRAM_MEMORY_CONFIG)
+        l1 = A2A_L1_BYTES and math.prod(rows) * 4 <= A2A_L1_BYTES  # the local sum in L1 for the all_gather
+        out = A2A_SUM_FN(
+            ttnn.reshape(g, [n] + rows[1:]), n, rows, ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
+        )
         ttnn.deallocate(g)
-        out = ttnn.reshape(out, part)
-        return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear)
+        s = ttnn.reshape(out, part)
+        kw = {"memory_config": ttnn.DRAM_MEMORY_CONFIG} if l1 else {}
+        res = ttnn.all_gather(s, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear, **kw)
+        if l1:
+            ttnn.deallocate(out)
+        return res
     g = _a2a(y, cluster_axis)
     if A2A_SUM_FN is not None and part[0] == 1:
         # [1, n, S, C] -> [n, 1, S, C] moves only leading dims: block i stays source i's partial
