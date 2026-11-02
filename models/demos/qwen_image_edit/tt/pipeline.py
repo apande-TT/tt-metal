@@ -51,6 +51,7 @@ from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, en
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
+from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
@@ -233,6 +234,7 @@ class QwenImageEditTT:
         # over the joint rows instead of per stream + the q/k/v joins
         _tr_attention.JOINT_HEADS = True
         _tr_attention.ROPE_SWAP = True  # rope as x * [cos | cos] + swap(x) * [-sin | sin] on cached tables
+        _tr_attention.ROPE_FN = fused_rope  # as one C++ kernel (no halves, swap or products written)
         _tr_attention.NLP_SPLIT = True  # the joint q/k/v heads split by one nlp_create_qkv_heads tile copy
         # and q / k / v each written head-major straight from the two streams' projections by one C++ copy program
         # (joint_heads.fused_joint_heads), with no [txt; img] join
