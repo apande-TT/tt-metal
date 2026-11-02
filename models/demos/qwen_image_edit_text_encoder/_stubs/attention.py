@@ -139,12 +139,16 @@ A2A_L1_BYTES = 0
 # with A2A_SUM_FN and several batch items per device: fold each device's B / n items into its rows before the
 # all_to_all ([n, 1, (B / n) * S, C]) so every source's partial arrives as one contiguous block for the fused sum
 A2A_FOLD = False
+# the folded all_to_all's received partials in L1 up to this many bytes (0: A2A_L1_BYTES)
+A2A_FOLD_L1_BYTES = 0
 
 
-def _a2a(y, cluster_axis):
-    """all_to_all of the reduce: split out_dim 0, stack the sources along in_dim 1 (L1 per A2A_L1_BYTES)."""
+def _a2a(y, cluster_axis, l1_bytes=None):
+    """all_to_all of the reduce: split out_dim 0, stack the sources along in_dim 1 (L1 per A2A_L1_BYTES, or
+    l1_bytes)."""
     kw = {}
-    if A2A_L1_BYTES and math.prod(list(y.shape)) * 4 <= A2A_L1_BYTES:
+    l1_bytes = A2A_L1_BYTES if l1_bytes is None else l1_bytes
+    if l1_bytes and math.prod(list(y.shape)) * 4 <= l1_bytes:
         kw["memory_config"] = ttnn.L1_MEMORY_CONFIG
     return ttnn.experimental.all_to_all_async_generic(
         y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear, **kw
@@ -158,7 +162,7 @@ def _a2a_sum(y, n, cluster_axis):
     part = [shape[0] // n, 1] + shape[2:]
     if A2A_FOLD and A2A_SUM_FN is not None and part[0] > 1 and shape[2] % 32 == 0:
         rows = [1, 1, part[0] * shape[2], shape[3]]  # device j's items j * B / n .. stay rows of block j
-        g = _a2a(ttnn.reshape(y, [n] + rows[1:]), cluster_axis)
+        g = _a2a(ttnn.reshape(y, [n] + rows[1:]), cluster_axis, max(A2A_L1_BYTES, A2A_FOLD_L1_BYTES))
         l1 = A2A_L1_BYTES and math.prod(rows) * 4 <= A2A_L1_BYTES  # the local sum in L1 for the all_gather
         out = A2A_SUM_FN(
             ttnn.reshape(g, [n] + rows[1:]), n, rows, ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
