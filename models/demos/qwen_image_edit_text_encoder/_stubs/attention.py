@@ -134,15 +134,25 @@ A2A_REDUCE = False
 # fn(g, n, part, memory_config) -> the sum of g's n leading-dim blocks of shape `part` in source order (e.g. one
 # fused kernel), used when each device keeps one batch item (the blocks are then contiguous); None: slices + adds
 A2A_SUM_FN = None
+# the all_to_all reduce's received partials in L1 when y takes at most this many bytes (0: DRAM)
+A2A_L1_BYTES = 0
+
+
+def _a2a(y, cluster_axis):
+    """all_to_all of the reduce: split out_dim 0, stack the sources along in_dim 1 (L1 per A2A_L1_BYTES)."""
+    kw = {}
+    if A2A_L1_BYTES and math.prod(list(y.shape)) * 4 <= A2A_L1_BYTES:
+        kw["memory_config"] = ttnn.L1_MEMORY_CONFIG
+    return ttnn.experimental.all_to_all_async_generic(
+        y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear, **kw
+    )
 
 
 def _a2a_sum(y, n, cluster_axis):
     """y [B, 1, S, C] with B % n == 0. The all_to_all splits out_dim 0 over the devices and stacks the
     sources along in_dim 1: [B / n, n, S, C], block i = source device i's partial of this device's batch."""
     shape = list(y.shape)
-    g = ttnn.experimental.all_to_all_async_generic(
-        y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear
-    )
+    g = _a2a(y, cluster_axis)
     part = [shape[0] // n, 1] + shape[2:]
     if A2A_SUM_FN is not None and part[0] == 1:
         # [1, n, S, C] -> [n, 1, S, C] moves only leading dims: block i stays source i's partial
@@ -174,9 +184,7 @@ def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1):
         return None
     if list(residual.shape) != shape or residual.dtype != ttnn.float32 or y.dtype != ttnn.float32:
         return None
-    g = ttnn.experimental.all_to_all_async_generic(
-        y, in_dim=1, out_dim=0, cluster_axis=cluster_axis, topology=ttnn.Topology.Linear
-    )
+    g = _a2a(y, cluster_axis)
     part = [1, 1] + shape[2:]
     blocks = ttnn.reshape(g, [n, 1] + shape[2:])  # block i = source i's partial of this device's batch item
     r3 = ttnn.reshape(residual, [shape[0]] + shape[2:])
