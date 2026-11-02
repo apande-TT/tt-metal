@@ -82,13 +82,15 @@ def host_side_uploads():
 
 class StepState:
     """Per-forward inputs shared by every layer: the mode, the RoPE rows for the positions being
-    processed, and (decode) each user's current position."""
+    processed, (decode) each user's current position, and (prefill) the cache row each of the batch's
+    served prompts fills, prompt b into user slots[b] (None: the prompt is every user's)."""
 
-    def __init__(self, mode, cos=None, sin=None, cur_pos=None):
+    def __init__(self, mode, cos=None, sin=None, cur_pos=None, slots=None):
         self.mode = mode
         self.cos = cos
         self.sin = sin
         self.cur_pos = cur_pos
+        self.slots = slots
 
 
 # ------------------------------------------------------------------------------------------- small stubs
@@ -178,7 +180,9 @@ class Router(TtKolibri1Router):
         rows = x.shape[-2]
         if rows % ttnn.TILE_SIZE or rows > 1024:
             return super().__call__(x, **kwargs)
-        pc = wide_k_config(self.device, rows // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE)
+        pc = wide_k_config(
+            self.device, rows // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.w.shape[-1] // ttnn.TILE_SIZE
+        )
         return ttnn.linear(x, self.w, dtype=ttnn.float32, program_config=pc, compute_kernel_config=self.cfg)
 
 
@@ -225,7 +229,11 @@ class SharedExpert(TtKolibri1MLP):
         the MoE block adds to its routed partial so ONE all_reduce sums both."""
         INVOCATIONS["m_l_p"] += 1
         rows = x.shape[-2]
-        pc = wide_k_config(self.device, rows // 32, x.shape[-1] // 32, self.w_gu.shape[-1] // 32) if rows < 2048 else None
+        pc = (
+            wide_k_config(self.device, rows // 32, x.shape[-1] // 32, self.w_gu.shape[-1] // 32)
+            if rows < 2048
+            else None
+        )
         gu = ttnn.linear(x, self.w_gu, program_config=pc, compute_kernel_config=self.mm_cfg)
         n = gu.shape[-1] // 2
         g = ttnn.slice(gu, [0, 0, 0, 0], [1, 1, rows, n])
@@ -282,7 +290,12 @@ class FinalNorm(TtKolibri1RMSNorm):
         smem, pc = self._shard[rows]
         xs = ttnn.to_memory_config(x, smem)
         n = ttnn.rms_norm(
-            xs, epsilon=self.eps, weight=self.weight, program_config=pc, memory_config=smem, compute_kernel_config=self.cfg
+            xs,
+            epsilon=self.eps,
+            weight=self.weight,
+            program_config=pc,
+            memory_config=smem,
+            compute_kernel_config=self.cfg,
         )
         ttnn.deallocate(xs)
         out = ttnn.to_memory_config(n, DRAM)
@@ -624,7 +637,9 @@ class Attention(TtKolibri1Attention):
         B, n = xqkv.shape[-2], xqkv.shape[-1]
         w, nt = self.head_dim // ttnn.TILE_SIZE, n // ttnn.TILE_SIZE
         heads = self.n_local_heads + 2 * self.n_local_kv
-        out = ttnn.empty([1, 1, B, n], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM)
+        out = ttnn.empty(
+            [1, 1, B, n], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
+        )
         units = [(tr, h) for tr in range(B // ttnn.TILE_SIZE) for h in range(heads)]
         g = self.device.compute_with_storage_grid_size()
         xy = [(i % g.x, i // g.x) for i in range(len(units))]
@@ -635,7 +650,15 @@ class Attention(TtKolibri1Attention):
         for (tr, h), (cx, cy) in zip(units, xy):
             kind = 0 if h < self.n_local_heads + self.n_local_kv else 1
             wt = self.qk_w[0 if h < self.n_local_heads else 1]
-            reader_rt[cx][cy] = [xqkv.buffer_address(), wt.buffer_address(), cs.buffer_address(), sn.buffer_address(), kind, tr, h * w]
+            reader_rt[cx][cy] = [
+                xqkv.buffer_address(),
+                wt.buffer_address(),
+                cs.buffer_address(),
+                sn.buffer_address(),
+                kind,
+                tr,
+                h * w,
+            ]
             compute_rt[cx][cy] = [kind]
             writer_rt[cx][cy] = [out.buffer_address(), tr, h * w]
         bf, f32 = 2048, 4096
@@ -661,7 +684,12 @@ class Attention(TtKolibri1Attention):
             math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
         )
         kernels = [
-            kernel("qk_prep_reader.cpp", [w, nt, rope, scaler] + acc(xqkv, self.qk_w[0], cs, sn), reader_rt, ttnn.ReaderConfigDescriptor()),
+            kernel(
+                "qk_prep_reader.cpp",
+                [w, nt, rope, scaler] + acc(xqkv, self.qk_w[0], cs, sn),
+                reader_rt,
+                ttnn.ReaderConfigDescriptor(),
+            ),
             kernel("qk_prep_compute.cpp", [w, rope, eps], compute_rt, compute_cfg),
             kernel("qk_prep_writer.cpp", [w, nt] + acc(out), writer_rt, ttnn.WriterConfigDescriptor()),
         ]
@@ -699,10 +727,46 @@ class Attention(TtKolibri1Attention):
         cb = RoutedGateUp._cb(0, ttnn.bfloat16, tile, slots, cores)
         ttnn.generic_op([src] + outs, ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
 
+    def _kv_rows(self, k, v, slots):
+        """tt/kernels/kv_rows.cpp: served prompts' K, V [N, kv_local, T, D] into the caches of users slots[b],
+        positions [0, T), as whole-tile copies over the grid; every other user's rows are left as they are.
+        ttnn's fill_cache takes one user per call (two per prompt per layer)."""
+        N, T = k.shape[0], k.shape[-2]
+        w, rt, ct = self.head_dim // ttnn.TILE_SIZE, T // ttnn.TILE_SIZE, self.capacity // ttnn.TILE_SIZE
+        total = 2 * N * self.n_local_kv * rt * w
+        g = self.device.compute_with_storage_grid_size()
+        per = -(-total // (g.x * g.y))
+        n_cores = -(-total // per)
+        xy = [(i % g.x, i // g.x) for i in range(n_cores)]
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in xy])
+        io = [k, v, self.k_cache, self.v_cache]
+        rtargs = ttnn.RuntimeArgs()
+        for i, (cx, cy) in enumerate(xy):
+            rtargs[cx][cy] = (
+                [t.buffer_address() for t in io] + [i * per, min(total, (i + 1) * per)] + [int(s) for s in slots]
+            )
+        slots_l1 = min(per, 4)
+        tile = 2 * ttnn.TILE_SIZE * ttnn.TILE_SIZE  # bf16
+        kernel = ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "kv_rows.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[N, self.n_local_kv, rt, w, ct, tile, slots_l1]
+            + [a for t in io for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=rtargs,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        cb = RoutedGateUp._cb(0, ttnn.bfloat16, tile, slots_l1, cores)
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
+
     def _split_heads(self, xqkv, B, T):
         def empty(heads):
             return ttnn.empty(
-                [B, heads, T, self.head_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=DRAM
+                [B, heads, T, self.head_dim],
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.device,
+                memory_config=DRAM,
             )
 
         q, k, v = empty(self.n_local_heads), empty(self.n_local_kv), empty(self.n_local_kv)
@@ -741,16 +805,20 @@ class Attention(TtKolibri1Attention):
         q, k, v = self._split_heads(xqkv, B, T)
         ttnn.deallocate(xqkv)
         q, k = self._qk(q, k, st)
-        flat = [1, B * self.n_local_kv, T, self.head_dim]
-        kf, vf = ttnn.reshape(k, flat), ttnn.reshape(v, flat)
-        if B < self.batch:  # one prompt shared by all users, prefilled once: its K,V go into every user's rows
-            kf = ttnn.repeat(kf, [1, self.batch // B, 1, 1])
-            vf = ttnn.repeat(vf, [1, self.batch // B, 1, 1])
-        ttnn.fill_cache(self._k_fill, kf, batch_idx=0)
-        ttnn.fill_cache(self._v_fill, vf, batch_idx=0)
-        if B < self.batch:
-            ttnn.deallocate(kf)
-            ttnn.deallocate(vf)
+        slots = getattr(st, "slots", None)
+        if slots is not None:  # served requests: each prompt's K,V go into its own user's rows only
+            self._kv_rows(k, v, slots)
+        else:
+            flat = [1, B * self.n_local_kv, T, self.head_dim]
+            kf, vf = ttnn.reshape(k, flat), ttnn.reshape(v, flat)
+            if B < self.batch:  # one prompt shared by all users, prefilled once: its K,V go into every user's rows
+                kf = ttnn.repeat(kf, [1, self.batch // B, 1, 1])
+                vf = ttnn.repeat(vf, [1, self.batch // B, 1, 1])
+            ttnn.fill_cache(self._k_fill, kf, batch_idx=0)
+            ttnn.fill_cache(self._v_fill, vf, batch_idx=0)
+            if B < self.batch:
+                ttnn.deallocate(kf)
+                ttnn.deallocate(vf)
         chunk = next(c for c in (256, 128, 64, 32) if T % c == 0 or c == 32)
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
@@ -777,7 +845,9 @@ class Attention(TtKolibri1Attention):
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         # wide K blocks (ttnn's default config for [B, 2560] x [2560, qkv] walked K in small multicast rounds, 44 us)
-        pc = wide_k_config(self.device, x.shape[-2] // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.wqkv.shape[-1] // 32)
+        pc = wide_k_config(
+            self.device, x.shape[-2] // ttnn.TILE_SIZE, x.shape[-1] // ttnn.TILE_SIZE, self.wqkv.shape[-1] // 32
+        )
         xqkv = ttnn.linear(x, self.wqkv, program_config=pc, compute_kernel_config=self.mm_cfg)
         ttnn.deallocate(x)
         xp = self._qk_prep(xqkv, st.cos, st.sin)  # q / k normed (+ RoPE) before the head split
@@ -1280,7 +1350,9 @@ class MoE(TtKolibri1SparseMoeBlock):
         s_gate = moe.shared_experts.gate_proj.dequantize(torch.float32).t()  # [hidden, inter], TP-split by columns
         s_up = moe.shared_experts.up_proj.dequantize(torch.float32).t()
         tp, k = self.shared.tp, r_w.shape[0]
-        fused = torch.cat([r_w.unsqueeze(1).expand(k, tp, -1), s_gate.reshape(k, tp, -1), s_up.reshape(k, tp, -1)], dim=2)
+        fused = torch.cat(
+            [r_w.unsqueeze(1).expand(k, tp, -1), s_gate.reshape(k, tp, -1), s_up.reshape(k, tp, -1)], dim=2
+        )
         self.n_router = r_w.shape[1]
         self.w_rgu_dec = self.shared._upload(fused.reshape(k, -1), -1)
         self.routed_gate_up = RoutedGateUp(device, self.w_gu, self.w_gu, self.n_local, self.inter, interleaved=True)
@@ -1321,7 +1393,11 @@ class MoE(TtKolibri1SparseMoeBlock):
         n, e = scores.shape[-2], scores.shape[-1]
         # L1: every core writes its rows into the same few tiles, one 64 B face row at a time
         out = ttnn.empty(
-            [1, 1, n, e], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=ttnn.L1_MEMORY_CONFIG
+            [1, 1, n, e],
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.device,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         g = self.device.compute_with_storage_grid_size()
         xy = [(i % g.x, i // g.x) for i in range(min(n, g.x * g.y))]
@@ -1374,6 +1450,11 @@ class MoE(TtKolibri1SparseMoeBlock):
             gu = ttnn.slice(fused, [0, 0, 0, nr], [1, 1, ttnn.TILE_SIZE, n_gu])
             ttnn.deallocate(fused)
             weights = self.routing_weights(None, logits)
+            row_on = getattr(self, "row_on", None)
+            if row_on is not None:  # serving: rows without a request route nowhere, so add no experts to the step
+                served = ttnn.multiply(weights, row_on)
+                ttnn.deallocate(weights)
+                weights = served
         else:
             weights = self.routing_weights(x_in if self.router_fp32_input else x)
         w = ttnn.mesh_partition(weights, dim=3, cluster_axis=self.tp_axis) if self.tp > 1 else weights
@@ -1452,7 +1533,12 @@ class DecoderLayer(TtKolibri1DecoderLayer):
         smem, pc = self._shard_cfg(rows)
         xs = ttnn.to_memory_config(x, smem)
         n = ttnn.rms_norm(
-            xs, epsilon=self.eps, weight=self.norm_w[name], program_config=pc, memory_config=smem, compute_kernel_config=self.norm_cfg
+            xs,
+            epsilon=self.eps,
+            weight=self.norm_w[name],
+            program_config=pc,
+            memory_config=smem,
+            compute_kernel_config=self.norm_cfg,
         )
         ttnn.deallocate(xs)
         out = ttnn.to_memory_config(n, mem)
@@ -1521,6 +1607,7 @@ class Sampler:
     ) -> None:
         self.device = device
         self.top_k, self.top_p, self.temperature = int(top_k), float(top_p), float(temperature)
+        self.row_prm = self.row_inv_temp = None  # serve(): each row's own rule
         self.k_pad = -(-self.top_k // 32) * 32
         mapper = ttnn.ReplicateTensorToMesh(device) if isinstance(device, ttnn.MeshDevice) else None
         # The merge and tail kernels (tt/kernels/topk_merge.cpp, sample_tail.cpp): one core per user row.
@@ -1555,6 +1642,13 @@ class Sampler:
     def sharded(self) -> bool:
         """True: __call__ takes this chip's vocab slice of the logits, not the gathered row."""
         return self.tp > 1
+
+    def serve(self, prm, inv_temp):
+        """Serving: each row samples by its own request's rule, read from resident buffers the caller rewrites in
+        place -- prm [1, 1, B, 32] fp32 (column 0: top_k, 1..self.top_k, 1 = greedy; column 1: top_p, >= 1 = no cut)
+        and inv_temp [1, 1, B, 1] fp32 (1 / temperature; 1.0 on greedy rows). The candidates stay the row's top
+        self.top_k (generation_config's top_k), so a larger or unset top_k samples among those."""
+        self.row_prm, self.row_inv_temp = prm, inv_temp
 
     def _merge(self, x, labels, groups):
         """x, labels [1, 1, B, groups * k] (each group's top k, largest first) -> the row's top k as a groups-way
@@ -1631,11 +1725,12 @@ class Sampler:
         B, k = vals.shape[-2], vals.shape[-1]
         out = ttnn.empty([1, 1, B, 1], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
         rt = ttnn.RuntimeArgs()
-        args = (e, vals, ids, u_table, col, out)
+        rows = self.row_prm is not None
+        args = (e, vals, ids, u_table, col) + ((self.row_prm,) if rows else ()) + (out,)
         for i, (cx, cy) in enumerate(self.count_xy):
             rt[cx][cy] = [t.buffer_address() for t in args] + [i]
         kernel = ttnn.KernelDescriptor(
-            kernel_source=str(_KERNELS / "sample_tail.cpp"),
+            kernel_source=str(_KERNELS / ("sample_tail_rows.cpp" if rows else "sample_tail.cpp")),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=self.count_cores,
             compile_time_args=[k // ttnn.TILE_SIZE, u_table.shape[-1] // ttnn.TILE_SIZE, self.top_p_q32]
@@ -1643,7 +1738,7 @@ class Sampler:
             runtime_args=rt,
             config=ttnn.ReaderConfigDescriptor(),
         )
-        scratch = 64 + 3 * k * 4 + 3 * 64 + k * 4 + 2 * k * 8
+        scratch = 64 + 3 * k * 4 + 3 * 64 + k * 4 + 2 * k * 8 + (64 if rows else 0)
         cb = RoutedGateUp._cb(0, ttnn.uint32, -(-scratch // 32) * 32, 1, self.count_cores)
         ttnn.generic_op(list(args), ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[cb]))
         return out
@@ -1652,7 +1747,10 @@ class Sampler:
         """logits [1, 1, B, V] fp32 (this chip's [1, 1, B, V / tp] slice when sharded), u_table [1, 1, B, C] fp32 (each
         user's uniform per position), col [1, 1, B, 1] fp32 (the position each user samples at) -> token ids [1, 1, B, 1]
         fp32 (exact integers), the same on every chip."""
-        x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
+        if self.row_inv_temp is not None:
+            x = ttnn.multiply(logits, self.row_inv_temp)
+        else:
+            x = logits if self.temperature == 1.0 else ttnn.multiply(logits, 1.0 / self.temperature)
         vals, tok_ids = self._top_k(x)
         B = vals.shape[-2]
         vmax = ttnn.slice(vals, [0, 0, 0, 0], [1, 1, B, 1])

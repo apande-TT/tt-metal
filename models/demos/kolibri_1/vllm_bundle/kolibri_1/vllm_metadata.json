@@ -2,6 +2,13 @@
   "arch": "Kolibri1ForCausalLM",
   "main_class": "adapter:TTKolibri1ForCausalLM",
   "weights": "Aleph-Alpha/Kolibri-1",
-  "note": "Single-sequence generator over the demo tt/pipeline.py; serve with --max-num-seqs 1 --max-model-len 2048 and MESH_DEVICE=\"(1, 4)\".",
-  "max_num_seqs": 1
+  "note": "Generator over the demo tt/pipeline.py, up to 32 concurrent sequences (one device row per request); serve with --max-num-seqs 32 --max-model-len 2048, --additional-config '{\"tt\": {\"sample_on_device_mode\": \"decode_only\"}}' (decode tokens sampled on the chip) and MESH_DEVICE=\"(1, 4)\".",
+  "max_num_seqs": 32,
+  "max_model_len": 2048,
+  "serve_hf_override_arch": "TTKolibri1ForCausalLM",
+  "additional_config": {
+    "tt": {
+      "sample_on_device_mode": "decode_only"
+    }
+  }
 }

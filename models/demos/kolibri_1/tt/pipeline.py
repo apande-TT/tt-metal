@@ -205,6 +205,98 @@ class KolibriPipeline:
         self._prefill_hn = hn
         return logits, tok
 
+    def prefill_rows(self, prompts, slots):
+        """Served requests' prompts, run as one batch -> prompt i's K,V in device row slots[i] only; every other
+        row's cache and the decode counters are left as they are (other requests may be mid-decode). The batch is
+        padded to its longest prompt (padding sits after each prompt, so causal attention keeps it out of every
+        real position). Returns the gathered logits [1, 1, B, V], row i at prompt i's last position (rows past
+        the prompts: copies of row 0). The caller owns the decode counters (set_decode_rows)."""
+        B, H, n = self.batch, self.hidden, len(prompts)
+        slots = [int(s) for s in slots]
+        if not 1 <= n <= B or len(slots) != n:
+            raise ValueError(f"{n} prompts for {len(slots)} slots (1..{B})")
+        if len(set(slots)) != n or not all(0 <= s < B for s in slots):
+            raise ValueError(f"slots {slots}: distinct device rows in 0..{B - 1}")
+        lens = [len(p) for p in prompts]
+        if min(lens) < 1 or max(lens) >= self.capacity:
+            raise ValueError(f"prompt lengths {min(lens)}..{max(lens)}: need 1..{self.capacity - 1}")
+        Tp = max(32, -(-max(lens) // 32) * 32)
+        rm, u32 = ttnn.ROW_MAJOR_LAYOUT, ttnn.uint32
+        ids = torch.full((n, Tp), self.settings.pad_id, dtype=torch.int32)
+        for i, p in enumerate(prompts):
+            ids[i, : lens[i]] = torch.as_tensor(list(p), dtype=torch.int32)
+        self.prompt_len, self.prefill_len = max(lens), Tp
+        self._write("prefill_ids", ids, u32, rm)
+        self._write("prefill_pos", torch.arange(Tp, dtype=torch.int32).reshape(1, Tp), u32, rm)
+        cos, sin = self._rope_rows(self.prefill_pos, [1, 1, Tp, self.head_dim])
+        st = StepState("prefill", cos, sin, slots=slots)
+        h = ttnn.typecast(ttnn.reshape(self.embed(self.prefill_ids), [n, 1, Tp, H]), ttnn.float32)
+        hn = self.norm(self._stack(h, st))
+        # Each prompt's last position: the tile-aligned 32-row block that holds it (no data reordering), all
+        # blocks read back at once, the rows picked on the host (exact) and sent back as the head's 32-row tile.
+        blocks = []
+        for i, T in enumerate(lens):
+            tr = (T - 1) // 32 * 32
+            blocks.append(ttnn.slice(hn, [i, 0, tr, 0], [i + 1, 1, tr + 32, H]))
+        cat = blocks[0] if n == 1 else ttnn.concat(blocks, dim=2)
+        host = read_host(cat).reshape(n, 32, H)
+        dtype = cat.dtype
+        for t in blocks + [cat, hn]:  # a full-range slice is its input: free only after the read
+            ttnn.deallocate(t)
+        last = host[torch.arange(n), torch.as_tensor([(T - 1) % 32 for T in lens])]
+        last = torch.cat([last, last[:1].expand(B - n, H)]).reshape(1, 1, B, H)
+        x = self._up(last, dtype)
+        local = self.head.local(x)
+        ttnn.deallocate(x)
+        logits = self.head.gather(local)
+        if logits is not local:
+            ttnn.deallocate(local)
+        return logits
+
+    def serve_rows(self):
+        """Serving: decode's MoE routes only the rows marked in the resident `row_on` [1, 1, B, 1] (1.0 / 0.0, set by
+        set_decode_rows), so a row without a request adds no experts to the step. Call before the decode programs
+        are compiled or captured."""
+        self._write("row_on", torch.ones((1, 1, self.batch, 1)), ttnn.float32)
+        for layer in self.layers:
+            layer.moe.row_on = self.row_on
+        s, B = self.settings, self.batch
+        self.set_sampling([s.top_k] * B, [s.top_p] * B, [1.0 / s.temperature] * B)
+        self.sampler.serve(self.samp_prm, self.samp_inv_t)
+
+    def set_sampling(self, top_k, top_p, inv_temp):
+        """Each device row's sampling rule ([B] host values, see Sampler.serve), written IN PLACE into the resident
+        buffers the serving sampler reads."""
+        B = self.batch
+        prm = torch.zeros((1, 1, B, 32), dtype=torch.float32)
+        prm[0, 0, :, 0] = torch.as_tensor(top_k, dtype=torch.float32)
+        prm[0, 0, :, 1] = torch.as_tensor(top_p, dtype=torch.float32)
+        self._write("samp_prm", prm, ttnn.float32)
+        self._write("samp_inv_t", torch.as_tensor(inv_temp, dtype=torch.float32).reshape(1, 1, B, 1), ttnn.float32)
+
+    def set_uniforms(self, table):
+        """Every row's uniform per position ([B, C] host, C = the KV capacity) into the resident u_table the
+        sampler reads at each row's position."""
+        self._write("u_table", torch.as_tensor(table, dtype=torch.float32).reshape(1, 1, self.batch, -1), ttnn.float32)
+
+    def set_decode_rows(self, tokens, positions=None, active=None):
+        """Each device row's next input token and (when given) its position and whether it serves a request ([B]
+        host values), written IN PLACE into the resident buffers the decode step (and its captured trace) reads.
+        Without positions the device's own counters stand (each decode step advances every row by one); without
+        tokens, the ids the last sampled step left on device."""
+        B = self.batch
+        rm, u32 = ttnn.ROW_MAJOR_LAYOUT, ttnn.uint32
+        if tokens is not None:
+            self._write("tok_u32", torch.as_tensor(tokens, dtype=torch.int32).reshape(1, B), u32, rm)
+        if active is not None:
+            self._write("row_on", torch.as_tensor(active, dtype=torch.float32).reshape(1, 1, B, 1), ttnn.float32)
+        if positions is None:
+            return
+        pos = torch.as_tensor(positions, dtype=torch.int32).reshape(B)
+        self._write("cur_pos", pos, ttnn.int32, rm)
+        self._write("pos_u32", pos.reshape(1, B), u32, rm)
+        self._write("pos_col", pos.float().reshape(1, 1, B, 1), ttnn.float32)
+
     @property
     def prefill_hidden(self):
         """Every user's final-norm prefill state [B, 1, Tp, H] (the shared prompt's, one copy per user)."""
@@ -222,6 +314,21 @@ class KolibriPipeline:
         ttnn.plus_one(self.pos_u32)
         ttnn.copy(ttnn.add(self.pos_col, 1.0), self.pos_col)
         return logits, tok
+
+    def decode_tokens(self):
+        """decode_forward without the logits: each row's token is sampled from this chip's vocab slice and only
+        the ids [1, 1, B, 1] fp32 leave the step (the full logits are never gathered)."""
+        B, H = self.batch, self.hidden
+        cos, sin = self._rope_rows(self.pos_u32, [1, 1, B, self.head_dim])
+        st = StepState("decode", cos, sin, self.cur_pos)
+        h = ttnn.typecast(ttnn.reshape(self.embed(self.tok_u32), [1, 1, B, H]), ttnn.float32)
+        local = self.head.local(self.norm(self._stack(h, st)))
+        tok = self.sampler(local if self.sampler.sharded else self.head.gather(local), self.u_table, self.pos_col)
+        self._commit(tok)
+        ttnn.plus_one(self.cur_pos)
+        ttnn.plus_one(self.pos_u32)
+        ttnn.copy(ttnn.add(self.pos_col, 1.0), self.pos_col)
+        return tok
 
     # ------------------------------------------------------------- decode contract (perf adapter)
     def decode_prefill(self, input_ids=None, seeds=None) -> dict:
