@@ -200,6 +200,12 @@ class TtQwenJointAttention:
     def _rope(self, x, freqs):  # x [B, Hl, S, D] half-split; freqs [S, D] = [cos | sin]
         if freqs is None:
             return x
+        if ROPE_SWAP and ROPE_FN is not None:  # the same products and sum in one kernel: x * cc + rot(x) * [sin | sin]
+            out = ROPE_FN(x, *_rope_tables(freqs, self.half, rot=True), ttnn.DRAM_MEMORY_CONFIG)
+            if out is not None:
+                if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                    ttnn.deallocate(x)
+                return out
         if ROPE_SWAP:  # x * [cos | cos] + [x2 | x1] * [-sin | sin]: the same fp32 products and sums
             cc, ss = _rope_tables(freqs, self.half)
             B, H, S = x.shape[0], x.shape[1], x.shape[2]
@@ -544,11 +550,15 @@ MERGE_L1 = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
 ROPE_SWAP = False
-# rotary tensor id -> (the tensor, held so its id stays valid; [cos | cos]; [-sin | sin])
+# with ROPE_SWAP: fn(x, [cos | cos], [sin | sin], mem) -> x * [cos | cos] + rotate_half(x) * [sin | sin] in one pass
+# (e.g. rope_rows.fused_rope: -x2 * sin is x2 * -sin exactly), or None where it does not take the shapes
+ROPE_FN = None
+# rotary tensor id -> (the tensor, held so its id stays valid; [cos | cos]; [-sin | sin]; [sin | sin])
 _ROPE_TABLES = {}
 
 
-def _rope_tables(freqs, half):
+def _rope_tables(freqs, half, rot=False):
+    """([cos | cos], [-sin | sin]) for the swap form, or ([cos | cos], [sin | sin]) for rotate_half (rot)."""
     hit = _ROPE_TABLES.get(id(freqs))
     if hit is None or hit[0] is not freqs:
         if len(_ROPE_TABLES) >= 8:
@@ -557,9 +567,14 @@ def _rope_tables(freqs, half):
         f = ttnn.reshape(freqs, (1, 1, S, 2 * half))
         cos = ttnn.slice(f, (0, 0, 0, 0), (1, 1, S, half))
         sin = ttnn.slice(f, (0, 0, 0, half), (1, 1, S, 2 * half))
-        hit = (freqs, ttnn.concat([cos, cos], dim=-1), ttnn.concat([ttnn.neg(sin), sin], dim=-1))
+        hit = (
+            freqs,
+            ttnn.concat([cos, cos], dim=-1),
+            ttnn.concat([ttnn.neg(sin), sin], dim=-1),
+            ttnn.concat([sin, sin], dim=-1),
+        )
         _ROPE_TABLES[id(freqs)] = hit
-    return hit[1], hit[2]
+    return (hit[1], hit[3]) if rot else (hit[1], hit[2])
 
 
 # the attention softmax's float32 logits in L1 (subtract / exp in place), only the probabilities written to DRAM
