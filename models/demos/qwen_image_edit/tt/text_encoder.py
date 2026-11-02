@@ -113,6 +113,7 @@ class TtQwenTextEncoder:
         _te_attention.A2A_SUM_FN = fused_block_sum  # its local sum of the n source partials as one C++ kernel
         # and the vision MLP's reduce with its bias and the block's residual add in that pass
         _te_attention.A2A_RESIDUAL_FN = fused_block_sum_gated
+        _te_attention.A2A_L1_BYTES = 12 * 1024 * 1024  # the all_to_all's received partials in L1
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
         # and the rows of each LM pipeline stage split the batch (B / 4 sequences per row) instead of all four rows
