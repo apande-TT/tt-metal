@@ -75,6 +75,8 @@ MODULATE_SPLIT = False
 # the six modulation tables as [B, dim] (B <= 32: item b in row b of one tile row) instead of reshaped to [B, 1, dim];
 # the fused LayerNorm and gated-sum kernels read row b, the stock fallbacks reshape (False: [B, 1, dim])
 TABLE_ROWS = False
+# with TABLE_ROWS: the modulation's all_gather lands in L1 and only the six sliced tables are written to DRAM
+MOD_GATHER_L1 = False
 # a sliced stream's MODULATE_FN(..., split=True, packed=True) writes its limbs stacked in one tensor, gathered by one
 # all_gather and read from there by the fused limb linears (_precise.PackedLimbs); False: two limb tensors, two gathers
 GATHER_PACKED = False
@@ -118,6 +120,22 @@ class _TtBlock:
             y = _precise.linear(silu_temb, w, bias=b, parts=parts)
         else:
             y = ttnn.linear(silu_temb, w, bias=b, dtype=ttnn.float32, compute_kernel_config=self.hifi)
+        if MOD_GATHER_L1 and self.tp > 1 and TABLE_ROWS and y.shape[0] <= 32:
+            # the gathered [B, 6*dim] in L1 only while the six tables are sliced out of it into DRAM
+            for ax in _ccl.mesh_axes(self.device, self.tp_axis):
+                y = ttnn.all_gather(
+                    y,
+                    dim=1,
+                    cluster_axis=ax,
+                    num_links=1,
+                    topology=ttnn.Topology.Linear,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+            B, d = y.shape[0], self.dim
+            dram = ttnn.DRAM_MEMORY_CONFIG
+            out = [ttnn.slice(y, (0, i * d), (B, (i + 1) * d), memory_config=dram) for i in range(6)]
+            ttnn.deallocate(y)
+            return out
         y = self._gather(y)  # [B, 6*dim] (column shards concatenate in order)
         B = y.shape[0]
         d = self.dim
