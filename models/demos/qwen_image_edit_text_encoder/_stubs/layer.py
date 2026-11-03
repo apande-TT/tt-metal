@@ -63,6 +63,10 @@ def _heads_kw(n, nbytes):
     return {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
 
 
+# fn(o) -> the (hi, lo) bf16 limbs of the merged heads [B, 1, S, H * D] read straight from the head-major attention
+# output o [B, H, S, D] (e.g. limb_split.fused_split_merge_heads), or None where it does not apply: the out
+# projection then skips the per-head slices + concat and the split (None: slices + concat, then the split)
+MERGE_SPLIT_FN = None
 # the decoder layer's two residual adds made in their branch's exact TP reduce pass (exact_all_reduce_residual)
 RESIDUAL_REDUCE = False
 # MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
@@ -280,6 +284,10 @@ class TtTextAttention:
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
+        op = MERGE_SPLIT_FN(o) if MERGE_SPLIT_FN is not None and hl > 1 else None
+        if op is not None:  # the out projection's limbs read straight from the head-major o (no merged o)
+            out = split_linear(op[0], self.wo, compute_kernel_config=cfg, exact=ex, parts=tuple(op))
+            return _reduce(out, self.device, self.tp, residual)
         if HEADS_BY_SLICES:  # heads side by side along the width by slices + concat (no padded permute)
             kw = _heads_kw(hl, b * s_pad * hl * D * 4)
             o = _concat_heads([ttnn.slice(o, [0, h, 0, 0], [b, h + 1, s_pad, D], **kw) for h in range(hl)], -1)
