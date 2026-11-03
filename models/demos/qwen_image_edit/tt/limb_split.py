@@ -24,20 +24,36 @@ def fused_split_bf16(x, mem=None):
     return _split(x, "split_bf16.cpp", gelu=False, out_mem=mem)
 
 
+def fused_split_merge_heads(o, mem=None):
+    """The bf16 limbs (hi, lo) of the merged heads [B, 1, S, H * D] of a head-major float32 [B, H, S, D] attention
+    output, read straight from it (kernels/reader_merge_heads.cpp) -- the same limbs as split_bf16 of the per-head
+    slices + concat, without running them. None when the shapes do not fit (D or S not tile aligned, padding)."""
+    if len(o.shape) != 4 or o.dtype != ttnn.float32 or o.layout != ttnn.TILE_LAYOUT or o.is_sharded():
+        return None
+    B, H, S, D = (int(d) for d in o.shape)
+    if D % 32 or S % 32 or list(o.padded_shape) != list(o.shape):
+        return None
+    return _split(o, "split_bf16.cpp", gelu=False, out_mem=mem, heads=H)
+
+
 def fused_gelu_split_bf16(x):
     """x float32 TILE (interleaved) -> (hi, lo) bf16 limbs of ttnn.gelu(x, variant=Tanh), the GELU computed
     in the split kernel (kernels/gelu_split_bf16.cpp) so its output never round-trips DRAM."""
     return _split(x, "gelu_split_bf16.cpp", gelu=True)
 
 
-def _split(x, compute_kernel, gelu, out_mem=None):
+def _split(x, compute_kernel, gelu, out_mem=None, heads=None):
     device = x.device()
     mem = x.memory_config()
     if mem.buffer_type == ttnn.BufferType.L1:  # an L1 input still gets its limbs in DRAM (L1 limbs clash with matmuls)
         mem = ttnn.DRAM_MEMORY_CONFIG
     mem = mem if out_mem is None else out_mem
-    hi = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
-    lo = ttnn.allocate_tensor_on_device(x.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
+    shape = x.shape
+    if heads is not None:  # the merged layout [B, 1, S, H * D] of a head-major [B, H, S, D] input
+        B, H, S, D = (int(d) for d in x.shape)
+        shape = ttnn.Shape([B, 1, S, H * D])
+    hi = ttnn.allocate_tensor_on_device(shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
+    lo = ttnn.allocate_tensor_on_device(shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
     vol = 1
     for d in x.padded_shape:
         vol *= int(d)
@@ -75,14 +91,20 @@ def _split(x, compute_kernel, gelu, out_mem=None):
     if gelu:
         modes[25] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
+    if heads is None:
+        reader = os.path.join(
+            _TT_METAL, "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/reader_unary_interleaved_start_id.cpp"
+        )
+        reader_ct = list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+    else:
+        reader = os.path.join(_KERNELS, "reader_merge_heads.cpp")
+        reader_ct = [H, S // 32, D // 32] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
     kernels = [
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(
-                _TT_METAL, "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/reader_unary_interleaved_start_id.cpp"
-            ),
+            kernel_source=reader,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=list(ttnn.TensorAccessorArgs(x).get_compile_time_args()),
+            compile_time_args=reader_ct,
             runtime_args=rd_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),

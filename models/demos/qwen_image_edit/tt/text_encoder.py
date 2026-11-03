@@ -27,6 +27,7 @@ from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
+from models.demos.qwen_image_edit.tt.limb_split import fused_split_merge_heads
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
@@ -178,6 +179,8 @@ class TtQwenTextEncoder:
         _te_layer.HEADS_BY_SLICES = True
         _te_layer.HEADS_L1_BYTES = 8 * 1024 * 1024  # with the per-head slices in L1
         _te_layer.RESIDUAL_REDUCE = True  # and each residual add made in its branch's TP reduce pass
+        # the out projection's limbs split straight from the head-major attention output (no per-head slices / concat)
+        _te_layer.MERGE_SPLIT_FN = fused_split_merge_heads
         # the LM MLP's gate / up limbs of a short batch (the negatives' tail: 14.7 MB) split straight into L1
         _te_layer.MLP_LIMBS_L1_BYTES = 16 * 1024 * 1024
         _te_layer.MLP_FUSED_SILU = True  # and its SiLU fused into the gate * up multiply
