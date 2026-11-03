@@ -316,7 +316,7 @@ class TtQwenJointAttention:
             return None
         return q, k, v
 
-    def _attend(self, q, kh, kl, v, mask_add, shared=None, out_mem=None):
+    def _attend(self, q, kh, kl, v, mask_add, shared=None, out_mem=None, merge=True):
         """shared (precise + SHARE_SPLIT): (K's folded operand or None, V's (hi, lo)), built once for
         the image and text queries that attend to the same joint K / V."""
         k_rep, v_parts = shared if shared is not None else (None, None)
@@ -364,6 +364,10 @@ class TtQwenJointAttention:
             o = ttnn.matmul(
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
             )  # [B, Hl, Sq, D]
+        # merge False: the caller takes the head-major [B, Hl, Sq, D] output (MERGE_SPLIT_FN)
+        return self._merge_heads(o, out_mem) if merge else o
+
+    def _merge_heads(self, o, out_mem=None):  # [B, Hl, Sq, D] -> [B, Sq, Hl * D]
         B, Sq = o.shape[0], o.shape[2]
         if NLP_MERGE:  # heads side by side along the width in one tile-copy op
             o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -383,6 +387,14 @@ class TtQwenJointAttention:
             return ttnn.reshape(o, (B, Sq, self.local_heads * D))
         o = ttnn.permute(o, (0, 2, 1, 3))
         return ttnn.reshape(o, (B, Sq, self.local_heads * self.head_dim))
+
+    def _out_parts(self, parts, wb):  # _out from x's (hi, lo) limbs [B, 1, S, W] (MERGE_SPLIT_FN)
+        w, b = wb
+        hi, lo = (ttnn.reshape(t, [int(t.shape[0]), int(t.shape[2]), int(t.shape[3])]) for t in parts)
+        y = _precise.linear(hi, w, parts=(hi, lo))
+        if self.tp > 1:
+            return _ccl.all_reduce(y, self.device, axis=self.tp_axis, bias=b)
+        return ttnn.add(y, b)
 
     def _out(self, x, wb):  # row-parallel + all_reduce, bias once
         w, b = wb
@@ -499,18 +511,33 @@ class TtQwenJointAttention:
             if joint is None:
                 L = qt.shape[2]
                 joint = ttnn.concat([qt, qi], dim=2)
-            # SPLIT_L1: the merged heads in L1 only until the two streams' rows are sliced out into DRAM
-            out_mem = ttnn.L1_MEMORY_CONFIG if SPLIT_L1 else None
-            o = self._attend(joint, kh, kl, v, mask_add, shared, out_mem=out_mem)
-            B, S, W = o.shape[0], o.shape[1], o.shape[2]
-            kw = {"memory_config": ttnn.DRAM_MEMORY_CONFIG} if SPLIT_L1 else {}
-            o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W), **kw)
-            o_img = ttnn.slice(o, (0, L, 0), (B, S, W), **kw)
-            ttnn.deallocate(o)
-            img = self._out(o_img, self.img_out)
-            txt = self._out(o_txt, self.txt_out) if need_txt else None
-            if not need_txt:
-                ttnn.deallocate(o_txt)
+            oh = self._attend(joint, kh, kl, v, mask_add, shared, merge=False)  # [B, Hl, L + S, D]
+            pi = pt = None
+            if MERGE_SPLIT_FN is not None and _precise.ENABLED:
+                # each stream's out projection limbs split straight from the head-major output's rows (no merge, no
+                # row slices); None (nothing run) where the shapes do not fit
+                pi = MERGE_SPLIT_FN(oh, rows=(L, int(oh.shape[2])))
+                pt = MERGE_SPLIT_FN(oh, rows=(0, L)) if need_txt and pi is not None else None
+                if pi is not None and need_txt and pt is None:
+                    for t in pi:
+                        ttnn.deallocate(t)
+                    pi = None
+            if pi is not None:
+                ttnn.deallocate(oh)
+                img = self._out_parts(pi, self.img_out)
+                txt = self._out_parts(pt, self.txt_out) if need_txt else None
+            else:
+                # SPLIT_L1: the merged heads in L1 only until the two streams' rows are sliced out into DRAM
+                o = self._merge_heads(oh, ttnn.L1_MEMORY_CONFIG if SPLIT_L1 else None)
+                B, S, W = o.shape[0], o.shape[1], o.shape[2]
+                kw = {"memory_config": ttnn.DRAM_MEMORY_CONFIG} if SPLIT_L1 else {}
+                o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W), **kw)
+                o_img = ttnn.slice(o, (0, L, 0), (B, S, W), **kw)
+                ttnn.deallocate(o)
+                img = self._out(o_img, self.img_out)
+                txt = self._out(o_txt, self.txt_out) if need_txt else None
+                if not need_txt:
+                    ttnn.deallocate(o_txt)
         else:
             img = self._out(self._attend(qi, kh, kl, v, mask_add, shared), self.img_out)
             txt = self._out(self._attend(qt, kh, kl, v, mask_add, shared), self.txt_out) if need_txt else None
@@ -557,6 +584,10 @@ NLP_MERGE = False
 MERGE_L1 = False
 # JOINT_QUERIES: the merged attention output in L1 while its text / image rows are sliced out (into DRAM)
 SPLIT_L1 = False
+# JOINT_QUERIES: fn(o, rows=(r0, r1)) -> the (hi, lo) bf16 limbs of the merged heads' rows [r0, r1) of the head-major
+# attention output o [B, Hl, S, D] (e.g. limb_split.fused_split_merge_heads), or None where it does not apply; each
+# stream's out projection then takes them (no merge, no row slices, no split; None: merge + slices + the split)
+MERGE_SPLIT_FN = None
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
 ROPE_SWAP = False
