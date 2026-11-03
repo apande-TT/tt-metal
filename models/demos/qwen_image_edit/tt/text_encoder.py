@@ -177,6 +177,7 @@ class TtQwenTextEncoder:
 
         _te_layer.HEADS_BY_SLICES = True
         _te_layer.HEADS_L1_BYTES = 8 * 1024 * 1024  # with the per-head slices in L1
+        _te_layer.RESIDUAL_REDUCE = True  # and each residual add made in its branch's TP reduce pass
         # the LM MLP's gate / up limbs of a short batch (the negatives' tail: 14.7 MB) split straight into L1
         _te_layer.MLP_LIMBS_L1_BYTES = 16 * 1024 * 1024
         _te_layer.MLP_FUSED_SILU = True  # and its SiLU fused into the gate * up multiply
