@@ -59,6 +59,10 @@ class TtRMSNorm32:
         return ttnn.multiply(ttnn.multiply(x, ttnn.rsqrt(ttnn.add(ms, self.eps))), self.w)
 
 
+# norm_out on each device's token slice of the image stream (then gathered) instead of on the gathered stream
+NORM_OUT_SLICED = True
+
+
 class TtQwenImageTransformer:
     def __init__(self, device, torch_module, layers=None, tracker=None):
         self.device = device
@@ -132,6 +136,11 @@ class TtQwenImageTransformer:
             txt, img = blk(
                 img, encoder_hidden_states=txt, temb=temb, image_rotary_emb=rotary, joint_attention_kwargs=jak
             )
-        img = _ccl.unslice(img)  # the blocks may hand the image stream on as each device's token slice
-        img = self.norm_out(img, temb)
+        if NORM_OUT_SLICED and isinstance(img, _ccl.Sliced) and img.dim == 1:
+            # norm_out (per-row LayerNorm + per-item modulation) on this device's token slice, then the gather of
+            # the normalised rows: the same ops per row on 1/n of them
+            img = img.gather_part(self.norm_out(img.t, temb))
+        else:
+            img = _ccl.unslice(img)  # the blocks may hand the image stream on as each device's token slice
+            img = self.norm_out(img, temb)
         return self.proj_out(img)
