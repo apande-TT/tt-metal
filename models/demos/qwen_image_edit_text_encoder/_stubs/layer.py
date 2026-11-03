@@ -27,6 +27,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import attention as _atten
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     MASK_NEG,
     exact_all_reduce,
+    exact_all_reduce_residual,
     hifi4_config,
     mesh_shape,
     pad_to_tile,
@@ -62,6 +63,8 @@ def _heads_kw(n, nbytes):
     return {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
 
 
+# the decoder layer's two residual adds made in their branch's exact TP reduce pass (exact_all_reduce_residual)
+RESIDUAL_REDUCE = False
 # MLP gate / up's shared bf16 limbs split straight into L1 when together they take at most this many bytes
 # (the split hook's optional output memory config; freed after both products. 0: in x's memory)
 MLP_LIMBS_L1_BYTES = 0
@@ -181,13 +184,13 @@ class TtTextAttention:
     def mask(self, attention_mask, b, s, s_pad):
         return upload(self.device, text_attention_mask(attention_mask, b, s, s_pad, self.group), dtype=ttnn.float32)
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None):
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, kv=None, residual=None):
         """x: [B, 1, s_pad, C] bf16 replicated -> [B, 1, s_pad, C] bf16 replicated. kv: prefix K/V cache
-        (see _forward_precise; precise path only)."""
+        (see _forward_precise; precise path only). residual: see _forward_precise (precise path only)."""
         D, hl, kvl, G = self.head_dim, self.hl, self.kvl, self.group
         b, s_pad = x.shape[0], x.shape[-2]
         if self.precise:
-            return self._forward_precise(x, tt_cos, tt_sin, tt_mask, kv=kv)
+            return self._forward_precise(x, tt_cos, tt_sin, tt_mask, kv=kv, residual=residual)
         assert kv is None, "the prefix K/V cache is implemented on the precise path only"
         # q/k carry large biases in Qwen2 (scores of O(100s)); keep the score path in fp32.
         qkv = ttnn.linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=self.compute_cfg, dtype=ttnn.float32)
@@ -221,7 +224,7 @@ class TtTextAttention:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
         return out
 
-    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, kv=None):
+    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, kv=None, residual=None):
         """kv = (mode, cache, key, P) or None. "store": keep this call's roped K and V of positions [0, P)
         in cache[key]. "use": x holds positions [P, P + s) only; the cached prefix K/V are prepended, so
         the queries attend to [0, P + s) (tt_cos/tt_sin/tt_mask are for those positions)."""
@@ -284,9 +287,19 @@ class TtTextAttention:
             o = ttnn.permute(o, (0, 2, 1, 3))
             o = ttnn.reshape(o, (b, 1, s_pad, hl * D))
         out = split_linear(o, self.wo, compute_kernel_config=cfg, exact=ex)
-        if self.tp > 1:
-            out = exact_all_reduce(out, self.device)
-        return out
+        return _reduce(out, self.device, self.tp, residual)
+
+
+def _reduce(out, device, tp, residual):
+    """The row-parallel output's exact TP reduce; with a residual (RESIDUAL_REDUCE): (residual + reduce, True)
+    with the add in the reduce's pass where exact_all_reduce_residual applies, else (reduce, False)."""
+    if residual is not None and tp > 1:
+        r = exact_all_reduce_residual(out, device, residual)
+        if r is not None:
+            return r, True
+    if tp > 1:
+        out = exact_all_reduce(out, device)
+    return (out, False) if residual is not None else out
 
 
 class TtTextMLP:
@@ -316,7 +329,7 @@ class TtTextMLP:
             return False
         return 2 * 2 * math.prod(int(d) for d in x.padded_shape) <= MLP_LIMBS_L1_BYTES
 
-    def __call__(self, x):
+    def __call__(self, x, residual=None):
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
@@ -335,9 +348,7 @@ class TtTextMLP:
             # lo_fidelity: this MLP's own lower-limb fidelity for the down projection (None: the module default)
             lo = getattr(self, "lo_fidelity", None)
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex, lo_fidelity=lo)
-            if self.tp > 1:
-                out = exact_all_reduce(out, self.device)
-            return out
+            return _reduce(out, self.device, self.tp, residual)
         gate = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
         up = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
         out = ttnn.linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=self.compute_cfg)
@@ -362,6 +373,14 @@ class TtTextDecoderLayer:
         """x: [B, 1, s_pad, C] fp32 residual stream (branch inputs stay fp32 with precise_inputs).
         kv: the attention's prefix K/V cache argument (TtTextAttention._forward_precise)."""
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
+        if RESIDUAL_REDUCE and self.self_attn.precise and getattr(self.mlp, "precise", False):
+            # each branch's residual add in its exact reduce's pass where that applies (else the same ttnn.add)
+            a, fused = self.self_attn.forward_padded(
+                cast(self.input_layernorm(x)), tt_cos, tt_sin, tt_mask, kv=kv, residual=x
+            )
+            x = a if fused else ttnn.add(x, _fp32(a))
+            m, fused = self.mlp(cast(self.post_attention_layernorm(x)), residual=x)
+            return m if fused else ttnn.add(x, _fp32(m))
         a = self.self_attn.forward_padded(cast(self.input_layernorm(x)), tt_cos, tt_sin, tt_mask, kv=kv)
         x = ttnn.add(x, _fp32(a))
         return ttnn.add(x, _fp32(self.mlp(cast(self.post_attention_layernorm(x)))))

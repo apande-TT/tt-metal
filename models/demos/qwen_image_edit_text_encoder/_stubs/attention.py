@@ -223,6 +223,54 @@ def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1):
     return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear), True
 
 
+def exact_all_reduce_residual(y, device, residual, cluster_axis=1):
+    """residual + exact_all_reduce(y) for several batch items per device (A2A_FOLD): the folded all_to_all's local
+    sum and the residual add in one pass (A2A_RESIDUAL_FN on the device's rows of the [1, B * S, C] residual), then
+    the all_gather -- the same float32 adds in the same order as the reduce followed by ttnn.add. None where this
+    path does not apply (nothing run). y, residual: [B, 1, S, C] float32."""
+    n = mesh_shape(device)[cluster_axis]
+    shape = list(y.shape)
+    if A2A_RESIDUAL_FN is None or A2A_SUM_FN is None or not (A2A_REDUCE and A2A_FOLD) or n == 1:
+        return None
+    if len(shape) != 4 or shape[1] != 1 or shape[0] % n or shape[0] // n < 2 or shape[2] % 32:
+        return None
+    if list(residual.shape) != shape or residual.dtype != ttnn.float32 or y.dtype != ttnn.float32:
+        return None
+    part = [shape[0] // n, 1] + shape[2:]
+    rows = [1, 1, part[0] * shape[2], shape[3]]
+    g = _a2a(ttnn.reshape(y, [n] + rows[1:]), cluster_axis, max(A2A_L1_BYTES, A2A_FOLD_L1_BYTES))
+    r3 = ttnn.reshape(residual, [1, shape[0] * shape[2], shape[3]])  # device k's rows: its items k * B / n ..
+    l1 = A2A_L1_BYTES and math.prod(rows) * 4 <= A2A_L1_BYTES
+    mem = ttnn.L1_MEMORY_CONFIG if l1 else ttnn.DRAM_MEMORY_CONFIG
+    out = A2A_RESIDUAL_FN(ttnn.reshape(g, [n] + rows[1:]), n, rows, mem, None, None, r3, 2, cluster_axis)
+    if out is None:  # shapes the kernel does not take: the sum, then the caller's add
+        s = A2A_SUM_FN(ttnn.reshape(g, [n] + rows[1:]), n, rows, mem)
+        ttnn.deallocate(g)
+        res = ttnn.all_gather(
+            ttnn.reshape(s, part),
+            dim=0,
+            cluster_axis=cluster_axis,
+            num_links=1,
+            topology=ttnn.Topology.Linear,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        if l1:
+            ttnn.deallocate(s)
+        return ttnn.add(residual, res, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(g)
+    res = ttnn.all_gather(
+        ttnn.reshape(out, part),
+        dim=0,
+        cluster_axis=cluster_axis,
+        num_links=1,
+        topology=ttnn.Topology.Linear,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    if l1:
+        ttnn.deallocate(out)
+    return res
+
+
 def exact_all_reduce(y, device, cluster_axis=1):
     """Sum over the TP axis without rounding: gather the float32 partials (bit-exact data movement) and
     add them in float32. ttnn.all_reduce rounds float32 partials at bf16 level (measured ~7e-3 abs on
