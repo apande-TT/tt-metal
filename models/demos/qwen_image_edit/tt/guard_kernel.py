@@ -765,6 +765,19 @@ def modulate_tail(xc, r, s, h):
     if list(h.padded_shape) != [b, TILE, ps[2]] or any(t.dtype != ttnn.float32 for t in (r, s, h)):
         return None
     n_tiles = b * st * ct
+    # r, s and h are re-read for every output tile (r once per tile column, s and h once per tile row): staged in L1
+    # (< 1 MB together), three of the four reads per tile leave DRAM
+    staged = [
+        ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
+        for t in (r, s, h)
+        if t.memory_config().buffer_type == ttnn.BufferType.DRAM
+    ]
+    if len(staged) == 3:
+        r, s, h = staged
+    else:  # not expected (the caller's operands are DRAM): leave them as they are
+        for t in staged:
+            ttnn.deallocate(t)
+        staged = []
     y = ttnn.empty_like(xc)
     grid = xc.device().compute_with_storage_grid_size()
     work = _cores(grid, n_tiles)
@@ -823,4 +836,6 @@ def modulate_tail(xc, r, s, h):
         ),
     ]
     ttnn.generic_op([xc, r, s, h, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    for t in staged:
+        ttnn.deallocate(t)
     return y
