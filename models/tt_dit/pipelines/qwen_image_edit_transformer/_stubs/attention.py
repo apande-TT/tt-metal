@@ -316,7 +316,7 @@ class TtQwenJointAttention:
             return None
         return q, k, v
 
-    def _attend(self, q, kh, kl, v, mask_add, shared=None):
+    def _attend(self, q, kh, kl, v, mask_add, shared=None, out_mem=None):
         """shared (precise + SHARE_SPLIT): (K's folded operand or None, V's (hi, lo)), built once for
         the image and text queries that attend to the same joint K / V."""
         k_rep, v_parts = shared if shared is not None else (None, None)
@@ -376,7 +376,7 @@ class TtQwenJointAttention:
             if len(parts) == 1:
                 o = parts[0]
             else:
-                o = ttnn.concat(parts, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                o = ttnn.concat(parts, dim=-1, memory_config=out_mem or ttnn.DRAM_MEMORY_CONFIG)
                 if l1:
                     for t in parts:
                         ttnn.deallocate(t)
@@ -499,10 +499,13 @@ class TtQwenJointAttention:
             if joint is None:
                 L = qt.shape[2]
                 joint = ttnn.concat([qt, qi], dim=2)
-            o = self._attend(joint, kh, kl, v, mask_add, shared)
+            # SPLIT_L1: the merged heads in L1 only until the two streams' rows are sliced out into DRAM
+            out_mem = ttnn.L1_MEMORY_CONFIG if SPLIT_L1 else None
+            o = self._attend(joint, kh, kl, v, mask_add, shared, out_mem=out_mem)
             B, S, W = o.shape[0], o.shape[1], o.shape[2]
-            o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W))
-            o_img = ttnn.slice(o, (0, L, 0), (B, S, W))
+            kw = {"memory_config": ttnn.DRAM_MEMORY_CONFIG} if SPLIT_L1 else {}
+            o_txt = ttnn.slice(o, (0, 0, 0), (B, L, W), **kw)
+            o_img = ttnn.slice(o, (0, L, 0), (B, S, W), **kw)
             ttnn.deallocate(o)
             img = self._out(o_img, self.img_out)
             txt = self._out(o_txt, self.txt_out) if need_txt else None
@@ -552,6 +555,8 @@ JOINT_HEADS_DIRECT = False
 NLP_MERGE = False
 # HEADS_BY_SLICES merge: the per-head slices in L1 (the concat still writes DRAM)
 MERGE_L1 = False
+# JOINT_QUERIES: the merged attention output in L1 while its text / image rows are sliced out (into DRAM)
+SPLIT_L1 = False
 # RoPE as x * [cos | cos] + [x2 | x1] * [-sin | sin] on tables built once per rotary tensor (bit-identical: a - b is
 # a + (-b), and the second half's sum is the same two products in the other order)
 ROPE_SWAP = False
