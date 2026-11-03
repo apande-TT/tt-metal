@@ -375,6 +375,10 @@ LANE_KSTACK = None
 LANE_STACK_MAX_K_PER_N = 0
 # Math fidelity of the K-stacked weight-lane products (HiFi4: each lane's bf16 x bf16 tile products exact).
 LANE_STACK_FIDELITY = ttnn.MathFidelity.HiFi4
+# Optional for the weight-side lanes the K-stack does not take: LANE_NSTACK(g, n) -> the left-to-right sum of g's n
+# column blocks, g = x @ [lane 0 | ... | lane 7] (N' = 8N), or None. The 8 lane products then run as ONE product over
+# the whole grid (a narrow N fills only part of it) and their sum is one pass over its float32 output.
+LANE_NSTACK = None
 _ROW_LANE_MASKS = {}
 
 
@@ -437,6 +441,24 @@ def _weight_lane_sums(lead, ws):
                     for t in lanes:
                         ttnn.deallocate(t)
             return outs
+    if LANE_NSTACK is not None and split is not None:
+        ys = []
+        for i, w in enumerate(ws):
+            got = None if cache is None else cache.get(("nstack", id(w)))
+            if got is None:
+                got = [ttnn.concat(list(split[i]), dim=1)]  # [K, 8N]: lane r's columns at r * N
+                if cache is not None:
+                    cache[("nstack", id(w))] = got
+            ys.append(LANE_NSTACK(_linear_mm(lead, got[0])(lead), len(split[i])))
+            if cache is None:
+                ttnn.deallocate(got[0])
+        if all(y is not None for y in ys):
+            if cache is None:
+                for lanes in split:
+                    for t in lanes:
+                        ttnn.deallocate(t)
+            return ys
+        raise RuntimeError("LANE_NSTACK refused an N-stacked lane product")
     # the lead limb, read by every lane product, staged in L1 once when it is small (the vision qkv 14.4 MB, proj
     # 17.3 MB per chip)
     vol = 2

@@ -239,6 +239,82 @@ def sum_list(ts):
     return y
 
 
+_LC_READER = f"{_DIR}/lane_cols_reader.cpp"
+_LC_COMPUTE = f"{_DIR}/lane_cols_compute.cpp"
+
+
+def lane_cols_sum(g, lanes):
+    """sum_r g[..., r * n : (r + 1) * n] (left to right, the ttnn.add chain's float32 values) for an interleaved
+    float32 tile tensor g [..., M, lanes * n] -- the N-stacked exact-lane product x @ [w_0 | ... | w_{L-1}] -- in one
+    pass with no slice copies. Consumes (deallocates) g. None for a g it does not take (g left as it is)."""
+    s, ps = list(g.shape), list(g.padded_shape)
+    if len(s) < 2 or g.dtype != ttnn.float32 or g.layout != ttnn.TILE_LAYOUT or g.is_sharded():
+        return None
+    if not 2 <= lanes <= 8 or s[-1] % (lanes * TILE) or ps[-1] != s[-1]:
+        return None
+    n = s[-1] // lanes
+    nt = n // TILE
+    n_tiles = nt * (ps[-2] // TILE)
+    for d in ps[:-2]:
+        n_tiles *= d
+    y = ttnn.empty(
+        s[:-1] + [n], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=g.device(), memory_config=g.memory_config()
+    )
+    work = _cores(g.device().compute_with_storage_grid_size(), n_tiles)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb(index, pages):
+        return ttnn.CBDescriptor(
+            total_size=pages * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=index, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [g.buffer_address(), count, start]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
+    )
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    unpack[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_LC_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(g).get_compile_time_args() + [lanes, nt],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_LC_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[lanes],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=[cb(0, 2 * lanes), cb(_OUT_CB, 2)])
+    ttnn.generic_op([g, y], program)
+    ttnn.deallocate(g)
+    return y
+
+
 _WL_READER = f"{_DIR}/weight_lanes_reader.cpp"
 _WL_COMPUTE = f"{_DIR}/weight_lanes_compute.cpp"
 _EIGHT_OUT_WRITER = f"{_DIR}/eight_out_writer.cpp"
