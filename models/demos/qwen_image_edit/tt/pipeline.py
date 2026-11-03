@@ -50,7 +50,7 @@ from models.demos.qwen_image_edit.tt.joint_heads import fused_joint_heads
 from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
-from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16
+from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16, fused_split_merge_heads
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt import rms_rows as _rms_rows
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
@@ -247,6 +247,8 @@ class QwenImageEditTT:
         _tr_attention.HEADS_BY_SLICES = True  # heads in/out by per-head slices, not a padded permute
         _tr_attention.MERGE_L1 = True  # the merge's per-head slices in L1
         _tr_attention.SPLIT_L1 = True  # and the merged rows in L1 until the two streams' rows are sliced out
+        # each stream's out projection limbs split straight from the head-major attention output's rows instead
+        _tr_attention.MERGE_SPLIT_FN = fused_split_merge_heads
         # the image and text queries as one joint query block: one exact QK^T / softmax / P @ V per attention
         _tr_attention.JOINT_QUERIES = True
         # with the two streams' fused q/k/v outputs joined as [txt; img] rows first: one head split, norm and rope

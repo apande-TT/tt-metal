@@ -5,8 +5,9 @@
 // Reader of the head-merging limb split (limb_split.fused_split_merge_heads): the split kernel's float32 input
 // tiles in the MERGED layout [B, 1, S, H * D] read straight from the head-major [B, H, S, D] attention output, so
 // the per-head slices + concat that would build the merged tensor are never run. Output tile t (St tile rows, H * Dt
-// tiles per row) is input tile ((b * H + h) * St + r) * Dt + c % Dt with b = t / (St * H * Dt), r its tile row,
-// c its tile column and h = c / Dt -- the tile the slice + concat would have copied there.
+// tiles per row) is input tile ((b * H + h) * St_in + R0 + r) * Dt + c % Dt with b = t / (St * H * Dt), r its
+// tile row, c its tile column and h = c / Dt -- the tile the slice + concat would have copied there. R0 / St_in:
+// the output covers input tile rows [R0, R0 + St) of St_in (one stream's rows of a joint attention output).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -21,7 +22,9 @@ void kernel_main() {
     constexpr uint32_t H = get_compile_time_arg_val(0);
     constexpr uint32_t St = get_compile_time_arg_val(1);
     constexpr uint32_t Dt = get_compile_time_arg_val(2);
-    constexpr auto src_args = TensorAccessorArgs<3>();
+    constexpr uint32_t R0 = get_compile_time_arg_val(3);
+    constexpr uint32_t St_in = get_compile_time_arg_val(4);
+    constexpr auto src_args = TensorAccessorArgs<5>();
 
     constexpr uint32_t cb_id_in = 0;
     constexpr uint32_t row_tiles = H * Dt;
@@ -34,7 +37,7 @@ void kernel_main() {
         const uint32_t b = t / (St * row_tiles);
         const uint32_t r = t / row_tiles % St;
         const uint32_t c = t % row_tiles;
-        const uint32_t in_tile = ((b * H + c / Dt) * St + r) * Dt + c % Dt;
+        const uint32_t in_tile = ((b * H + c / Dt) * St_in + R0 + r) * Dt + c % Dt;
         dfb.reserve_back(1);
         noc.async_read(src, dfb, page, {.page_id = in_tile}, {.offset_bytes = 0});
         noc.async_read_barrier();

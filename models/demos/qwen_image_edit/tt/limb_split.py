@@ -24,16 +24,20 @@ def fused_split_bf16(x, mem=None):
     return _split(x, "split_bf16.cpp", gelu=False, out_mem=mem)
 
 
-def fused_split_merge_heads(o, mem=None):
+def fused_split_merge_heads(o, mem=None, rows=None):
     """The bf16 limbs (hi, lo) of the merged heads [B, 1, S, H * D] of a head-major float32 [B, H, S, D] attention
     output, read straight from it (kernels/reader_merge_heads.cpp) -- the same limbs as split_bf16 of the per-head
-    slices + concat, without running them. None when the shapes do not fit (D or S not tile aligned, padding)."""
+    slices + concat, without running them. rows=(r0, r1): only rows [r0, r1) ([B, 1, r1 - r0, H * D]; the slice of
+    the merged rows). None when the shapes do not fit (D, S or the row range not tile aligned, padding)."""
     if len(o.shape) != 4 or o.dtype != ttnn.float32 or o.layout != ttnn.TILE_LAYOUT or o.is_sharded():
         return None
     B, H, S, D = (int(d) for d in o.shape)
     if D % 32 or S % 32 or list(o.padded_shape) != list(o.shape):
         return None
-    return _split(o, "split_bf16.cpp", gelu=False, out_mem=mem, heads=H)
+    r0, r1 = (0, S) if rows is None else (int(rows[0]), int(rows[1]))
+    if r0 % 32 or r1 % 32 or not 0 <= r0 < r1 <= S:
+        return None
+    return _split(o, "split_bf16.cpp", gelu=False, out_mem=mem, heads=H, rows=(r0, r1))
 
 
 def fused_gelu_split_bf16(x):
@@ -42,7 +46,7 @@ def fused_gelu_split_bf16(x):
     return _split(x, "gelu_split_bf16.cpp", gelu=True)
 
 
-def _split(x, compute_kernel, gelu, out_mem=None, heads=None):
+def _split(x, compute_kernel, gelu, out_mem=None, heads=None, rows=None):
     device = x.device()
     mem = x.memory_config()
     if mem.buffer_type == ttnn.BufferType.L1:  # an L1 input still gets its limbs in DRAM (L1 limbs clash with matmuls)
@@ -51,11 +55,12 @@ def _split(x, compute_kernel, gelu, out_mem=None, heads=None):
     shape = x.shape
     if heads is not None:  # the merged layout [B, 1, S, H * D] of a head-major [B, H, S, D] input
         B, H, S, D = (int(d) for d in x.shape)
-        shape = ttnn.Shape([B, 1, S, H * D])
+        r0, r1 = rows
+        shape = ttnn.Shape([B, 1, r1 - r0, H * D])
     hi = ttnn.allocate_tensor_on_device(shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
     lo = ttnn.allocate_tensor_on_device(shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
     vol = 1
-    for d in x.padded_shape:
+    for d in hi.padded_shape:  # output tiles (the merged-heads row range may cover only part of x)
         vol *= int(d)
     tiles = vol // 1024
     grid = device.compute_with_storage_grid_size()
@@ -98,7 +103,8 @@ def _split(x, compute_kernel, gelu, out_mem=None, heads=None):
         reader_ct = list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
     else:
         reader = os.path.join(_KERNELS, "reader_merge_heads.cpp")
-        reader_ct = [H, S // 32, D // 32] + list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
+        reader_ct = [H, (r1 - r0) // 32, D // 32, r0 // 32, S // 32]
+        reader_ct += list(ttnn.TensorAccessorArgs(x).get_compile_time_args())
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=reader,
