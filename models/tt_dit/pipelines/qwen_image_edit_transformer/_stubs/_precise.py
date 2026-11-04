@@ -103,8 +103,9 @@ class PackedLimbs:
 
 class StackedLimbs:
     """x's [rows, K] limbs as the two row blocks of one bf16 tensor t [2 * mp, K] (hi in rows [0, rows), lo in rows
-    [mp, mp + rows), mp = rows padded to whole tiles, zero rows between): linear() runs one matmul over both (the
-    weight read once); parts: the (hi, lo) limbs themselves, for anything else."""
+    [mp, mp + rows); mp = rows padded to whole tiles, or 16: both limbs in one tile row, see FACE_SUM_BIAS_FN):
+    linear() runs one matmul over both (the weight read once); parts: the (hi, lo) limbs themselves, for anything
+    else."""
 
     def __init__(self, t, rows, mp, parts):
         self.t, self.rows, self.mp, self.parts = t, rows, mp, parts
@@ -179,11 +180,22 @@ def _stacked_linear(limbs, w, bias):
         return None
     t, rows, mp = limbs.t, limbs.rows, limbs.mp
     y = ttnn.linear(t, w, compute_kernel_config=precise_config(), dtype=ttnn.float32, **_pc_kw(t, w))
+    if mp == 16 and FACE_SUM_BIAS_FN is not None and bias is not None and bias.dtype == ttnn.float32:
+        out = FACE_SUM_BIAS_FN(y, rows, _bias_rows(bias))
+        if out is not None:
+            ttnn.deallocate(y)
+            return out
     n = int(y.shape[-1])
     y_hi = ttnn.slice(y, (0, 0), (rows, n))
     y_lo = ttnn.slice(y, (mp, 0), (mp + rows, n))
     ttnn.deallocate(y)
     return _sum_bias(y_hi, y_lo, bias)
+
+
+# fn(y, rows, bias_rows) -> (y[0:rows] + y[16:16 + rows]) + bias for a StackedLimbs product with both limbs in one
+# tile row (mp 16), in one pass reading y's tiles once (e.g. block_sum.fused_face_sum_bias), or None where it does not
+# take the shapes; None: StackedLimbs keep each limb in its own tile rows
+FACE_SUM_BIAS_FN = None
 
 
 def _sum_bias(y_hi, y_lo, bias):

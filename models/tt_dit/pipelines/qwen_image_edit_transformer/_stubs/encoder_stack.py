@@ -304,7 +304,8 @@ class TtQwenBlockStack:
                     # one matmul per modulation linear, reading its weight once for both limbs (in DRAM: a tensor
                     # held in L1 through the forward clashes with the fused limb kernels' static CBs)
                     dram, rows = ttnn.DRAM_MEMORY_CONFIG, int(silu.shape[0])
-                    mp = -(-rows // 32) * 32
+                    # <= 16 rows: both limbs in ONE tile row (hi rows 0..15, lo rows 16..31) with a face-sum epilogue
+                    mp = 16 if rows <= 16 and _precise.FACE_SUM_BIAS_FN is not None else -(-rows // 32) * 32
                     pad = lambda t: ttnn.pad(t, [(0, mp - rows), (0, 0)], 0.0, memory_config=dram)
                     padded = [pad(t) for t in parts]
                     stacked = ttnn.concat(padded, dim=0, memory_config=dram)
