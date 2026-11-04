@@ -315,6 +315,112 @@ def lane_cols_sum(g, lanes):
     return y
 
 
+_MM_READER = f"{_DIR}/masked_mm_reader.cpp"
+_MM_COMPUTE = f"{_DIR}/masked_mm_compute.cpp"
+_MM_WRITER = f"{_DIR}/masked_mm_writer.cpp"
+_COL_MASKS = {}
+_MM_L1_BYTES = 1000 * 1024
+
+
+def _col_masks(device):
+    """The 8 column-lane mask tiles ([8 x 32, 32] bf16; tile r keeps the columns j % 8 == r: lane r of an input's K)."""
+    if id(device) not in _COL_MASKS:
+        vals = [1.0 if j % 8 == r else 0.0 for r in range(8) for _ in range(TILE) for j in range(TILE)]
+        m = ttnn.Tensor(vals, [8 * TILE, TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
+        _COL_MASKS[id(device)] = ttnn.typecast(m, ttnn.bfloat16)
+    return _COL_MASKS[id(device)]
+
+
+def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
+    """sum_r lane_r(x) @ w in float32 (lane r of x keeping its K columns k % 8 == r: the exact-lane sum of the
+    weight-side lanes) for a bf16 interleaved tile input [..., M, K] and bf16 weight [K, N] (M, K, N tile-aligned),
+    with no 8x copy of x: each core masks its own x tiles into their lanes in L1 and reads w once. None for a shape
+    it does not take."""
+    s, ws = list(x.shape), list(w.shape)
+    if len(s) < 2 or len(ws) != 2 or s[-1] != ws[0] or s[-2] % TILE or s[-1] % TILE or ws[1] % TILE:
+        return None
+    if x.dtype != ttnn.bfloat16 or w.dtype != ttnn.bfloat16 or x.layout != ttnn.TILE_LAYOUT or x.is_sharded():
+        return None
+    if w.layout != ttnn.TILE_LAYOUT or w.is_sharded() or list(x.padded_shape) != s:
+        return None
+    rows = 1
+    for d in s[:-1]:
+        rows *= d
+    mt, kt, nt = rows // TILE, s[-1] // TILE, ws[1] // TILE
+    dev = x.device()
+    work = _cores(dev.compute_with_storage_grid_size(), mt)
+    rmax = max(c for _, _, c in work)
+    page = _FP32_TILE_BYTES // 2
+    fixed = (2 * rmax + 8 + 8 * rmax) * page  # x (double), masks, lanes
+    nc = next(
+        (
+            d
+            for d in range(nt, 0, -1)
+            if nt % d == 0 and fixed + d * (rmax * _FP32_TILE_BYTES + 2 * page) <= _MM_L1_BYTES
+        ),
+        0,
+    )
+    if not nc:
+        return None
+    sbw = next(d for d in (4, 3, 2, 1) if nc % d == 0)
+    masks = _col_masks(dev)
+    y = ttnn.empty(s[:-1] + [ws[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb(index, pages, dtype):
+        size = _FP32_TILE_BYTES if dtype == ttnn.float32 else page
+        return ttnn.CBDescriptor(
+            total_size=pages * size,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=index, data_format=dtype, page_size=size)],
+        )
+
+    cbs = [
+        cb(0, 2 * rmax, ttnn.bfloat16),
+        cb(1, 2 * nc, ttnn.bfloat16),
+        cb(2, 8, ttnn.bfloat16),
+        cb(3, 8 * rmax, ttnn.bfloat16),
+        cb(_OUT_CB, rmax * nc, ttnn.float32),
+    ]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [x.buffer_address(), w.buffer_address(), masks.buffer_address(), start, count]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [y.buffer_address(), start, count]
+    compute_cfg = ttnn.ComputeConfigDescriptor(math_fidelity=fidelity, fp32_dest_acc_en=True)
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_MM_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args()
+            + ttnn.TensorAccessorArgs(w).get_compile_time_args()
+            + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
+            + [kt, nt, nc],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_MM_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[kt, nt, nc, sbw, rmax],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_MM_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(y).get_compile_time_args() + [nt, nc],
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([x, w, masks, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return y
+
+
 _WL_READER = f"{_DIR}/weight_lanes_reader.cpp"
 _WL_COMPUTE = f"{_DIR}/weight_lanes_compute.cpp"
 _EIGHT_OUT_WRITER = f"{_DIR}/eight_out_writer.cpp"

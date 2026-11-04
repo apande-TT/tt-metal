@@ -31,6 +31,7 @@ from models.demos.qwen_image_edit.tt.guard_kernel import (
     guard_tail,
     head_split,
     lane_cols_sum,
+    masked_lane_linear,
     modulate_tail,
     repeat_k,
     row_gather,
@@ -296,6 +297,7 @@ class TtQwenImageEditPipeline:
         # (and the QK^T's 8 lane products as one K-stacked product: q's lanes side by side along K by tt-lang)
         # (and its exact all-reduces gathered in 128 MB-per-partial row chunks: 2 per stream and axis, not 6)
         # (and the QK^T's lead k limb read from L1 by its lane / dense / negated products at 16-entry groups too)
+        # (and the K-stacked lanes' products by the C++ masked-lane linear: x's lanes masked in L1, no 8x input copy)
         # (and the lanes the K-stack skips (the narrow out-proj) as ONE N-stacked full-grid product, summed by the C++
         # lane_cols_sum in one pass over its column blocks)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
@@ -324,6 +326,8 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_STACK", repeat_k if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "LANE_NSTACK", lane_cols_sum if self.weight_lane_split else None
+        ), self._hook(
+            _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail():

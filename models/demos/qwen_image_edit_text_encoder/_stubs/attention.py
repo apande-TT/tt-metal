@@ -379,6 +379,9 @@ LANE_STACK_FIDELITY = ttnn.MathFidelity.HiFi4
 # column blocks, g = x @ [lane 0 | ... | lane 7] (N' = 8N), or None. The 8 lane products then run as ONE product over
 # the whole grid (a narrow N fills only part of it) and their sum is one pass over its float32 output.
 LANE_NSTACK = None
+# Optional in place of the K-stacked product: LANE_MASKED_MM(x, w, fidelity) -> sum_r lane_r(x) @ w in float32 with no
+# 8x copy of x (each core masks its x tiles into their lanes in L1), or None for a product it does not take.
+LANE_MASKED_MM = None
 _ROW_LANE_MASKS = {}
 
 
@@ -407,6 +410,20 @@ def _weight_lane_sums(lead, ws):
         rows *= d
     if 2 * sum(w.shape[-1] for w in ws) > rows or any(len(w.shape) != 2 for w in ws):
         return None
+    if LANE_MASKED_MM is not None and LANE_STACK is not None and WEIGHT_LANE_SPLIT is not None:
+        n_all = sum(w.shape[-1] for w in ws)
+        if not LANE_STACK_MAX_K_PER_N or lead.shape[-1] <= LANE_STACK_MAX_K_PER_N * n_all:
+            outs = []
+            for w in ws:
+                y = LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
+                if y is None:
+                    for t in outs:
+                        ttnn.deallocate(t)
+                    outs = None
+                    break
+                outs.append(y)
+            if outs is not None:
+                return outs
     accs = [_LaneAcc() for _ in ws]
     cache = LANE_CACHE if WEIGHT_LANE_SPLIT is not None else None
     if cache is not None:
