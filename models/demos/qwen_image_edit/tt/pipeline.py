@@ -41,6 +41,7 @@ from models.demos.qwen_image_edit.tt.block_sum import (
     fused_block_sum,
     fused_block_sum_bias,
     fused_block_sum_gated,
+    fused_face_sum_bias,
     fused_sum_bias,
 )
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
@@ -329,6 +330,10 @@ class QwenImageEditTT:
         # stacked [hi; lo], so each modulation linear (B rows: too few for the fused limb linear) is one matmul that
         # reads its weight once instead of one per limb
         _tr_stack.STACK_TEMB_LIMBS = True
+        # both limbs in one tile row (B <= 16) and the products' sum + bias as one face-sum pass over that tile row
+        _tr_precise.FACE_SUM_BIAS_FN = lambda y, rows, bias_rows: fused_face_sum_bias(
+            y, rows, bias_rows, ttnn.DRAM_MEMORY_CONFIG
+        )
         # the blocks' float32 LayerNorm + modulation as one C++ program (ln_rows: no float32 intermediates)
         _tr_stack.MODULATE_FN = fused_ln_modulate
         _tr_stack.MODULATE_SPLIT = True  # writing its bf16 limbs (the q/k/v and FF-up inputs) instead of float32

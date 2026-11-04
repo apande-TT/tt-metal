@@ -47,6 +47,20 @@ def fused_sum_bias(a, b, bias_rows, mem):
     return _sum_program([a, b, bias_rows], out, 3, "reader_sum_bias.cpp", reader_ct)
 
 
+def fused_face_sum_bias(y, rows, bias_rows, mem):
+    """(a + b) + bias for a float32 TILE y [32, N] holding two limbs' products in one tile row: a its rows 0..15, b
+    its rows 16..31 (the first `rows` <= 16 of each valid) -> float32 [rows, N], the same SFPU float32 adds in the
+    same order as fused_sum_bias(a, b, bias_rows); None for any other shape."""
+    if len(y.shape) != 2 or int(y.padded_shape[-2]) != 32 or rows > 16 or y.is_sharded():
+        return None
+    shape = [rows, int(y.shape[-1])]
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), ttnn.float32, ttnn.TILE_LAYOUT, y.device(), mem)
+    reader_ct = [int(y.padded_shape[-1]) // 32]
+    for t in (y, bias_rows):
+        reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    return _sum_program([y, bias_rows], out, 3, "reader_face_sum_bias.cpp", reader_ct)
+
+
 def _tiles(t):
     vol = 1
     for d in t.padded_shape:
