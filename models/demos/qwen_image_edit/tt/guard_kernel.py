@@ -362,7 +362,7 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
     )
     if not nc:
         return None
-    sbw = next(d for d in (4, 3, 2, 1) if nc % d == 0)
+    sbw = 2 if nc % 2 == 0 else 1  # (2-row subblocks: 2 x sbw <= the 4 float32 DST tiles)
     masks = _col_masks(dev)
     y = ttnn.empty(s[:-1] + [ws[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
