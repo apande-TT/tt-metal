@@ -80,6 +80,8 @@ MOD_GATHER_L1 = False
 # a sliced stream's MODULATE_FN(..., split=True, packed=True) writes its limbs stacked in one tensor, gathered by one
 # all_gather and read from there by the fused limb linears (_precise.PackedLimbs); False: two limb tensors, two gathers
 GATHER_PACKED = False
+# with SHARE_TEMB_LIMBS: temb's limbs stacked as row blocks (_precise.StackedLimbs): each modulation linear one matmul
+STACK_TEMB_LIMBS = False
 
 
 def _t3(t):
@@ -296,7 +298,20 @@ class TtQwenBlockStack:
             if _TEMB_CACHE.get("temb") is not temb_arg:
                 _TEMB_CACHE.clear()
                 silu = ttnn.silu(temb)
-                _TEMB_CACHE.update(temb=temb_arg, silu=silu, parts=_precise.SPLIT_FN(silu, ttnn.L1_MEMORY_CONFIG))
+                parts = _precise.SPLIT_FN(silu, ttnn.L1_MEMORY_CONFIG)
+                if STACK_TEMB_LIMBS and len(silu.shape) == 2:
+                    # hi and lo as the row blocks of one [2 * mp, dim] tensor (each zero-padded to whole tiles):
+                    # one matmul per modulation linear, reading its weight once for both limbs (in DRAM: a tensor
+                    # held in L1 through the forward clashes with the fused limb kernels' static CBs)
+                    dram, rows = ttnn.DRAM_MEMORY_CONFIG, int(silu.shape[0])
+                    mp = -(-rows // 32) * 32
+                    pad = lambda t: ttnn.pad(t, [(0, mp - rows), (0, 0)], 0.0, memory_config=dram)
+                    padded = [pad(t) for t in parts]
+                    stacked = ttnn.concat(padded, dim=0, memory_config=dram)
+                    for t in padded:
+                        ttnn.deallocate(t)
+                    parts = _precise.StackedLimbs(stacked, rows, mp, parts)
+                _TEMB_CACHE.update(temb=temb_arg, silu=silu, parts=parts)
             silu_temb, temb_parts = _TEMB_CACHE["silu"], _TEMB_CACHE["parts"]
         else:
             silu_temb = ttnn.silu(temb) if _precise.ENABLED else ttnn.typecast(ttnn.silu(temb), ttnn.bfloat16)

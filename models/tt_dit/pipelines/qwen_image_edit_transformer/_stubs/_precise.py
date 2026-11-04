@@ -101,6 +101,15 @@ class PackedLimbs:
         return ttnn.reshape(hi, shape[1:]), ttnn.reshape(lo, shape[1:])
 
 
+class StackedLimbs:
+    """x's [rows, K] limbs as the two row blocks of one bf16 tensor t [2 * mp, K] (hi in rows [0, rows), lo in rows
+    [mp, mp + rows), mp = rows padded to whole tiles, zero rows between): linear() runs one matmul over both (the
+    weight read once); parts: the (hi, lo) limbs themselves, for anything else."""
+
+    def __init__(self, t, rows, mp, parts):
+        self.t, self.rows, self.mp, self.parts = t, rows, mp, parts
+
+
 def register_split(x, parts):
     """x's (hi, lo) limbs, made by its producer as SPLIT_FN would: the next split_bf16(x) returns them."""
     _PRESPLIT[id(x)] = (x, parts)
@@ -128,6 +137,11 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
         if y is not None:
             return y
         limbs = limbs.unpack()
+    if isinstance(limbs, StackedLimbs):
+        y = _stacked_linear(limbs, w, bias)
+        if y is not None:
+            return y
+        limbs = limbs.parts
     hi, lo = limbs
     if (
         LIMB_LINEAR_BIAS_FN is not None
@@ -146,11 +160,34 @@ def linear(x, w, bias=None, compute_kernel_config=None, parts=None):
             if bias is None
             else ttnn.add(y, bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32))
         )
-    pc = LINEAR_PC_FN(hi, w) if LINEAR_PC_FN is not None else None
-    kw = {} if pc is None else {"core_grid": pc} if isinstance(pc, ttnn.CoreGrid) else {"program_config": pc}
-    y_hi = ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **kw)
+    y_hi = ttnn.linear(hi, w, compute_kernel_config=cfg, dtype=ttnn.float32, **_pc_kw(hi, w))
     cfg_lo = cfg if LO_FIDELITY is None else precise_config(LO_FIDELITY)
-    y_lo = ttnn.linear(lo, w, compute_kernel_config=cfg_lo, dtype=ttnn.float32, **kw)
+    y_lo = ttnn.linear(lo, w, compute_kernel_config=cfg_lo, dtype=ttnn.float32, **_pc_kw(lo, w))
+    return _sum_bias(y_hi, y_lo, bias)
+
+
+def _pc_kw(x, w):
+    pc = LINEAR_PC_FN(x, w) if LINEAR_PC_FN is not None else None
+    return {} if pc is None else {"core_grid": pc} if isinstance(pc, ttnn.CoreGrid) else {"program_config": pc}
+
+
+def _stacked_linear(limbs, w, bias):
+    """linear() of StackedLimbs as ONE stock matmul over both limbs' row blocks (the weight read once; each output
+    row's K sum is the one its own limb's matmul makes), then the limb products' sum + bias as linear() adds them;
+    None with LO_FIDELITY (the two limbs' products then take different fidelities)."""
+    if LO_FIDELITY is not None:
+        return None
+    t, rows, mp = limbs.t, limbs.rows, limbs.mp
+    y = ttnn.linear(t, w, compute_kernel_config=precise_config(), dtype=ttnn.float32, **_pc_kw(t, w))
+    n = int(y.shape[-1])
+    y_hi = ttnn.slice(y, (0, 0), (rows, n))
+    y_lo = ttnn.slice(y, (mp, 0), (mp + rows, n))
+    ttnn.deallocate(y)
+    return _sum_bias(y_hi, y_lo, bias)
+
+
+def _sum_bias(y_hi, y_lo, bias):
+    """(y_hi + y_lo) + bias (float32), through LINEAR_SUM_BIAS_FN where it takes the shapes."""
     if LINEAR_SUM_BIAS_FN is not None and bias is not None and bias.dtype == ttnn.float32:
         n = int(y_hi.padded_shape[-1])
         one_row = math.prod(int(d) for d in list(bias.shape)[:-1]) == 1  # a bias row broadcast over the rows
