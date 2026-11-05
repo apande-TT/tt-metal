@@ -145,6 +145,8 @@ class TtQwenTextEncoder:
         _te_attention.EXACT_BMM_L1_BYTES = 8 * 1024 * 1024
         _te_attention.VISION_PV_PATTERNS = ("strided",)  # vision P @ V: one lane pattern, no median of three
         _te_attention.VISION_QK_PATTERNS = ("strided",)  # and QK^T likewise
+        # and every other exact-lane product (the vision linears, the patch embed): one lane pattern, no median of three
+        _te_attention.LANE_PATTERNS = ("strided",)
         # each lane pattern of P @ V and QK^T as one C++ kernel (lane copies, products and adds in one program)
         _te_attention.EXACT_BMM_FN = fused_lane_bmm
         # the exact-lane linears (vision tower) likewise: a lane pattern's limb x lane products + adds as one kernel
