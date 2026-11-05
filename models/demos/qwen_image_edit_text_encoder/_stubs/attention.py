@@ -440,6 +440,9 @@ VISION_FUSED_SCALE_MASK = False
 # fn(qkv, off, heads, head_dim, mem) -> [N, heads, S, head_dim] head-major (the column block off + h * head_dim per
 # head) or None; the vision attention's q / k / v heads in one call instead of slice + reshape + permute
 VISION_HEADS_FN = None
+# fn(o, mem) -> the head-major P @ V output [N, heads, S, head_dim] merged to [N, 1, S, heads * head_dim] in one call
+# (e.g. joint_heads.fused_face_merge_heads), or None; None: permute + reshape
+VISION_MERGE_FN = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
@@ -951,8 +954,13 @@ class TtVisionAttention:
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         pv_ex = VISION_PV_PATTERNS if ex and VISION_PV_PATTERNS else ex
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=pv_ex, limbs=L)
-        o = ttnn.permute(o, (0, 2, 1, 3))
-        o = ttnn.reshape(o, (n, 1, s_pad, loc))
+        merged = VISION_MERGE_FN(o, ttnn.DRAM_MEMORY_CONFIG) if VISION_MERGE_FN is not None else None
+        if merged is not None:
+            ttnn.deallocate(o)
+            o = merged
+        else:
+            o = ttnn.permute(o, (0, 2, 1, 3))
+            o = ttnn.reshape(o, (n, 1, s_pad, loc))
         out = split_linear(o, self.wproj, compute_kernel_config=cfg, exact=ex, limbs=L)
         if self.tp > 1:
             out = exact_all_reduce(out, self.device)
