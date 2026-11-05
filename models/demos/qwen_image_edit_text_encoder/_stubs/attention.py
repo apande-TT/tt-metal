@@ -446,6 +446,9 @@ VISION_MERGE_FN = None
 # fn(x, cos, sin, mem) -> x * cos + rotate_half(x) * sin in one call for the vision q / k (e.g.
 # rope_rows.fused_rope_rows), or None where it does not take the shapes; None: the stock chain
 VISION_ROPE_FN = None
+# fn(s, None, mem) -> softmax(s, dim=-1) bit-identical to the max / subtract / exp / sum (HiFi4, fp32 DEST) / divide
+# chain the vision attention runs after its scale + mask add (e.g. softmax_rows.fused_softmax_rows); None: the chain
+VISION_SOFTMAX_FN = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
@@ -957,9 +960,13 @@ class TtVisionAttention:
             scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
         # explicit float32 softmax (the fused op mis-scales some masked window rows: one token of block
         # 12 measured 6.7% off with exact inputs)
-        mx = ttnn.max(scores, dim=-1, keepdim=True)
-        e = ttnn.exp(ttnn.subtract(scores, mx))
-        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
+        if VISION_SOFTMAX_FN is not None:  # the max / subtract / exp / sum / divide chain as one kernel
+            probs = VISION_SOFTMAX_FN(scores, None, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(scores)
+        else:
+            mx = ttnn.max(scores, dim=-1, keepdim=True)
+            e = ttnn.exp(ttnn.subtract(scores, mx))
+            probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
         pv_ex = VISION_PV_PATTERNS if ex and VISION_PV_PATTERNS else ex
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=pv_ex, limbs=L)
         merged = VISION_MERGE_FN(o, ttnn.DRAM_MEMORY_CONFIG) if VISION_MERGE_FN is not None else None
