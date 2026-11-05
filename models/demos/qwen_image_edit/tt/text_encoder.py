@@ -24,7 +24,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
 from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear, fused_lane_linear_patterns
-from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads
+from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads, fused_face_merge_heads
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.limb_split import fused_split_merge_heads
@@ -193,6 +193,7 @@ class TtQwenTextEncoder:
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
         # faces), not slice + reshape [N, S, heads, 80] + permute (the reshape pads the 4 local heads to a tile dim)
         _te_attention.VISION_HEADS_FN = fused_face_heads
+        _te_attention.VISION_MERGE_FN = fused_face_merge_heads  # and the P @ V heads merged back by whole-face copies
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise

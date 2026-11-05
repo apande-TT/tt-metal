@@ -57,6 +57,22 @@ def fused_face_heads(x, off, heads, head_dim, mem):
     return _copy_program([x], out, "reader_face_heads.cpp", reader_ct, shape_rt)
 
 
+def fused_face_merge_heads(o, mem):
+    """o [N, H, S, D] TILE head-major (D a multiple of 16, H * D of 32; S whole tiles) -> [N, 1, S, H * D], head h in
+    columns h * D .. + D: the permute (0, 2, 1, 3) + reshape of the heads as whole-face copies (bit-identical). None
+    when the shapes do not fit."""
+    ob, os_ = [int(d) for d in o.padded_shape], [int(d) for d in o.shape]
+    if o.dtype not in (ttnn.float32, ttnn.bfloat16) or o.layout != ttnn.TILE_LAYOUT or o.is_sharded() or len(ob) != 4:
+        return None
+    N, H, S, D = os_
+    if ob[2] != S or S % 32 or D % 16 or (H * D) % 32 or ob[3] != -(-D // 32) * 32:
+        return None
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape([N, 1, S, H * D]), o.dtype, ttnn.TILE_LAYOUT, o.device(), mem)
+    reader_ct = [_BATCH] + list(ttnn.TensorAccessorArgs(o).get_compile_time_args())
+    shape_rt = [S // 32, H * D // 32, H, D // 16, ob[3] // 32]
+    return _copy_program([o], out, "reader_face_merge_heads.cpp", reader_ct, shape_rt)
+
+
 def _copy_program(srcs, out, reader, reader_ct, shape_rt):
     """`reader` streams out's tiles in order (one source tile each) into cb 16; the stock interleaved writer stores
     them. Reader runtime args: the source addresses, (tile count, first tile), then shape_rt (shapes and offsets are
