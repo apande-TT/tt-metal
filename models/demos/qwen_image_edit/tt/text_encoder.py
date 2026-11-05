@@ -30,7 +30,7 @@ from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.limb_split import fused_split_merge_heads
 from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
-from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
+from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_rows
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -194,6 +194,7 @@ class TtQwenTextEncoder:
         # faces), not slice + reshape [N, S, heads, 80] + permute (the reshape pads the 4 local heads to a tile dim)
         _te_attention.VISION_HEADS_FN = fused_face_heads
         _te_attention.VISION_MERGE_FN = fused_face_merge_heads  # and the P @ V heads merged back by whole-face copies
+        _te_attention.VISION_ROPE_FN = fused_rope_rows  # and the q / k rope as one program (D / 2 = 40: not tile aligned)
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise

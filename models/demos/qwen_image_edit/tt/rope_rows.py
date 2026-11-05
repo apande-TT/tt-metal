@@ -94,7 +94,107 @@ def fused_rope(x, cos, sin, mem=None):
             kernel_source=os.path.join(_KERNELS, "rope_swap.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[Dt],
+            compile_time_args=[Dt, 1],
+            runtime_args=cp_rt,
+            config=cfg,
+        ),
+    ]
+    return ttnn.generic_op([x, cos, sin, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+
+
+_SIN_SIGNED = {}  # id(sin) -> (sin, [-sin | sin] over the head's two halves)
+
+
+def _sin_signed(sin, half):
+    """sin with rotate_half's sign folded in: -sin on the first `half` columns (exact), built once per table."""
+    hit = _SIN_SIGNED.get(id(sin))
+    if hit is None or hit[0] is not sin:
+        if len(_SIN_SIGNED) >= 8:
+            _SIN_SIGNED.clear()
+        shape = [int(d) for d in sin.shape]
+        a = ttnn.slice(sin, [0] * len(shape), shape[:-1] + [half])
+        b = ttnn.slice(sin, [0] * (len(shape) - 1) + [half], shape)
+        hit = (sin, ttnn.concat([ttnn.neg(a), b], dim=-1))
+        _SIN_SIGNED[id(sin)] = hit
+    return hit[1]
+
+
+def fused_rope_rows(x, cos, sin, mem=None):
+    """fused_rope for a head width D whose half is not tile aligned (D / 2 a multiple of 8, e.g. 80): x [B, H, S, D]
+    float32 TILE (padded columns zero), cos / sin [1, 1, S, D] -> x * cos + rotate_half(x) * sin, bit-identical to the
+    ttnn chain (-x2 * sin is x2 * -sin exactly; the padded columns stay zero). kernels/reader_rope_rows.cpp builds
+    each head row's half-swapped tiles in L1; rope_swap.cpp makes the same SFPU multiplies and add. None when the
+    shapes do not fit."""
+    if len(x.shape) != 4 or any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT for t in (x, cos, sin)):
+        return None
+    if x.is_sharded() or cos.is_sharded() or sin.is_sharded():
+        return None
+    B, H, S, D = (int(d) for d in x.shape)
+    Dt = -(-D // 32)
+    if D % 16 or (D // 2) % 8 or S % 32 or int(x.padded_shape[-2]) != S or int(x.padded_shape[-1]) != Dt * 32:
+        return None
+    if list(cos.shape) != [1, 1, S, D] or list(sin.shape) != [1, 1, S, D]:
+        return None
+    sin = _sin_signed(sin, D // 2)
+    St = S // 32
+    device = x.device()
+    out = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG)
+    n_groups = B * H * St
+    reader_ct = [Dt, St, D]
+    for t in (x, cos, sin):
+        reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    grid = device.compute_with_storage_grid_size()
+    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, n_groups)
+    page = 4096  # one float32 tile
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=pages * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
+        )
+        for i, pages in ((0, 8 * Dt), (16, 2))  # a head row group's 4 * Dt tiles double-buffered
+    ]
+    rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    addrs = [x.buffer_address(), cos.buffer_address(), sin.buffer_address()]
+    start = 0
+    for group, per in ((group1, per1), (group2, per2)):
+        for r in group.ranges():
+            for cx in range(r.start.x, r.end.x + 1):
+                for cy in range(r.start.y, r.end.y + 1):
+                    rd_rt[cx][cy] = addrs + [per, start]
+                    wr_rt[cx][cy] = [out.buffer_address(), per * Dt, start * Dt]
+                    cp_rt[cx][cy] = [per * Dt, start * Dt]
+                    start += per
+    cfg = ttnn.ComputeConfigDescriptor()
+    cfg.math_fidelity = ttnn.MathFidelity.HiFi4
+    cfg.fp32_dest_acc_en = True
+    cfg.math_approx_mode = False
+    modes = [ttnn.UnpackToDestMode.Default] * 32
+    modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    cfg.unpack_to_dest_mode = modes
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KERNELS, "reader_rope_rows.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=reader_ct,
+            runtime_args=rd_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_TT_METAL, _WRITER),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            runtime_args=wr_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=os.path.join(_KERNELS, "rope_swap.cpp"),
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[Dt, 0],
             runtime_args=cp_rt,
             config=cfg,
         ),

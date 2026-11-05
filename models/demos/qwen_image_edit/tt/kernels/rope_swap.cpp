@@ -25,6 +25,8 @@ void kernel_main() {
     const uint32_t num_tiles = get_arg_val<uint32_t>(0);
     const uint32_t start_tile = get_arg_val<uint32_t>(1);
     constexpr uint32_t Dt = get_compile_time_arg_val(0);
+    // 1: negate the half-swapped tile of the first Dt / 2 tiles (rotate_half's -x2); 0: the sin table carries it
+    constexpr uint32_t negate = get_compile_time_arg_val(1);
 
     constexpr uint32_t cb_in_id = 0;
     constexpr uint32_t cb_out_id = 16;
@@ -42,7 +44,7 @@ void kernel_main() {
         mul_binary_tile(0, 1, 0);
         copy_init(cb_in_id);
         copy_tile(cb_in_id, 1, 1);
-        if (t % Dt < Dt / 2) {
+        if (negate && t % Dt < Dt / 2) {
             negative_tile_init();
             negative_tile(1);
         }
