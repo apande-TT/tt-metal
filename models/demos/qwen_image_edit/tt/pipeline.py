@@ -124,6 +124,9 @@ STAGE_MAX_BATCH = {}
 # true CFG as ONE transformer pass over [cond; uncond] (the shorter text zero-padded to the longer and masked
 # out) instead of a cond pass and an uncond pass per step: half the per-block programs and TP reduces
 CFG_BATCH = True
+# CFG_BATCH's text zero-padding appended in TILE layout straight into L1 (ttnn.pad), then batched into DRAM (no
+# untilize -> row-major zeros + concat -> tilize round trip)
+CFG_PAD_TILED_L1 = True
 
 
 def _replicated(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
@@ -481,10 +484,16 @@ class QwenImageEditTT:
                 n = int(t.shape[1])
                 if n == L:
                     return t
+                if CFG_PAD_TILED_L1 and t.layout == ttnn.TILE_LAYOUT:
+                    return ttnn.pad(t, [(0, 0), (0, L - n), (0, 0)], 0.0, memory_config=ttnn.L1_MEMORY_CONFIG)
                 z = ttnn.zeros((t.shape[0], L - n, t.shape[2]), dtype=t.dtype, layout=t.layout, device=self.device)
                 return ttnn.concat([t, z], dim=1)
 
-            p._cfg_txt = ttnn.concat([pad(pe), pad(neg_pe)], dim=0)
+            parts = [pad(pe), pad(neg_pe)]
+            p._cfg_txt = ttnn.concat(parts, dim=0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            for t, src in zip(parts, (pe, neg_pe)):
+                if t is not src:
+                    ttnn.deallocate(t)
             p._cfg_rope = self.rope(p, L)
             p._cfg_key = key
         return p._cfg_txt, p._cfg_rope
