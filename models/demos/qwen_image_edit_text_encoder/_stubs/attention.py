@@ -468,6 +468,8 @@ EXACT_LINEAR_PATTERNS_FN = None
 # lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
 # i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
 VISION_PV_PATTERNS = None
+# likewise for the vision attention's QK^T exact-lane product (None: the attention's own `exact`)
+VISION_QK_PATTERNS = None
 # hand-shaped 2-D multicast config for those products on LINEAR_CORE_GRID (False: core_grid only;
 # ttnn then picks per_core_N=19 for the LM MLP, i.e. 1x1 subblocks and 2-row output blocks that
 # re-stream the weight per block)
@@ -952,7 +954,8 @@ class TtVisionAttention:
 
         q, k = _rope(q), _rope(k)
         mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, limbs=L)
+        qk_ex = VISION_QK_PATTERNS if ex and VISION_QK_PATTERNS else ex
+        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=qk_ex, limbs=L)
         if VISION_FUSED_SCALE_MASK:  # the logit scale as the mask add's input activation (one pass)
             scale = [ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, self.scale)]
             scores = ttnn.add(scores, mask, input_tensor_a_activations=scale)
