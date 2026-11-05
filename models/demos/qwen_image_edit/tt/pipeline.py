@@ -300,9 +300,13 @@ class TtQwenImageEditPipeline:
         # (and the K-stacked lanes' products by the C++ masked-lane linear: x's lanes masked in L1, no 8x input copy)
         # (and the lanes the K-stack skips (the narrow out-proj) as ONE N-stacked full-grid product, summed by the C++
         # lane_cols_sum in one pass over its column blocks)
+        # (and the guard's dense lead-limb product, which only checks the exact-lane sum and breaks a glitch's tie, at
+        # HiFi3, the exact lane products' fidelity: HiFi2 trips the guard's 2^-12 slack and takes PCC to 0.898)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
-            _dit_precise, "LANE_REUSE", bool(self.weight_lane_split)
-        ), self._hook(_dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024), self._hook(
+            _te_attention, "DN_FIDELITY", ttnn.MathFidelity.HiFi3 if self.weight_lane_split else ttnn.MathFidelity.HiFi4
+        ), self._hook(_dit_precise, "LANE_REUSE", bool(self.weight_lane_split)), self._hook(
+            _dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024
+        ), self._hook(
             _te_attention, "NORM_BF16_SQUARE", True
         ), self._hook(
             _te_attention, "NORM_SQUARE", square_ttl.square if self.weight_lane_split else None

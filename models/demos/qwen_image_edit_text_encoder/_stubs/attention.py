@@ -286,6 +286,9 @@ LO_FIDELITY = ttnn.MathFidelity.HiFi4
 # glitch), as the tie-break in median(ex, dn, -nn), where a lower fidelity's ~2^-7 product error still leaves the
 # median a sound value; everywhere else the exact-lane sum is kept.
 NN_FIDELITY = ttnn.MathFidelity.HiFi4
+# Math fidelity of the guard's dense lead-limb product dn: the guard keeps the exact-lane sum wherever it is within
+# the dense floor of dn and otherwise takes median(ex, dn, -nn), so dn only checks ex and breaks a glitch's tie.
+DN_FIDELITY = ttnn.MathFidelity.HiFi4
 # Optional fused kernel for the exact-lane sums: LANE_SUM(ts) -> ((ts[0] + ts[1]) + ...) (bit-identical to the
 # ttnn.add chain) for up to LANE_SUM_WIDTH products, consuming them, or None for a list it does not take.
 LANE_SUM = None
@@ -689,7 +692,9 @@ def split_linears(x, ws, biases=None, compute_kernel_config=None, exact=True, li
     parts = split_bf16(x, limbs)
     lo_mms = [_linear_mm(x, w, LO_FIDELITY) for w in ws]
     nn_mms = [_linear_mm(x, w, NN_FIDELITY) for w in ws]
-    ys = _guarded_sums([_linear_mm(x, w) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms, nn_mms, ws=ws)
+    ys = _guarded_sums(
+        [_linear_mm(x, w, DN_FIDELITY) for w in ws], parts, [_col_norms(w) for w in ws], lo_mms, nn_mms, ws=ws
+    )
     return [_add_bias(y, b) for y, b in zip(ys, biases)]
 
 
@@ -701,7 +706,12 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     mm = _linear_mm(x, w)
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sums(
-            [mm], parts, [_col_norms(w)], [_linear_mm(x, w, LO_FIDELITY)], [_linear_mm(x, w, NN_FIDELITY)], ws=[w]
+            [_linear_mm(x, w, DN_FIDELITY)],
+            parts,
+            [_col_norms(w)],
+            [_linear_mm(x, w, LO_FIDELITY)],
+            [_linear_mm(x, w, NN_FIDELITY)],
+            ws=[w],
         )[0]
     elif exact:
         y = _exact_sum(mm, parts)
