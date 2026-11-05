@@ -465,6 +465,9 @@ EXACT_LINEAR_FN = None
 # fn(limbs, w, [lanes per pattern], memory_config) -> every lane pattern's exact-lane linear and their vote in one
 # call, or None (then EXACT_LINEAR_FN per pattern / the stock ops)
 EXACT_LINEAR_PATTERNS_FN = None
+# an EXACT_LINEAR_PATTERNS_FN result staged in L1 whose bias is added separately stays there for that add (which
+# writes DRAM) instead of being copied to DRAM first
+EXACT_BIAS_FROM_L1 = False
 # lane patterns of the vision attention's P @ V exact-lane product (None: the attention's own `exact`,
 # i.e. the median of all LANE_PATTERNS; e.g. ("strided",): one pattern, no vote)
 VISION_PV_PATTERNS = None
@@ -563,6 +566,8 @@ def _exact_linear_fn(parts, w, patterns, out_bytes, bias=None):
                 return (ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out), True
         out = EXACT_LINEAR_PATTERNS_FN(parts, w, lane_lists, mem)
         if out is not None:
+            if l1 and bias is not None and EXACT_BIAS_FROM_L1:
+                return out, False  # left in L1: split_linear's bias add reads it there and writes DRAM
             return (ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG) if l1 else out), False
     ests = []
     for pattern in patterns:
@@ -651,6 +656,10 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
                     ttnn.deallocate(t)
                 y = s
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
+    if bias is not None and y.memory_config().buffer_type == ttnn.BufferType.L1:
+        out = ttnn.add(y, ttnn.typecast(bias, ttnn.float32), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(y)
+        return out
     return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
 
 
