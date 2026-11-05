@@ -443,6 +443,9 @@ VISION_HEADS_FN = None
 # fn(o, mem) -> the head-major P @ V output [N, heads, S, head_dim] merged to [N, 1, S, heads * head_dim] in one call
 # (e.g. joint_heads.fused_face_merge_heads), or None; None: permute + reshape
 VISION_MERGE_FN = None
+# fn(x, cos, sin, mem) -> x * cos + rotate_half(x) * sin in one call for the vision q / k (e.g.
+# rope_rows.fused_rope_rows), or None where it does not take the shapes; None: the stock chain
+VISION_ROPE_FN = None
 # core grid for split_linear's exact-lane products (None: ttnn.linear picks its own)
 EXACT_LINEAR_CORE_GRID = None
 # split_linear's exact-lane products stage the bf16 weight and the activation limbs in L1 once per call when
@@ -926,6 +929,11 @@ class TtVisionAttention:
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
         def _rope(t):
+            if VISION_ROPE_FN is not None:
+                out = VISION_ROPE_FN(t, cos, sin, ttnn.DRAM_MEMORY_CONFIG)
+                if out is not None:
+                    ttnn.deallocate(t)
+                    return out
             if not (0 < 4 * math.prod([int(d) for d in t.padded_shape]) <= VISION_ROPE_L1_BYTES):
                 return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
             # the rotation's intermediates in L1; only the result goes to DRAM
