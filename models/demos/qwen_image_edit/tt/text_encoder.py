@@ -57,8 +57,9 @@ LM_EXACT = False
 # the vision tower needs the exact 8-lane K reduction (without it the image PCC measured 0.55), but it
 # forms it with one lane pattern instead of the median of three: the median only outvotes a rare
 # power-of-two glitch, and it triples the ~24 matmuls + masks + adds of every vision linear.
-# Back to the median (True = every lane pattern): on tt-metal f6b166e383 one image's min PCC fell to
-# 0.942 with a single pattern and the median holds it at the gate (models without this win: 0.9607).
+# True = every LANE_PATTERNS pattern; TtQwenTextEncoder sets LANE_PATTERNS / VISION_QK_PATTERNS / VISION_PV_PATTERNS
+# to the single "strided" pattern (2026-11-05: e2e gate PCC 0.9508 -> 0.9636, vision 823 -> 391 ms; on tt-metal
+# f6b166e383 one image's min PCC had fallen to 0.942 with a single pattern).
 VISION_EXACT = True
 # bf16 limbs of the vision MLP's input in the precise path (the rest of the tower uses 3)
 VISION_MLP_LIMBS = 2
