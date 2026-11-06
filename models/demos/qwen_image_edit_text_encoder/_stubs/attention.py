@@ -78,16 +78,124 @@ def upload(device, array, dtype=ttnn.bfloat16, mapper=None):
     )
 
 
-def block_mask(cu_seqlens, s, s_pad):
-    """[1, 1, s_pad, s_pad] additive mask: 0 within a cu_seqlens segment, MASK_NEG elsewhere.
-    Padded key columns are masked; padded query rows are left unmasked (they are sliced away)."""
+def segment_ids(cu_seqlens, s_pad):
+    """The segment each of s_pad positions belongs to, -1 for a position inside none of them."""
     seg = np.full((s_pad,), -1, dtype=np.int64)
     bounds = [int(v) for v in cu_seqlens]
     for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
         seg[lo:hi] = i
-    mask = np.where((seg[:, None] == seg[None, :]) & (seg[None, :] >= 0), 0.0, MASK_NEG).astype(np.float32)
-    mask[s:, :] = 0.0
-    return mask.reshape(1, 1, s_pad, s_pad)
+    return seg
+
+
+def block_mask(cu_seqlens, s, s_pad, rows=None, cols=None):
+    """[1, 1, R, C] additive mask: 0 within a cu_seqlens segment, MASK_NEG elsewhere.
+    Padded key columns are masked; padded query rows are left unmasked (they are sliced away).
+
+    rows / cols: half-open (lo, hi) sub-ranges to build in place of the whole [s_pad, s_pad] matrix. The
+    entries are the ones that matrix holds, so a row chunk can take the block it needs without the matrix
+    it is a part of ever existing -- see SegmentPlan for why that matters at an edit's real resolution."""
+    seg = segment_ids(cu_seqlens, s_pad)
+    r0, r1 = rows if rows is not None else (0, s_pad)
+    c0, c1 = cols if cols is not None else (0, s_pad)
+    qs, ks = seg[r0:r1], seg[c0:c1]
+    mask = np.where((qs[:, None] == ks[None, :]) & (ks[None, :] >= 0), 0.0, MASK_NEG).astype(np.float32)
+    if s < r1:  # padded query rows attend everywhere; they are sliced away
+        mask[max(0, s - r0) :, :] = 0.0
+    return mask.reshape(1, 1, r1 - r0, c1 - c0)
+
+
+# FLOAT32 SCORE BYTES ONE ATTENTION CHUNK MAY HOLD, the ceiling SegmentPlan sizes its chunks to. Named
+# as _precise.CHUNK_ROWS_BYTES is, and for the same reason: the transient, not the resident weights, is
+# what runs a chip out of DRAM. 48 MB leaves room for the limbs each exact product carries alongside it.
+SEGMENT_SCORE_BYTES = 48 * 1024 * 1024
+
+
+class SegmentPlan:
+    """A vision block's attention mask as the segments it is made of, rather than the [s_pad, s_pad]
+    matrix those segments describe.
+
+    The dense form costs s_pad ** 2 per mask and the tower builds two of them, which is 61 MB at a
+    256 x 256 edit but 969 MB at 1024 x 1024 -- and the scores each is added to cost that again per head.
+    So the dense form, not the hardware, is what caps the resolution this tower can run: a 1024 x 1024
+    edit dies on the FIRST of the two masks, before one score has been computed.
+
+    A row only ever attends within its own segment, so a chunk of rows needs only the columns of the
+    segments it covers. This carries the boundaries instead of the matrix, and `chunks` walks them: a
+    window block's chunk is a group of whole windows, whose scores are chunk-sized rather than
+    sequence-sized; a full block's single segment is divided by rows alone and keeps all its columns.
+    Masks are built per chunk through block_mask and cached by shape, since every interior chunk of a
+    window block has the same one."""
+
+    def __init__(self, cu_seqlens, s, s_pad):
+        self.cu_seqlens = [int(v) for v in cu_seqlens]
+        self.s, self.s_pad = int(s), int(s_pad)
+        self._masks = {}
+
+    def _segments(self):
+        """The (lo, hi) of each segment, clipped to the real rows: padded rows own no segment."""
+        b = self.cu_seqlens
+        return [(lo, min(hi, self.s)) for lo, hi in zip(b[:-1], b[1:]) if lo < self.s]
+
+    def chunks(self, heads):
+        """(row_lo, row_hi, key_lo, key_hi) per chunk, partitioning the rows in order.
+
+        EVERY BOUND IS A MULTIPLE OF THE TILE. A window ends wherever the image's last column falls, so
+        the segment bounds themselves are not tile multiples and slicing a tiled tensor on one is not
+        something this stack can do. Chunks therefore break on tile boundaries and take, as their keys,
+        the tile-aligned cover of every segment those rows touch -- a few columns wider than the rows
+        strictly need, and the mask built for the chunk accounts for them exactly.
+
+        The step is the whole sequence's worth of columns when one segment is wider than a square chunk
+        (the full-attention block, whose rows do read every column), and a square chunk otherwise (a
+        window block, whose keys stay beside its rows)."""
+        tile = TILE
+        per_row = max(1, heads * self.s_pad * 4)
+        rows_full = max(tile, (SEGMENT_SCORE_BYTES // per_row) // tile * tile)
+        rows_square = max(tile, int(math.isqrt(SEGMENT_SCORE_BYTES // max(1, heads * 4))) // tile * tile)
+        segs = self._segments()
+        widest = max((hi - lo) for lo, hi in segs)
+        step = rows_full if widest > rows_square else rows_square
+        out = []
+        for r0 in range(0, self.s_pad, step):
+            r1 = min(self.s_pad, r0 + step)
+            touch = [(lo, hi) for lo, hi in segs if lo < r1 and hi > r0] or [segs[-1]]
+            c0 = min(lo for lo, _ in touch) // tile * tile
+            c1 = min(self.s_pad, -(-max(hi for _, hi in touch) // tile) * tile)
+            out.append((r0, r1, c0, c1))
+        return out
+
+    def _pattern(self, chunk):
+        """What this chunk's mask is made of: its rows' and columns' segments, renumbered together from
+        the first one either of them uses. Two chunks that differ only in WHERE they sit come out equal,
+        which is the point -- every interior chunk of a full-attention block masks the same padded
+        columns, and a window block's repeat the same block-diagonal, so one upload serves them all.
+        Without that sharing the masks of a 1024 x 1024 edit's chunks would come to more than the dense
+        matrix this class exists to avoid."""
+        r0, r1, c0, c1 = chunk
+        seg = segment_ids(self.cu_seqlens, self.s_pad)
+        order = {}
+
+        def relabel(ids):
+            out = []
+            for v in ids:
+                if v < 0:
+                    out.append(-1)
+                    continue
+                if v not in order:
+                    order[v] = len(order)
+                out.append(order[v])
+            return tuple(out)
+
+        return relabel(seg[r0:r1].tolist()), relabel(seg[c0:c1].tolist())
+
+    def mask(self, device, chunk):
+        """This chunk's additive mask on device, or None when the chunk has nothing to mask out."""
+        key = self._pattern(chunk)
+        if key not in self._masks:
+            r0, r1, c0, c1 = chunk
+            m = block_mask(self.cu_seqlens, self.s, self.s_pad, rows=(r0, r1), cols=(c0, c1))
+            self._masks[key] = upload(device, m, dtype=ttnn.float32) if (m == MASK_NEG).any() else None
+        return self._masks[key]
 
 
 def upload_rows(device, arrays, dtype=ttnn.bfloat16, col_dim=None, layout=ttnn.TILE_LAYOUT):
@@ -967,6 +1075,15 @@ def pad_rows(array, s_pad):
     return out
 
 
+def softmax_f32(scores, compute_kernel_config=None):
+    """float32 softmax along the last dim, written out rather than fused: the fused op mis-scales some
+    masked window rows (one token of block 12 measured 6.7% off with exact inputs). Both precise paths
+    and the segmented one take it from here so the three cannot drift apart."""
+    mx = ttnn.max(scores, dim=-1, keepdim=True)
+    e = ttnn.exp(ttnn.subtract(scores, mx))
+    return ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=compute_kernel_config))
+
+
 class TtVisionAttention:
     def __init__(self, device, torch_module):
         self.device = device
@@ -1043,6 +1160,41 @@ class TtVisionAttention:
         sin = pad_rows(np.asarray(sin, dtype=np.float32), s_pad).reshape(1, 1, s_pad, D)
         return upload(self.device, cos), upload(self.device, sin)
 
+    def _attend_by_segments(self, q, k, v, plan, score_mm, soft, out_mm, v_prep=None):
+        """probs @ v over `plan`'s row chunks, concatenated and padded back to the sequence.
+
+        The whole-sequence form holds [N, heads, s_pad, s_pad] scores; this holds one chunk's worth. The
+        result is the same tensor: the softmax is taken along a row, so a row's probabilities depend on
+        its own scores and on nothing above or below it, and every column that chunk leaves out is a
+        column `plan` says that row masks away.
+
+        score_mm(q_chunk, k_chunk) -> chunk scores, soft(scores) -> probabilities, out_mm(probs, value)
+        -> that chunk's output rows, and v_prep(v_chunk) -> whatever out_mm takes as its value argument
+        (the chunk's own, since a value reduction over keys is a reduction over the chunk's keys only).
+
+        Rows beyond `plan.s` are not computed. They are keys no real row attends to -- every mask this
+        tower builds masks the padded columns out of every real row -- so what the tower carries there
+        cannot reach an output, and the rows are sliced away before it returns."""
+        n, hp, s_pad, dim = q.shape[0], q.shape[1], q.shape[-2], q.shape[-1]
+        vd = v.shape[-1]
+        outs = []
+        for chunk in plan.chunks(hp):
+            r0, r1, c0, c1 = chunk
+            qc = ttnn.slice(q, [0, 0, r0, 0], [n, hp, r1, dim])
+            whole = (c0, c1) == (0, k.shape[-2])
+            kc = k if whole else ttnn.slice(k, [0, 0, c0, 0], [n, hp, c1, dim])
+            vc = v if whole else ttnn.slice(v, [0, 0, c0, 0], [n, hp, c1, vd])
+            scores = ttnn.multiply(score_mm(qc, kc), self.scale)
+            m = plan.mask(self.device, chunk)
+            if m is not None:
+                scores = ttnn.add(scores, m)
+            outs.append(out_mm(soft(scores), vc if v_prep is None else v_prep(vc)))
+        o = outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=-2)
+        rows = o.shape[-2]
+        if rows < s_pad:  # the padded tail, which no real row reads
+            o = ttnn.pad(o, [(0, 0), (0, 0), (0, s_pad - rows), (0, 0)], 0.0)
+        return o
+
     def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
         """x: [N, 1, s_pad, C] replicated (N independent images) -> [N, 1, s_pad, C] (bias included).
         tt_cos / tt_sin [1, 1, s_pad, D] and tt_mask [1, 1, s_pad, s_pad] broadcast over N."""
@@ -1067,10 +1219,21 @@ class TtVisionAttention:
 
         q, k = _rope(q), _rope(k)
 
-        scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_cfg)
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
-        probs = ttnn.softmax(scores, dim=-1, numeric_stable=True)
-        o = ttnn.matmul(probs, v, compute_kernel_config=self.compute_cfg)  # [N, hp, S, D]
+        if isinstance(tt_mask, SegmentPlan):
+            o = self._attend_by_segments(
+                q,
+                k,
+                v,
+                tt_mask,
+                lambda a, b: ttnn.matmul(a, ttnn.transpose(b, -2, -1), compute_kernel_config=self.compute_cfg),
+                lambda sc: ttnn.softmax(sc, dim=-1, numeric_stable=True),
+                lambda p, vc: ttnn.matmul(p, vc, compute_kernel_config=self.compute_cfg),
+            )
+        else:
+            scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_cfg)
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
+            probs = ttnn.softmax(scores, dim=-1, numeric_stable=True)
+            o = ttnn.matmul(probs, v, compute_kernel_config=self.compute_cfg)  # [N, hp, S, D]
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (n, 1, s_pad, loc))
 
@@ -1119,17 +1282,35 @@ class TtVisionAttention:
         q, k = _rope(q), _rope(k)
         # v's limbs and column norms (all P @ V takes of it) formed from L1 straight into DRAM: no copy of v
         dram = ttnn.DRAM_MEMORY_CONFIG
-        vt = ttnn.transpose(v, -2, -1, memory_config=dram)
-        v_pre = (split_bf16(v, L, memory_config=dram), ttnn.transpose(_norm_last(vt), -2, -1))
-        ttnn.deallocate(vt)
-        ttnn.deallocate(v)
-        mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
-        mx = ttnn.max(scores, dim=-1, keepdim=True)
-        e = ttnn.exp(ttnn.subtract(scores, mx))
-        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
-        o = split_matmul(probs, None, compute_kernel_config=cfg, limbs=L, b_pre=v_pre)  # [N, hp, S, Dp]
+
+        def _v_pre(t):
+            vt = ttnn.transpose(t, -2, -1, memory_config=dram)
+            pre = (split_bf16(t, L, memory_config=dram), ttnn.transpose(_norm_last(vt), -2, -1))
+            ttnn.deallocate(vt)
+            return pre
+
+        if isinstance(tt_mask, SegmentPlan):
+            # A chunk's value limbs and column norms are its own: the P @ V reduction runs over the keys
+            # that chunk holds, so the norms must be taken over those same keys and not the sequence.
+            o = self._attend_by_segments(
+                q,
+                k,
+                v,
+                tt_mask,
+                lambda a, b: split_matmul(a, b, transpose_b=True, compute_kernel_config=cfg, limbs=L),
+                lambda sc: softmax_f32(sc, cfg),
+                lambda p, pre: split_matmul(p, None, compute_kernel_config=cfg, limbs=L, b_pre=pre),
+                v_prep=_v_pre,
+            )
+            ttnn.deallocate(v)
+        else:
+            v_pre = _v_pre(v)
+            ttnn.deallocate(v)
+            mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
+            scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
+            probs = softmax_f32(scores, cfg)
+            o = split_matmul(probs, None, compute_kernel_config=cfg, limbs=L, b_pre=v_pre)  # [N, hp, S, Dp]
         o = ttnn.experimental.nlp_concat_heads(o)  # [N, 1, S, hp * Dp]
         if self.tp > 1:
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
@@ -1162,15 +1343,22 @@ class TtVisionAttention:
             return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
 
         q, k = _rope(q), _rope(k)
-        mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
-        scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
-        # explicit float32 softmax (the fused op mis-scales some masked window rows: one token of block
-        # 12 measured 6.7% off with exact inputs)
-        mx = ttnn.max(scores, dim=-1, keepdim=True)
-        e = ttnn.exp(ttnn.subtract(scores, mx))
-        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
-        o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)
+        if isinstance(tt_mask, SegmentPlan):
+            o = self._attend_by_segments(
+                q,
+                k,
+                v,
+                tt_mask,
+                lambda a, b: split_matmul(a, b, transpose_b=True, compute_kernel_config=cfg, limbs=L),
+                lambda sc: softmax_f32(sc, cfg),
+                lambda p, vc: split_matmul(p, vc, compute_kernel_config=cfg, limbs=L),
+            )
+        else:
+            mask = tt_mask if tt_mask.dtype == ttnn.float32 else ttnn.typecast(tt_mask, ttnn.float32)
+            scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, limbs=L)
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), mask)
+            probs = softmax_f32(scores, cfg)
+            o = split_matmul(probs, v, compute_kernel_config=cfg, limbs=L)
         o = ttnn.permute(o, (0, 2, 1, 3))
         o = ttnn.reshape(o, (n, 1, s_pad, loc))
         if self.tp > 1:

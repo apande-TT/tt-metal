@@ -25,7 +25,7 @@ import numpy as np
 
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
-    block_mask,
+    SegmentPlan,
     hifi4_config,
     onehot_matmul,
     pad_rows,
@@ -36,7 +36,6 @@ from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import _bf16
 from models.demos.qwen_image_edit_text_encoder._stubs.v_l_patch_merger import TtVLPatchMerger
 from models.demos.qwen_image_edit_text_encoder._stubs.v_l_vision_block import TtVLVisionBlock
 from models.demos.qwen_image_edit_text_encoder._stubs.vision_patch_embed import TtVisionPatchEmbed
-
 
 # Optional exact row-gather kernel for the merged rows' unpermutation: ROW_GATHER(x, perm) -> y with y[..., j, :] =
 # x[..., perm[j], :] for j < len(perm) (later rows unset), or None (the one-hot product runs).
@@ -94,8 +93,12 @@ class TtVisionTransformer:
             sin = upload(self.device, pad_rows(np.sin(emb), s_pad).reshape(1, 1, s_pad, D), dtype=ttnn.float32)
         else:
             cos, sin = self.blocks[0].block.attn.rope_tables(np.cos(emb), np.sin(emb), s_pad)
-        mask_full = upload(self.device, block_mask(cu_full, s, s_pad))
-        mask_win = upload(self.device, block_mask(cu_window, s, s_pad))
+        # THE SEGMENTS, NOT THE MATRIX THEY DESCRIBE -- the same change encoder_stack makes, for the same
+        # reason: uploaded whole these two cost s_pad ** 2 each, which is 61 MB at a 256 x 256 edit but
+        # 969 MB at the 1024 x 1024 one the pipeline targets, more than a chip has free before the first
+        # score exists. This is the port forward_batched runs, so the saving has to be made here too.
+        mask_full = SegmentPlan(cu_full, s, s_pad)
+        mask_win = SegmentPlan(cu_window, s, s_pad)
         m = s // self.unit
         m_pad = pad_to_tile(s_pad // self.unit)
         perm = np.repeat(_one_hot(rows, s_pad), n_images, axis=0)
@@ -140,7 +143,9 @@ class TtVisionTransformer:
             merged = ttnn.pad(merged, [(0, 0), (0, 0), (0, c.m_pad - m_rows), (0, 0)], 0.0)
         if self.precise:
             gathered = None if ROW_GATHER is None else ROW_GATHER(merged, c.unperm_rows)
-            merged = gathered if gathered is not None else onehot_matmul(c.unperm, merged, limbs=getattr(self, "limbs", 2))
+            merged = (
+                gathered if gathered is not None else onehot_matmul(c.unperm, merged, limbs=getattr(self, "limbs", 2))
+            )
         else:
             merged = ttnn.matmul(c.unperm, merged, compute_kernel_config=cfg)
         out = merged.shape[-1]

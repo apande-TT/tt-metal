@@ -27,8 +27,8 @@ import torch
 
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
+    SegmentPlan,
     TtVisionAttention,
-    block_mask,
     exact_all_reduce,
     hifi4_config,
     mesh_shape,
@@ -294,8 +294,12 @@ class TtVisionTransformer:
         freqs = (pos[:, :, None].astype(np.float32) * self.inv_freq[None, None, :]).reshape(s, -1)[rows]
         emb = np.concatenate([freqs, freqs], axis=-1)
         tt_cos, tt_sin = self.blocks[0].attn.rope_tables(np.cos(emb), np.sin(emb), s_pad)
-        mask_full = upload(self.device, block_mask(cu_full, s, s_pad))
-        mask_win = upload(self.device, block_mask(cu_window, s, s_pad))
+        # THE SEGMENTS, NOT THE MATRIX THEY DESCRIBE. Uploaded whole, these two cost s_pad ** 2 each --
+        # 61 MB at a 256 x 256 edit, 969 MB at the 1024 x 1024 one the pipeline actually targets, which
+        # is more than a chip has free before the first score is computed. SegmentPlan carries the same
+        # information as its boundaries and the attention walks them in chunks (see its docstring).
+        mask_full = SegmentPlan(cu_full, s, s_pad)
+        mask_win = SegmentPlan(cu_window, s, s_pad)
 
         x = ttnn.reshape(hidden_states, (1, 1, s, hidden_states.shape[-1]))
         if s_pad != s:
