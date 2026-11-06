@@ -81,6 +81,8 @@ MLP_FUSED_SILU = False
 SOFTMAX_L1_BYTES = 0
 # the LM attention softmax's exp applied as the scores - max subtract's output activation (one op, no exp round trip)
 SOFTMAX_FUSED_EXP = False
+# with SOFTMAX_L1_BYTES: the masked scores and the probabilities in L1 too (the softmax reads and P @ V reads them)
+SOFTMAX_IO_L1 = False
 # fn(t, cos, sin) -> the precise LM attention's RoPE t * cos + rotate_half(t) * sin in one call (e.g. a fused kernel),
 # or None to run the stock ops (None: slices + neg + concat + multiplies + add)
 ROPE_FN = None
@@ -269,19 +271,20 @@ class TtTextAttention:
                 k, v = ttnn.concat([kp, k], dim=2), ttnn.concat([vp, v], dim=2)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
-        if FUSED_SCALE_MASK:
-            scale = [ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, self.scale)]
-            scores = ttnn.add(scores, tt_mask, input_tensor_a_activations=scale)
-        else:
-            scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask)
-        mx = ttnn.max(scores, dim=-1, keepdim=True)
         nbytes = scores.volume() * (4 if scores.dtype == ttnn.float32 else 2)
         sm = ttnn.L1_MEMORY_CONFIG if SOFTMAX_L1_BYTES and nbytes <= SOFTMAX_L1_BYTES else None
+        io = sm if SOFTMAX_IO_L1 else None
+        if FUSED_SCALE_MASK:
+            scale = [ttnn.UnaryWithParam(ttnn.UnaryOpType.MUL_UNARY_SFPU, self.scale)]
+            scores = ttnn.add(scores, tt_mask, input_tensor_a_activations=scale, memory_config=io)
+        else:
+            scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask, memory_config=io)
+        mx = ttnn.max(scores, dim=-1, keepdim=True)
         if SOFTMAX_FUSED_EXP:
             e = ttnn.subtract(scores, mx, activations=[ttnn.UnaryOpType.EXP], memory_config=sm)
         else:
             e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=sm), memory_config=sm)
-        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg))
+        probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg), memory_config=io)
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         op = MERGE_SPLIT_FN(o) if MERGE_SPLIT_FN is not None and hl > 1 else None

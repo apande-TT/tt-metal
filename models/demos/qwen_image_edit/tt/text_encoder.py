@@ -192,6 +192,7 @@ class TtQwenTextEncoder:
         _te_layer.FUSED_SCALE_MASK = True  # the LM attention's logit scale fused into its mask add
         _te_layer.SOFTMAX_L1_BYTES = 8 * 1024 * 1024  # and its softmax intermediates in L1
         _te_layer.SOFTMAX_FUSED_EXP = True  # with the exp fused into the scores - max subtract
+        _te_layer.SOFTMAX_IO_L1 = True  # and the masked scores and the probabilities in L1 as well
         _te_layer.ROPE_FN = fused_rope  # and its float32 RoPE as one C++ kernel (no float32 intermediates)
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         _te_attention.VISION_ROPE_L1_BYTES = 4 * 1024 * 1024  # its RoPE intermediates (q / k: 2.2 MB) in L1

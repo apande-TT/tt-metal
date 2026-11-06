@@ -4,7 +4,7 @@
   "source": "checkpoint bytes + HF config",
   "total_params": 27627912755,
   "params_basis": "read set for unit=unknown: lookup-only and tower-only tensors excluded",
-  "device_weight_bytes": 7863303864,
+  "device_weight_bytes": 7863500472,
   "device_census_complete": false,
   "device_section_bytes": {
     "stacks": 7285715072,
@@ -26,7 +26,7 @@
     "vae_encode": 147933696,
     "weight": 143456448,
     "ccl_manager": 120247296,
-    "transformer": 80907264,
+    "transformer": 81103872,
     "te": 80123904,
     "vae_decode": 79685760,
     "resnets": 71346432,
@@ -52,9 +52,9 @@
     "patch_embed": 752640,
     "conv_shortcut": 481920,
     "img_in": 405504,
+    "proj_out": 393472,
     "post_attention_layernorm": 301056,
-    "input_layernorm": 301056,
-    "norm2": 267264
+    "input_layernorm": 301056
   },
   "bytes_per_param": 2.0363
 }
