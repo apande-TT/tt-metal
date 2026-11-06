@@ -29,6 +29,10 @@ from models.tt_dit.utils.conv3d import aligned_channels, count_convs
 # Mesh axes carrying the H and W partitions of the (8x4) grid.
 _H_AXIS = 0
 _W_AXIS = 1
+# the gathered [B, T, H, W * C] output to BCTHW without a [.., W, C] view (C = 3: 12-byte rows, which every
+# ROW_MAJOR op moves one at a time): tilize + transpose to [W * C, H], whose rows split into (W, C) as a view, a
+# whole-row permute to [C, W, H], then tilize + transpose back to [C, H, W]. Data movement only (bit-identical).
+CHANNELS_BY_TRANSPOSE = False
 
 
 class TtQwenImageDecoder3d:
@@ -124,16 +128,27 @@ class TtQwenImageDecoder3d:
             out = self.ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
         if self.batch_axis is not None:
             out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=self.batch_axis, use_hyperparams=False)
-        out = ttnn.reshape(out, (out.shape[0], ot, out.shape[2], out.shape[3] // oc, oc))
-        if pc.height_parallel.factor > 1:
-            ob, ot, oh, ow, oc = out.shape
-            lh, lw = H * oh // Hp, W * ow // Wp
-            if (oh, ow) != (lh, lw):
-                out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, ot, lh, lw, oc))
+        ob, oh, ow = out.shape[0], out.shape[2], out.shape[3] // oc
+        if CHANNELS_BY_TRANSPOSE and ot == 1 and oh % 32 == 0 and ow % 32 == 0:
+            out = ttnn.to_layout(ttnn.reshape(out, (ob, oh, ow * oc)), ttnn.TILE_LAYOUT)
+            out = ttnn.to_layout(ttnn.transpose(out, -2, -1), ttnn.ROW_MAJOR_LAYOUT)  # [B, W * C, H]
+            out = ttnn.permute(ttnn.reshape(out, (ob, ow, oc, oh)), (0, 2, 1, 3))  # [B, C, W, H]
+            out = ttnn.transpose(ttnn.to_layout(out, ttnn.TILE_LAYOUT), -2, -1)  # [B, C, H, W]
+            out = ttnn.reshape(out, (ob, oc, 1, oh, ow))
+            if pc.height_parallel.factor > 1:
+                lh, lw = H * oh // Hp, W * ow // Wp
+                if (oh, ow) != (lh, lw):
+                    out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, oc, 1, lh, lw))
+        else:
+            out = ttnn.reshape(out, (ob, ot, oh, ow, oc))
+            if pc.height_parallel.factor > 1:
+                lh, lw = H * oh // Hp, W * ow // Wp
+                if (oh, ow) != (lh, lw):
+                    out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, ot, lh, lw, oc))
 
-        # BCTHW while still ROW_MAJOR: tilizing BTHWC would pad its 3 channels to a 32-wide tile first
-        out = ttnn.permute(out, (0, 4, 1, 2, 3))
-        out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
+            # BCTHW while still ROW_MAJOR: tilizing BTHWC would pad its 3 channels to a 32-wide tile first
+            out = ttnn.permute(out, (0, 4, 1, 2, 3))
+            out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
         if out.shape[1] != self.out_channels:
             ob, _, ot, oh, ow = out.shape
             out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, self.out_channels, ot, oh, ow))

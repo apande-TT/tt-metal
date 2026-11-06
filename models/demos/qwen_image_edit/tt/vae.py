@@ -143,6 +143,8 @@ class TtQwenVAE:
             )
             self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
             self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
+            # its gathered 3-channel output turned BCTHW by tile transposes + whole-row moves, never as 12-byte rows
+            qwen_image_decoder3d.CHANNELS_BY_TRANSPOSE = True
             # image latents are single-frame: the decoder's causal convs keep only their live temporal tap
             self.decoder = qwen_image_decoder3d.build(
                 device,
