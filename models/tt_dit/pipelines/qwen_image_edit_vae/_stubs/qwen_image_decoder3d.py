@@ -131,8 +131,9 @@ class TtQwenImageDecoder3d:
             if (oh, ow) != (lh, lw):
                 out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, ot, lh, lw, oc))
 
+        # BCTHW while still ROW_MAJOR: tilizing BTHWC would pad its 3 channels to a 32-wide tile first
+        out = ttnn.permute(out, (0, 4, 1, 2, 3))
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
-        out = ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW
         if out.shape[1] != self.out_channels:
             ob, _, ot, oh, ow = out.shape
             out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, self.out_channels, ot, oh, ow))
