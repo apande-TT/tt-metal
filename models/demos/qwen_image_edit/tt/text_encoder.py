@@ -94,6 +94,9 @@ class TtQwenTextEncoder:
         self.num_vision_layers = (
             len(visual.blocks) if vision_layers is None else max(1, min(int(vision_layers), len(visual.blocks)))
         )
+        # the towers' weights arrive already tiled (host tilize + cast, the device path's transient buffers replayed),
+        # not as row-major float32 tilized on device
+        _te_attention.HOST_TILIZE = True
         # Depth caps build fewer repeats of each stack; the rest of each module is intact.
         vis_blocks, lm_layers = visual.blocks, lm.layers
         try:

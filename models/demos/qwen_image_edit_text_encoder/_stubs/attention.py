@@ -68,12 +68,34 @@ def hifi4_config():
     )
 
 
+# upload / upload_rows tilize (and cast) on the host and copy the finished tiles, instead of copying row-major
+# float32 and running a tilize + typecast on every device (load-time device work, same tiles). The device path's
+# transient buffers are still allocated and freed in its order (no kernels run), so every later DRAM allocation
+# lands where it did -- the traced denoise is sensitive to that layout.
+HOST_TILIZE = False
+
+
+def _from_torch(t, dtype, layout, device, mapper):
+    if not HOST_TILIZE or t.dtype != torch.float32 or layout != ttnn.TILE_LAYOUT:
+        return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, mesh_mapper=mapper)
+    host = ttnn.from_torch(t, dtype=dtype, layout=layout, mesh_mapper=mapper)
+    shape, dram = host.shape, ttnn.DRAM_MEMORY_CONFIG
+    src_rm = ttnn.allocate_tensor_on_device(shape, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, device, dram)
+    if dtype == ttnn.float32:  # RM -> tilize: the tiles land beside the row-major copy, which is then freed
+        out = ttnn.to_device(host, device)
+        ttnn.deallocate(src_rm)
+        return out
+    src_tile = ttnn.allocate_tensor_on_device(shape, ttnn.float32, ttnn.TILE_LAYOUT, device, dram)
+    ttnn.deallocate(src_rm)  # RM -> tilize -> typecast: the cast tiles land after the row-major copy is freed
+    out = ttnn.to_device(host, device)
+    ttnn.deallocate(src_tile)
+    return out
+
+
 def upload(device, array, dtype=ttnn.bfloat16, mapper=None):
     """numpy / torch host tensor -> tile-layout device tensor (replicated by default)."""
     t = torch.from_numpy(np.ascontiguousarray(array)) if isinstance(array, np.ndarray) else array.contiguous()
-    return ttnn.from_torch(
-        t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mapper or replicate(device)
-    )
+    return _from_torch(t, dtype, ttnn.TILE_LAYOUT, device, mapper or replicate(device))
 
 
 def block_mask(cu_seqlens, s, s_pad):
@@ -103,7 +125,7 @@ def upload_rows(device, arrays, dtype=ttnn.bfloat16, col_dim=None, layout=ttnn.T
     t = torch.stack(ts, 0)
     cd = None if col_dim is None else (col_dim + 1 if col_dim >= 0 else col_dim)
     mapper = ttnn.ShardTensor2dMesh(device, mesh_shape=(rows, cols), dims=(0, cd))
-    tt = ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, mesh_mapper=mapper)
+    tt = _from_torch(t, dtype, layout, device, mapper)
     return ttnn.reshape(tt, list(tt.shape)[1:])
 
 
