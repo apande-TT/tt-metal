@@ -26,6 +26,16 @@ from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import Residen
 # Mesh axis that carries the W partition; the other axis (size 1 on a 1xN mesh) carries H.
 _H_AXIS = 0
 _W_AXIS = 1
+_TILE = 32
+
+
+def _score_rows(n):
+    """Query rows per attention chunk: as many as fill _precise.CHUNK_ROWS_BYTES of float32 scores, tile
+    aligned (a tiled tensor cannot be sliced elsewhere). Follows the exact linears' own row-chunk rule, so
+    the whole matrix stays one chunk wherever it already fit."""
+    from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
+
+    return max(_TILE, _precise.CHUNK_ROWS_BYTES // (4 * max(1, n)) // _TILE * _TILE)
 
 
 def _mesh_shape(device):
@@ -82,10 +92,23 @@ class TtQwenImageAttentionBlock(ResidentPort):
         q = ttnn.slice(qkv, [0, 0, 0], [B * T, n, C])
         k = ttnn.slice(qkv, [0, 0, C], [B * T, n, 2 * C])
         v = ttnn.slice(qkv, [0, 0, 2 * C], [B * T, n, 3 * C])
-        sc = ttnn.multiply(_precise.matmul_bt(q, k), 1.0 / float(C) ** 0.5)
-        e = ttnn.exp(ttnn.subtract(sc, ttnn.max(sc, dim=-1, keepdim=True)))
-        prob = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self._cfg32))
-        out = _precise.linear(_precise.matmul(prob, v), w_proj, bias=b_proj)
+
+        # The scores are [samples, n, n] and matmul_bt holds three of them: 4 MB each at the 256 x 256 area
+        # the PCC gate runs, but 1 GB each at the 1024 x 1024 area the pipeline targets (n = H * W of the
+        # LATENT grid, and this block all-gathers it whatever the spatial partition is). A softmax row only
+        # needs its own scores, so the attention runs in row chunks that hold _precise.CHUNK_ROWS_BYTES of
+        # them, which at the gate's own area is one chunk: the single pass this block has always run.
+        def attend(qc):
+            sc = ttnn.multiply(_precise.matmul_bt(qc, k), 1.0 / float(C) ** 0.5)
+            e = ttnn.exp(ttnn.subtract(sc, ttnn.max(sc, dim=-1, keepdim=True)))
+            ttnn.deallocate(sc)
+            prob = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self._cfg32))
+            ttnn.deallocate(e)
+            pv = _precise.matmul(prob, v)
+            ttnn.deallocate(prob)
+            return pv
+
+        out = _precise.linear(_precise._row_chunked(attend, q, _score_rows(n), dim=-2), w_proj, bias=b_proj)
         out = ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT)
         if padded_h > logical_h or (logical_w > 0 and padded_w > logical_w):
             o4 = ttnn.reshape(out, (B * T, H, W, C))

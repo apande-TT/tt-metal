@@ -119,24 +119,43 @@ def _guarded_exact(x, w):
 # Rows are independent and the exact-lane sum is exact whatever the matmul blocking, so running row
 # chunks and concatenating computes the same per-row products as one call.
 EXACT_ROW_CHUNK = 4096
+TILE = 32  # a tiled tensor cannot be sliced off a tile boundary, so a row cut lands on one
 
 
-def _row_chunked(fn, x, chunk=None):
-    """fn(x) over row chunks of x (chunk rows, default EXACT_ROW_CHUNK), concatenated (fn may return a list of
-    outputs: each concatenated)."""
+def row_cuts(shape, chunk=None, dim=None):
+    """(axis, rows per chunk) that `_row_chunked` cuts a tensor of this shape into, or None when it runs it
+    in one piece. Separate from the loop so a caller -- or a test -- can see the cut without a device.
+
+    dim: the axis to cut, when the caller needs a particular one. Attention wants the TOKEN dim however many
+    samples it has (its scores are [samples, tokens, tokens]: cutting the batch leaves each sample's whole
+    matrix), while a linear is happy with whole samples, which is what the default picks."""
     chunk = chunk or EXACT_ROW_CHUNK
-    shape = list(x.shape)
+    shape = list(shape)
     rows = 1
     for s in shape[:-1]:
         rows *= s
     if rows <= chunk:
-        return fn(x)
+        return None
     # split the batch when there is one (whole samples), else the token dim in tile-aligned pieces
-    ax = 0 if len(shape) >= 3 and shape[0] > 1 else len(shape) - 2
+    if dim is None:
+        ax = 0 if len(shape) >= 3 and shape[0] > 1 else len(shape) - 2
+    else:
+        ax = dim % len(shape)
     per = rows // shape[ax]  # rows per index of `ax`
     step = max(1, chunk // per)
     if ax == len(shape) - 2:
-        step = max(32, step // 32 * 32)
+        step = max(TILE, step // TILE * TILE)
+    return ax, step
+
+
+def _row_chunked(fn, x, chunk=None, dim=None):
+    """fn(x) over row chunks of x (chunk rows, default EXACT_ROW_CHUNK), concatenated (fn may return a list of
+    outputs: each concatenated). `dim`: see row_cuts."""
+    cut = row_cuts(x.shape, chunk, dim)
+    if cut is None:
+        return fn(x)
+    ax, step = cut
+    shape = list(x.shape)
     outs = []
     for s0 in range(0, shape[ax], step):
         lo = [0] * len(shape)
