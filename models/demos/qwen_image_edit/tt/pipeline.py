@@ -106,6 +106,7 @@ class TtQwenImageEditPipeline:
         denoise_layers=None,
         tracker=None,
         precise=True,
+        image_hw=None,
     ):
         self.device = device
         # the batch every <stage>_trace_inputs() builds (the perf adapter reads it back via resolve_batch)
@@ -168,7 +169,7 @@ class TtQwenImageEditPipeline:
         )
         # The VAE encoder / decoder are not homogeneous repeats (every level changes channels and
         # resolution), so a depth cap leaves them whole.
-        self.vae = TtQwenVAE(device, self.hf.vae, tracker=tracker)
+        self.vae = TtQwenVAE(device, self.hf.vae, tracker=tracker, image_hw=image_hw)
         self._trace = {}
         self._active_stage = None
         self.stage_times = {}
@@ -613,13 +614,16 @@ def build_pipeline(
     denoise_layers=None,
     tracker=None,
     precise=True,
+    image_hw=None,
     **_demo_kwargs,
 ):
     """Construct and RETURN the resident pipeline object (it is not run here).
 
     layers caps every repeated stack (None = full depth); <stage>_layers overrides it for that stage's
     stack (vision tower, LM, transformer). model: an HF QwenImageEditPipeline to build from (default:
-    the checkpoint, float32). Demo kwargs (prompt, image, ...) are accepted and ignored."""
+    the checkpoint, float32). image_hw: the (height, width) the condition images will be encoded at, which
+    is what the VAE lays its stacks out for -- None keeps the layout that fits the default area. Demo kwargs
+    (prompt, image, ...) are accepted and ignored."""
     return TtQwenImageEditPipeline(
         device,
         hf=model,
@@ -629,6 +633,7 @@ def build_pipeline(
         denoise_layers=denoise_layers,
         tracker=tracker,
         precise=precise,
+        image_hw=image_hw,
     )
 
 

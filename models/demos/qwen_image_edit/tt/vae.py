@@ -23,6 +23,7 @@ import torch
 import ttnn
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import qwen_image_decoder3d, qwen_image_encoder3d
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._batch_split import mesh_shape
 from models.tt_dit.utils import conv3d as _conv3d_utils
 from models.tt_dit.utils.conv3d import _walk_conv3d_modules
 
@@ -78,6 +79,17 @@ class PointwiseConv32:
 ENCODER_C_IN_BLOCK = {384: 64}
 DECODER_C_IN_BLOCK = {384: 64, 192: 64}
 
+# Images per decoder program when every chip holds a whole image. Re-measured 2026-10-03 on this 2x4 T3K mesh
+# with every stage's weights resident (7.95 GB per chip after text encode, B=32): 32 in one program fails
+# allocating a 201 MB DRAM buffer (16.8 MB per bank needed, largest free block 10.1 MB); 16 fits (9.01 GB per
+# chip). 8 (2026-10-05): the precise convs now hold their padded input's tile copy across their runs.
+DECODE_MAX_BATCH = 8
+# Images per encoder program, same setup: 32 in one program fails allocating a 50 MB buffer (4.19 MB per bank
+# needed, largest free block 3.30 MB); 16 fits (8.92 GB per chip). 8 (2026-10-04): the exact convs now hold the
+# padded input's bf16 limbs across their lane runs, which at 16 ran the eager e2e out of memory; 8 per program
+# costs ~1% and the shared limbs save ~7%. A split that partitions the image sets its own (see _image_split).
+ENCODE_MAX_BATCH = 8
+
 
 def _block_fp32_convs(stack, h_block=8, w_block=8):
     """Give a float32 Wan stack's conv3d layers a real output blocking.
@@ -99,25 +111,98 @@ def _block_fp32_convs(stack, h_block=8, w_block=8):
     return n
 
 
+# Bytes of the image-resolution activation ONE CHIP is known to carry. A conv VAE's stages are a geometric
+# series -- every down block halves H and W and at most doubles the channels -- so this one stage sets the
+# whole stack's working set, and the stack holds many tensors of its size (every precise conv keeps both
+# operands' bf16 limbs, the decoder's upsamples quadruple it spatially, and the mid block's attention runs
+# on the gathered latent grid). Measured on this 2x4 T3K mesh with every other stage's weights resident
+# (7.78 GB per chip, 2.89 GB free when vae_encode starts):
+#
+#    per chip  as                                        encode                      decode
+#    --------  ----------------------------------------  --------------------------  --------------------
+#     24 MB    a whole 256 x 256 image (the PCC gate)     runs                        runs
+#     48 MB    a 1024 x 1024 image over the whole mesh    runs                        runs
+#     96 MB    a whole 512 x 512 image                    runs                        FAILS
+#     96 MB    a 1024 x 1024 image over the columns       FAILS                       FAILS
+#    384 MB    a whole 1024 x 1024 image                  FAILS                       (never reached)
+#
+# 96 MB runs in one place and fails in two, so it is not a size to depend on: the failures are not capacity
+# but FRAGMENTATION. Each one asks for a buffer whose per-bank size is a power of two plus one 256 B page
+# (the page count does not divide the 12 banks) while the holes the stack's earlier buffers left are exact
+# powers of two -- every one of the three missed the largest hole by exactly 256 B, with 20 to 45 MB per
+# bank still free. Leaving the working set room is the lever this side of the allocator, so the budget is
+# the largest per-chip stage BOTH stacks are measured to carry.
+STAGE_BYTES_PER_CHIP = 48 * 1024 * 1024
+
+
+def _image_split(device, dim, image_hw, max_batch, downsample=1):
+    """(batch_parallel, images per program) for a VAE stack whose image-resolution stage carries `dim` float32
+    channels. image_hw=None (the caller did not say what it will run) keeps the layout the per-program batches
+    were measured against.
+
+    batch_parallel="full" hands every chip a WHOLE image -- a batch smaller than the mesh is padded with zero
+    images -- so its per-chip activation never falls below one image however small the per-program batch is.
+    It is also the fastest, because then no conv exchanges halos with a neighbour, so it is what any stack
+    whose whole image fits runs. When one does not fit, the IMAGE is partitioned over the mesh instead: its
+    width over the mesh columns first, then its height over the rows as well. The Wan causal conv fuses its
+    temporal front pad into the H halo exchange and that fused neighbor_pad only takes B == 1, which is why
+    the finest split runs one image per program.
+
+    downsample: the stack partitions a grid this many times smaller than the image on each side -- 1 for the
+    encoder, which partitions the image itself, and the spatial scale for the decoder, which partitions the
+    latent. A split that grid cannot divide is not offered: an image's sides are multiples of the VAE's own
+    16-pixel step, but an aspect ratio can leave its latent indivisible by the mesh columns."""
+    rows, cols = mesh_shape(device)
+    # (share of one image per chip, the split that gives it, images per program, the grid it must divide)
+    candidates = [
+        (1.0, "full", max_batch, (1, 1)),
+        (1.0 / cols, True, rows, (1, cols)),
+        (1.0 / (rows * cols), False, 1, (rows, cols)),
+    ]
+    if image_hw is None:
+        return candidates[0][1], candidates[0][2]
+    h, w = image_hw[0] // downsample, image_hw[1] // downsample
+    stage = image_hw[0] * image_hw[1] * dim * 4  # both stacks run float32
+    usable, finest = [], None
+    for share, parallel, batch, grid in candidates:
+        if h % grid[0] or w % grid[1]:  # a grid this mesh axis cannot divide
+            continue
+        if finest is not None and share >= finest:  # no finer than one already offered, and slower
+            continue
+        usable.append((share, parallel, batch))
+        finest = share
+    for share, parallel, batch in usable:
+        if stage * share <= STAGE_BYTES_PER_CHIP:
+            return parallel, batch
+    return usable[-1][1], usable[-1][2]  # nothing fits: the finest split this mesh and grid allow
+
+
 class TtQwenVAE:
-    def __init__(self, device, hf_vae, tracker=None):
+    def __init__(self, device, hf_vae, tracker=None, image_hw=None):
         self.device = device
         cfg = hf_vae.config
         self.z_dim = int(cfg.z_dim)
         rows = tuple(device.shape)[0] if isinstance(device, ttnn.MeshDevice) else 1
         self.batch_factor = rows
+        # How the batch and the image lie over the mesh, and how many images one program takes, for the image
+        # size this pipeline was built for (image_hw=None: whole images per chip, as it has always been).
+        # The decoder partitions the latent grid, which is one resample per dim_mult step smaller per side.
+        scale = 2 ** (len(cfg.dim_mult) - 1)
+        enc_parallel, enc_batch = _image_split(device, hf_vae.encoder.dim, image_hw, ENCODE_MAX_BATCH)
+        dec_parallel, dec_batch = _image_split(device, hf_vae.decoder.dim, image_hw, DECODE_MAX_BATCH, downsample=scale)
         # float32 encoder: the image latents condition every denoising step, and the bf16 encoder's
         # error (image-latent PCC 0.99999) moved the final latents ~10x more than the denoiser's own
-        # whole images per chip (batch over both mesh axes): no halo exchange / width masking at any conv
         # (the float32 encoder's convs read C_in_block input channels per vol2col block: wider than the default 32)
         _conv3d_utils.FP32_C_IN_BLOCK = ENCODER_C_IN_BLOCK
         try:
-            self.encoder = qwen_image_encoder3d.build(device, hf_vae.encoder, batch_parallel="full", dtype=ttnn.float32)
+            self.encoder = qwen_image_encoder3d.build(
+                device, hf_vae.encoder, batch_parallel=enc_parallel, dtype=ttnn.float32
+            )
         finally:
             _conv3d_utils.FP32_C_IN_BLOCK = None
         _conv3d_utils.FP32_C_IN_BLOCK = DECODER_C_IN_BLOCK
         try:
-            self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel="full")
+            self.decoder = qwen_image_decoder3d.build(device, hf_vae.decoder, batch_parallel=dec_parallel)
         finally:
             _conv3d_utils.FP32_C_IN_BLOCK = None
         _block_fp32_convs(self.encoder.encoder)
@@ -127,16 +212,8 @@ class TtQwenVAE:
         mean = torch.tensor(cfg.latents_mean, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         std = torch.tensor(cfg.latents_std, dtype=torch.float32).reshape(1, self.z_dim, 1, 1)
         self.mean, self.std, self.inv_std = (_replicated(device, t) for t in (mean, std, 1.0 / std))
-        # Images per decoder program. Re-measured 2026-10-03 on this 2x4 T3K mesh with every stage's weights
-        # resident (7.95 GB per chip after text encode, B=32): 32 in one program fails allocating a 201 MB
-        # DRAM buffer (16.8 MB per bank needed, largest free block 10.1 MB); 16 fits (9.01 GB per chip).
-        # 8 (2026-10-05): the precise convs now hold their padded input's tile copy across their runs.
-        self.decode_max_batch = 8
-        # Images per encoder program. Re-measured 2026-10-03, same setup: 32 in one program fails allocating a
-        # 50 MB buffer (4.19 MB per bank needed, largest free block 3.30 MB); 16 fits (8.92 GB per chip).
-        # 8 (2026-10-04): the exact convs now hold the padded input's bf16 limbs across their lane runs,
-        # which at 16 ran the eager e2e out of memory; 8 per program costs ~1% and the shared limbs save ~7%.
-        self.encode_max_batch = 8
+        self.decode_max_batch = dec_batch
+        self.encode_max_batch = enc_batch
         # encoder convs exact-lane (its image latents condition every denoising step); decoder convs the
         # exact-product split alone (two convs each instead of the median's four)
         self.precise_convs = self._precise_ports(self.encoder, "encoder", hf_vae.encoder, conv_mode="exact")

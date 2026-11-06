@@ -53,7 +53,7 @@ def main(argv=None):
     device = open_mesh()
     try:
         t0 = time.time()
-        pipe = build_pipeline(device)
+        pipe = build_pipeline(device, image_hw=(enc.height, enc.width))
         print(f"[demo] pipeline built in {time.time() - t0:.0f} s", flush=True)
         t0 = time.time()
         out = run_image_edit(pipe, enc, use_trace=not args.no_trace)
