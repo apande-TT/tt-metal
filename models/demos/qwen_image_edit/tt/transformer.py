@@ -89,6 +89,8 @@ class TtQwenImageTransformer:
         # its text output projection, FF and residual updates
         self.transformer_blocks[-1].stack.blocks[0].need_txt = False
         self.norm_out = ada_layer_norm_continuous.build(device, torch_module.norm_out)
+        # proj_out's 64 outputs whole on every device: no all_gather + slice of 8 x 32 padded columns per step
+        decoder_head.REPLICATE_MAX_OUT = 64
         self.proj_out = decoder_head.build(device, torch_module.proj_out)
 
         if tr is not None:

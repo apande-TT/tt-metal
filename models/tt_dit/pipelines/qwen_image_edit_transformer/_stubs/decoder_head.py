@@ -17,6 +17,9 @@ import ttnn
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl, _precise
 
 _TILE = 32
+# a head with at most this many output features keeps the whole weight on every device (no all_gather, no padded
+# columns to slice off); 0: always column-parallel
+REPLICATE_MAX_OUT = 0
 
 
 def _is_mesh(device):
@@ -36,6 +39,8 @@ class TtQwenDecoderHead:
         self.out_features, self.in_features = w.shape
         self.tp_axis = _ccl.get_tp_axis()  # mesh axis of the TP split (None = every device)
         self.tp = _ccl.tp_size(device, self.tp_axis)
+        if self.out_features <= REPLICATE_MAX_OUT:
+            self.tp = 1
 
         wt = w.t()  # [K, N]
         if self.tp > 1:
