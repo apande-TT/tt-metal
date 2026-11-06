@@ -48,7 +48,7 @@ class VisionConsts:
     def __init__(self, cos, sin, mask_full, mask_win, perm, unperm, s, s_pad, m, m_pad):
         self.cos, self.sin = cos, sin
         self.mask_full, self.mask_win = mask_full, mask_win
-        self.perm, self.unperm = perm, unperm  # [N, 1, s_pad, s_pad] / [N, 1, m_pad, m_pad] one-hot
+        self.perm, self.unperm = perm, unperm  # [1, 1, s_pad, s_pad] / [1, 1, m_pad, m_pad] one-hot
         self.s, self.s_pad, self.m, self.m_pad = s, s_pad, m, m_pad
         # the window-major token order (the perm's rows); a caller that uploads its pixel rows in this order sets
         # pixels_in_window_order and the forward skips the perm product (the patch embed is row-wise)
@@ -78,8 +78,8 @@ class TtVisionTransformer:
         self.precise = False
 
     # ---- per-grid constants (integer metadata -> device tables) ---------------------------------
-    def consts(self, grid, n_images):
-        """grid: (t, h, w) shared by all n_images. Built once, outside the forward."""
+    def consts(self, grid):
+        """grid: (t, h, w) shared by every image of the batch. Built once, outside the forward."""
         grid = tuple(int(v) for v in grid)
         pos, window_index, cu_window, cu_full = _vision_metadata([grid], self.merge, self.window_size, self.patch_size)
         s = grid[0] * grid[1] * grid[2]
@@ -101,8 +101,13 @@ class TtVisionTransformer:
         mask_win = SegmentPlan(cu_window, s, s_pad)
         m = s // self.unit
         m_pad = pad_to_tile(s_pad // self.unit)
-        perm = np.repeat(_one_hot(rows, s_pad), n_images, axis=0)
-        unperm = np.repeat(_one_hot(np.argsort(window_index), m_pad), n_images, axis=0)
+        # ONE copy, not one per image: the row order depends on the grid alone, so every image of the batch
+        # selects by the same matrix and the batched product broadcasts it over them (encoder_stack, the
+        # single-image port, has always uploaded it this shape). Held per image it is batch * s_pad ** 2
+        # floats -- 60 MB for a batch of 16 at a 256 x 256 edit, but 1.94 GB at the 1024 x 1024 one the
+        # pipeline targets, which no chip has free.
+        perm = _one_hot(rows, s_pad)
+        unperm = _one_hot(np.argsort(window_index), m_pad)
         c = VisionConsts(
             cos,
             sin,
@@ -157,7 +162,7 @@ class TtVisionTransformer:
         grids = [tuple(int(v) for v in row) for row in grid_thw.tolist()]
         assert len(set(grids)) == 1, "batched vision port needs every image on the same grid"
         n = len(grids)
-        c = self.consts(grids[0], n)
+        c = self.consts(grids[0])
         s, s_pad = c.s, c.s_pad
         x = ttnn.reshape(hidden_states, (n, 1, s, hidden_states.shape[-1]))
         if s_pad != s:

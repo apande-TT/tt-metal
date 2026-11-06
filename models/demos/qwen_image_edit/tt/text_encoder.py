@@ -138,7 +138,7 @@ class TtQwenTextEncoder:
         # are replicated over the rows anyway; every row used to encode all B), and encode_vision gathers them
         rows, cols = tuple(d.shape) if isinstance(d, ttnn.MeshDevice) else (1, 1)
         p.vision_rows = rows if rows > 1 and B % rows == 0 else 1
-        vc = self.visual.consts(grids[0], B // p.vision_rows)
+        vc = self.visual.consts(grids[0])
         pix = vl["pixel_values"].to(torch.float32).reshape(B, 1, vc.s, -1)
         # the patch rows uploaded in the tower's window-major order (an index permutation of the input, from the
         # grid metadata): the forward then skips its one-hot reorder product after the row-wise patch embed
