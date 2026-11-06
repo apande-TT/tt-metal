@@ -402,13 +402,11 @@ class TtQwenTextEncoder:
         peak must fit beside the 896 MB trace region that the precise denoise trace needs. Measured at
         B=32: one 64-sequence program ran out of DRAM (a 704 MB allocation) with that region; two
         32-sequence programs fit."""
-        tok = self.text_model.embed_tokens(p.ids)  # [2B, s_pad, 3584]
-        B2, s_pad, C = tok.shape[0], tok.shape[1], tok.shape[2]
+        B2, s_pad = p.ids.shape[0], p.ids.shape[1]
         B = B2 // 2
         a, m = p.img_start, p.img_len
         # HF: inputs_embeds.masked_scatter(image_mask, image_embeds) in the embeddings' dtype (float32 in
         # the golden): splice in float32 (the bf16 table values are exact in float32)
-        tok = ttnn.typecast(tok, ttnn.float32)
         img = ttnn.typecast(img, ttnn.float32)
         cos, sin = self._rope(p.positions)
         drop = PROMPT_TEMPLATE_DROP
@@ -417,7 +415,10 @@ class TtQwenTextEncoder:
         outs = []
         h_cond = None
         for lo, L, keep in ((0, p.len_cond, p.keep_cond), (B, p.len_uncond, p.keep_uncond)):
-            t = ttnn.slice(tok, [lo, 0, 0], [lo + B, s_pad, C])
+            # this half's ids embedded on their own (no [2B, s_pad, 3584] lookup sliced into halves)
+            t = self.text_model.embed_tokens(ttnn.slice(p.ids, [lo, 0], [lo + B, s_pad]))  # [B, s_pad, 3584]
+            C = t.shape[2]
+            t = ttnn.typecast(t, ttnn.float32)
             x = ttnn.concat(
                 [ttnn.slice(t, [0, 0, 0], [B, a, C]), img, ttnn.slice(t, [0, a + m, 0], [B, s_pad, C])], dim=1
             )  # sequence lo + b uses condition image b
