@@ -117,6 +117,35 @@ class EncodedInputs:
     latent_hw: tuple  # (h, w) of the unpacked latent
     img_shapes: list = field(default_factory=list)
 
+    def subset(self, indices):
+        """A copy holding only `indices` of the samples, in that order (batch set to their count).
+
+        No stage of this pipeline has a cross-sample term -- every image is edited on its own -- so a batch
+        too large for one program is the same work as its groups run in turn. What makes this a SLICE of the
+        encoding rather than a smaller `encode_inputs` call is that the VL processor pads a batch of prompts
+        to the longest IN THAT BATCH: re-encoding a group would hand it a different padded length, and a
+        group of one a different one again. Sliced, every sample keeps the inputs the whole batch gave it."""
+        import dataclasses
+
+        idx = [int(i) % self.batch for i in indices]
+        # pixel_values is the images' patch rows CONCATENATED, not one row per sample: cut it on the
+        # boundaries the grids give (t * h * w rows per image), which holds whether or not the grids agree.
+        off = np.cumsum([0] + [int(v) for v in self.vl["image_grid_thw"].prod(-1)])
+        vl = {
+            k: t[idx] if t.shape[0] == self.batch else torch.cat([t[off[i] : off[i + 1]] for i in idx])
+            for k, t in self.vl.items()
+        }
+        return dataclasses.replace(
+            self,
+            batch=len(idx),
+            seeds=[self.seeds[i] for i in idx],
+            prompts=[self.prompts[i] for i in idx],
+            images=[self.images[i] for i in idx],
+            vl=vl,
+            vae_image=self.vae_image[idx],
+            latents=self.latents[idx],
+        )
+
     def key(self):
         h = hashlib.sha256()
         h.update(repr((self.prompts, self.seeds, self.width, self.height, self.num_inference_steps)).encode())
@@ -124,6 +153,14 @@ class EncodedInputs:
         np.save(buf, np.asarray(self.images[0]))
         h.update(buf.getvalue())
         return h.hexdigest()[:10]
+
+
+def sample_groups(batch, per=None):
+    """The index groups a batch of `batch` samples runs in when one program carries `per` of them
+    (None or 0: all of them, one program). Every sample appears once and in order, so the groups'
+    outputs concatenate back into the batch's."""
+    per = min(per or batch, batch)
+    return [list(range(i, min(i + per, batch))) for i in range(0, batch, per)]
 
 
 def encode_inputs(

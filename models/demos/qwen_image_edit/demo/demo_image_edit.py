@@ -23,6 +23,12 @@ from models.demos.qwen_image_edit.tt import inputs as I
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--batch", type=int, default=None, help="samples per call (default: $TT_PERF_BATCH or 32)")
+    ap.add_argument(
+        "--max-batch",
+        type=int,
+        default=None,
+        help="samples one program carries; a larger --batch runs in groups of this many (default: one program)",
+    )
     ap.add_argument("--image", default=None, help="input image path or URL (default: the published example)")
     ap.add_argument("--prompt", default=I.EXAMPLE_PROMPT)
     ap.add_argument("--seed", type=int, default=I.EXAMPLE_SEED, help="seed of sample 0 (sample i uses seed + i)")
@@ -56,10 +62,22 @@ def main(argv=None):
         pipe = build_pipeline(device, image_hw=(enc.height, enc.width))
         print(f"[demo] pipeline built in {time.time() - t0:.0f} s", flush=True)
         t0 = time.time()
-        out = run_image_edit(pipe, enc, use_trace=not args.no_trace)
-        ttnn.synchronize_device(device)
+        # One program per group of samples. The stages have no cross-sample term, so this is the same
+        # edit; it is how a batch whose working set does not fit a chip at the requested area still runs
+        # (at 1024 x 1024 every stage carries ~14x what it does at the 256 the gate runs).
+        import torch
+
+        groups = I.sample_groups(B, args.max_batch)
+        parts = []
+        for g in groups:
+            out = run_image_edit(pipe, enc.subset(g) if len(groups) > 1 else enc, use_trace=not args.no_trace)
+            ttnn.synchronize_device(device)
+            parts.append(to_host(out["image"], device).float())
+            del out
+            if len(groups) > 1:
+                print(f"[demo] samples {g[0]}..{g[-1]} done ({time.time() - t0:.0f} s)", flush=True)
+        images = torch.cat(parts) if len(parts) > 1 else parts[0]
         print(f"[demo] {B} image(s) in {time.time() - t0:.0f} s", flush=True)
-        images = to_host(out["image"], device).float()
     finally:
         close_mesh(device)
 
