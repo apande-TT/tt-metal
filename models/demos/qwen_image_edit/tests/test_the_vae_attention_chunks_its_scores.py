@@ -20,7 +20,8 @@ import math
 import pytest
 
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
-from models.tt_dit.pipelines.qwen_image_edit_vae._stubs.qwen_image_attention_block import _TILE, _score_rows
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs._precise import TILE as _TILE
+from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs._precise import score_rows as _score_rows
 
 # The VAE downsamples by 8 in each spatial dimension (dim_mult has four entries, three of them resampling),
 # so the attention's sequence is (area / 8) ** 2 tokens. 256 is DEFAULT_AREA, 1024 is PIPELINE_AREA.
@@ -99,8 +100,10 @@ def test_more_samples_per_program_do_not_widen_a_chunk(area):
 
 
 def test_the_budget_is_the_one_the_exact_linears_use():
-    """Not a second number for the same job: the row-chunk budget lives in _precise with the linears."""
-    assert _score_rows(_n(1024)) == max(_TILE, _precise.CHUNK_ROWS_BYTES // (SCORE_BYTES * _n(1024)) // _TILE * _TILE)
+    """Not a second number for the same job: the row-chunk budget lives in _precise with the linears, and the
+    denoiser's joint attention -- which builds its scores the same way -- spends it through the same helper."""
+    assert _score_rows(_n(1024)) == max(_TILE, _precise.CHUNK_ROWS_BYTES // (SCORE_BYTES * _n(1024)))
+    assert _score_rows is _precise.score_rows
 
 
 def test_the_cut_falls_on_the_token_dim_and_not_the_batch():

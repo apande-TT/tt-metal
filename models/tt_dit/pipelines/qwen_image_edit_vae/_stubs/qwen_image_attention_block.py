@@ -26,16 +26,6 @@ from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._resident import Residen
 # Mesh axis that carries the W partition; the other axis (size 1 on a 1xN mesh) carries H.
 _H_AXIS = 0
 _W_AXIS = 1
-_TILE = 32
-
-
-def _score_rows(n):
-    """Query rows per attention chunk: as many as fill _precise.CHUNK_ROWS_BYTES of float32 scores, tile
-    aligned (a tiled tensor cannot be sliced elsewhere). Follows the exact linears' own row-chunk rule, so
-    the whole matrix stays one chunk wherever it already fit."""
-    from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise
-
-    return max(_TILE, _precise.CHUNK_ROWS_BYTES // (4 * max(1, n)) // _TILE * _TILE)
 
 
 def _mesh_shape(device):
@@ -108,7 +98,7 @@ class TtQwenImageAttentionBlock(ResidentPort):
             ttnn.deallocate(prob)
             return pv
 
-        out = _precise.linear(_precise._row_chunked(attend, q, _score_rows(n), dim=-2), w_proj, bias=b_proj)
+        out = _precise.linear(_precise._row_chunked(attend, q, _precise.score_rows(n), dim=-2), w_proj, bias=b_proj)
         out = ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT)
         if padded_h > logical_h or (logical_w > 0 and padded_w > logical_w):
             o4 = ttnn.reshape(out, (B * T, H, W, C))

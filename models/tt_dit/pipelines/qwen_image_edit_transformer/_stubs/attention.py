@@ -264,6 +264,22 @@ class TtQwenJointAttention:
         return ttnn.reshape(o, (B, H, Sq, D))
 
     def _attend_core(self, q, kh, kl, v, mask_add):
+        """The attention of one group of (sample, head) entries, in query-row chunks when the whole group's
+        scores do not fit _precise.CHUNK_ROWS_BYTES.
+
+        The scores are [entries, Sq, Sk] and the guarded exact product holds several at once. At the 256 x 256
+        area the PCC gate runs the joint sequence is 686 tokens and _attend_entries hands this a group of 16,
+        whose scores are ~32 MB -- one chunk, the pass this has always run. At the 1024 x 1024 area the
+        pipeline targets the sequence is 9600 tokens and the group is the whole batch, so one score matrix is
+        2.1 GB: a full-resolution denoise step died inside this product on a 943,718,400 B buffer with 662 MB
+        free. A softmax row reads only its own scores, so the rows can be cut."""
+        chunk = _precise.score_rows(kh.shape[-2])
+        if _precise.row_cuts(q.shape, chunk, dim=-2) is None:
+            return self._attend_rows(q, kh, kl, v, mask_add)
+        # mask_add is [B, 1, 1, Sk]: one value per KEY, so every row chunk reads the same one
+        return _precise._row_chunked(lambda qc: self._attend_rows(qc, kh, kl, v, mask_add), q, chunk, dim=-2)
+
+    def _attend_rows(self, q, kh, kl, v, mask_add):
         if _precise.ENABLED:  # kh = k (float32) in precise mode
             s = _precise.exact_matmul_bt(q, kh) if _precise.EXACT_QK else _precise.matmul_bt(q, kh)
         else:

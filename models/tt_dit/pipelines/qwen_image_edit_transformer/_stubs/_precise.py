@@ -181,6 +181,14 @@ WHOLE_ROWS_BYTES = 80 * 1024 * 1024
 CHUNK_ROWS_BYTES = 48 * 1024 * 1024
 
 
+def score_rows(keys):
+    """Rows per chunk for an attention whose scores are `keys` float32 columns wide: as many as fill
+    CHUNK_ROWS_BYTES of them. Counted over every leading dim, the way row_cuts counts rows, so a chunk holds
+    that many bytes of scores whatever the (sample, head) entry count is. Both attentions that build their
+    scores explicitly -- the denoiser's joint attention and the VAE mid block's -- spend the budget here."""
+    return max(TILE, CHUNK_ROWS_BYTES // max(1, keys * 4))
+
+
 def _weight_lane_chunk(x, ws):
     """Rows per chunk for an exact linear whose lanes go on these weights' rows (the text encoder's weight-lane
     rule, sum(N) <= rows / 2: no input-sized lane copies): all of them when its float32 output fits WHOLE_ROWS_BYTES,
