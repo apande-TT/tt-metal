@@ -145,6 +145,9 @@ A2A_REDUCE = False
 A2A_SUM_FN = None
 # the all_to_all reduce's received partials in L1 when y takes at most this many bytes (0: DRAM)
 A2A_L1_BYTES = 0
+# the one-item-per-device reduce's gathered sum in L1 when it takes at most this many bytes (0: DRAM); the
+# caller's next op (the bias add) writes DRAM
+A2A_GATHER_L1_BYTES = 0
 # with A2A_SUM_FN and several batch items per device: fold each device's B / n items into its rows before the
 # all_to_all ([n, 1, (B / n) * S, C]) so every source's partial arrives as one contiguous block for the fused sum
 A2A_FOLD = False
@@ -188,7 +191,9 @@ def _a2a_sum(y, n, cluster_axis):
         # [1, n, S, C] -> [n, 1, S, C] moves only leading dims: block i stays source i's partial
         out = A2A_SUM_FN(ttnn.reshape(g, [n, 1] + shape[2:]), n, part, ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(g)
-        return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear)
+        l1 = A2A_GATHER_L1_BYTES and math.prod(shape) * 4 <= A2A_GATHER_L1_BYTES
+        kw = {"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}
+        return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear, **kw)
     out = None
     for i in range(n):
         p = ttnn.slice(g, [0, i, 0, 0], [part[0], i + 1] + shape[2:])
@@ -1001,7 +1006,10 @@ class TtVisionAttention:
         if self.tp > 1:
             out = exact_all_reduce(out, self.device)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)
-        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        y = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if out.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(out)
+        return y
 
     def __call__(self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
         s = hidden_states.shape[0]
