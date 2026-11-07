@@ -46,6 +46,7 @@ INPUTS_PROVENANCE = (
 # pipeline with that ONE target area set to DEFAULT_AREA on both sides. demo --area overrides it.
 PIPELINE_AREA = 1024
 DEFAULT_AREA = 256
+VAE_SCALE = 8  # 2 ** len(vae.temperal_downsample)
 
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, "
@@ -96,6 +97,16 @@ def calculated_size(image, area):
 
     w, h, _ = calculate_dimensions(area * area, image.size[0] / image.size[1])
     return int(w), int(h)
+
+
+def condition_size(image, area):
+    """(width, height) the pipeline ENCODES the condition image at: `calculated_size` rounded down to the
+    stride its packed latents need. Separate from encode_inputs so a caller that has to know the size BEFORE
+    it builds the pipeline can ask without encoding -- the VAE lays its stacks out for the image size, and at
+    the area the pipeline targets a whole image per chip does not fit."""
+    w, h = calculated_size(image, area)
+    multiple = VAE_SCALE * 2
+    return w // multiple * multiple, h // multiple * multiple
 
 
 @dataclass
@@ -185,12 +196,10 @@ def encode_inputs(
 
     root = model_path()
     image = load_example_image() if image is None else image
-    width, height = calculated_size(image, area)
-    vae_scale = 8  # 2 ** len(vae.temperal_downsample)
-    multiple = vae_scale * 2
-    width, height = width // multiple * multiple, height // multiple * multiple
+    width, height = condition_size(image, area)
+    multiple = VAE_SCALE * 2
 
-    ip = VaeImageProcessor(vae_scale_factor=vae_scale * 2)
+    ip = VaeImageProcessor(vae_scale_factor=multiple)
     resized = ip.resize(image, height, width)
     images = [resized] * batch
     prompts = [prompt] * batch

@@ -37,6 +37,15 @@ _MESH_SHAPE = resolve_mesh_shape(default_rows=_SRC_MESH[0], default_cols=_SRC_ME
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 
 
+def _condition_hw():
+    """(height, width) the condition image is encoded at for PERF_AREA. The pipeline needs it at BUILD
+    time, before any input exists: the VAE lays its stacks out for the image size, and above the default
+    area a whole image per chip stops fitting, so a build that was not told the size partitions nothing
+    and aborts in the encoder. The demo passes the same from its own encoding."""
+    w, h = I.condition_size(I.load_example_image(), PERF_AREA)
+    return h, w
+
+
 def _open_device():
     """Open the mesh exactly as the demo does (demo.mesh.open_mesh), honouring the resolved shape and
     passing the trace region through when the open function accepts it."""
@@ -138,7 +147,7 @@ def test_image_edit_perf():
         def _eager_forward():
             from models.demos.qwen_image_edit.tt.pipeline import build_pipeline, run_image_edit
 
-            pipe = build_pipeline(device, layers=PERF_LAYERS)
+            pipe = build_pipeline(device, layers=PERF_LAYERS, image_hw=_condition_hw())
             # --- per-stage marks (injected) ---------------------------------------------------
             # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
             # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
@@ -211,7 +220,7 @@ def test_image_edit_perf():
             def _build_for_perf(dev):
                 from models.demos.qwen_image_edit.tt.pipeline import build_pipeline
 
-                return build_pipeline(dev, layers=PERF_LAYERS)
+                return build_pipeline(dev, layers=PERF_LAYERS, image_hw=_condition_hw())
 
             measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
 
