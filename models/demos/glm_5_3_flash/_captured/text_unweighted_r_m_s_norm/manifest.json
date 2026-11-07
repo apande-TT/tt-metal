@@ -1,0 +1,32 @@
+{
+  "component": "text_unweighted_r_m_s_norm",
+  "submodule_path": "language_model.layers.0.attn_hc.input_norm",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          8,
+          16384
+        ],
+        "dtype": "torch.float32"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      8,
+      16384
+    ],
+    "dtype": "torch.float32"
+  }
+}

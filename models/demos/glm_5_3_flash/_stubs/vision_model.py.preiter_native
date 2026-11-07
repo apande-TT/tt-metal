@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, tensor-parallel port of `Glm5NextVisionModel` (GLM-5.3-Flash vision tower).
+
+Reference (one image / video, grid_thw = [[t, h, w]] in patches, merge m = spatial_merge_size):
+    x   = patch_embed(pixels)                              Conv3d(kernel=stride=patch) == Linear
+    pos = get_vision_position_ids(grid_thw, m)             block-major (h, w) per token
+    cos, sin = axial rope(pos)                             [N, hd] = cat(cat(fh, fw), cat(fh, fw))
+    x   = blocks(x)   (attention block-diagonal per frame, from cu_seqlens)
+    x   = post_layernorm(x)
+    last = downsample(x)   Conv2d(m x m, stride m) over each m*m consecutive (block-major) tokens
+    pooler = merger(last)
+    returns (last_hidden_state=last, pooler_output=pooler)
+
+Everything input-dependent is computed ON DEVICE from grid_thw (uploaded): each token's (h, w)
+position by closed-form index arithmetic (verified equal to HF's get_vision_position_ids, incl.
+multi-frame video), the rope angles hpos * [inv|0|inv|0] + wpos * [0|inv|0|inv], and the per-frame
+attention mask (segment = token // (h*w)). The downsample conv is exactly a Linear over the m*m
+consecutive tokens' channels (weight permuted to (dy, dx, c) order).
+
+Tensor parallelism: blocks = vision_block's head/column/row-parallel `_VisionBlock`; patch embed,
+downsample and the merger's proj are COLUMN-parallel + all_gather; merger MLP column/row-parallel.
+Norms, rope tables, residuals replicated. Multiple images packed in one call are not ported.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+from models.demos.glm_5_3_flash._stubs.text_decoder_layer import _Ctx, _rms, _rs
+from models.demos.glm_5_3_flash._stubs.vision_block import _VisionBlock
+from models.demos.glm_5_3_flash._stubs.vision_patch_embed import _gather_cols, _PatchEmbed
+from models.demos.glm_5_3_flash._stubs.vision_patch_merger import _PatchMerger
+
+MAX_TOKENS = 16384
+
+
+class TtVisionModel:
+    def __init__(self, device, m):
+        self.ctx = c = _Ctx(device)
+        cfg = m.config
+        self.m = int(cfg.spatial_merge_size)
+        self.pe = _PatchEmbed(c, m.patch_embed)
+        self.blocks = [_VisionBlock(c, b) for b in m.blocks]
+        self.hd = self.blocks[0].attn.hd if self.blocks else None
+        rope = m.rotary_pos_emb
+        inv = rope.inv_freq.detach().to(torch.float32) * float(rope.attention_scaling)
+        z = torch.zeros_like(inv)
+        self.A_row = c.f32(torch.cat([inv, z, inv, z]).reshape(1, 1, 1, -1))
+        self.B_row = c.f32(torch.cat([z, inv, z, inv]).reshape(1, 1, 1, -1))
+        self.tok = c.f32(torch.arange(MAX_TOKENS, dtype=torch.float32).reshape(1, 1, MAX_TOKENS, 1))
+        self.post_w = c.f32(m.post_layernorm.weight.detach().reshape(1, 1, 1, -1))
+        self.post_eps = float(m.post_layernorm.variance_epsilon)
+        ds = m.downsample
+        if tuple(ds.kernel_size) != (self.m, self.m) or tuple(ds.stride) != (self.m, self.m):
+            raise NotImplementedError("downsample conv must be m x m, stride m")
+        Wd = ds.weight.detach().to(torch.float32)  # [O, C, m, m]
+        self.out_dim, self.C = int(Wd.shape[0]), int(Wd.shape[1])
+        if self.out_dim % c.n:
+            raise ValueError("downsample out channels not divisible by mesh")
+        self.w_ds = c.put(Wd.permute(2, 3, 1, 0).reshape(self.m * self.m * self.C, self.out_dim), shard_dim=-1)
+        self.b_ds = c.f32(ds.bias.detach().reshape(1, 1, 1, -1), shard_dim=-1) if ds.bias is not None else None
+        self.merger = _PatchMerger(c, m.merger)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    @staticmethod
+    def _floor_div(a, b):
+        return ttnn.floor(ttnn.divide(ttnn.add(a, 0.5), b))  # integer operands: +0.5 guards rounding
+
+    def _positions(self, grid_thw, N):
+        c, m = self.ctx, self.m
+        g = c.f32(grid_thw.reshape(1, 1, 1, 3)) if isinstance(grid_thw, torch.Tensor) else ttnn.typecast(
+            ttnn.to_layout(ttnn.reshape(grid_thw, [1, 1, 1, 3]), ttnn.TILE_LAYOUT), ttnn.float32
+        )
+        grm = ttnn.to_layout(g, ttnn.ROW_MAJOR_LAYOUT)
+        col = lambda j: ttnn.to_layout(ttnn.slice(grm, [0, 0, 0, j], [1, 1, 1, j + 1]), ttnn.TILE_LAYOUT)
+        h, w = col(1), col(2)
+        hw = ttnn.multiply(h, w)
+        i = ttnn.to_layout(ttnn.slice(ttnn.to_layout(self.tok, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, N, 1]), ttnn.TILE_LAYOUT)
+        frame = self._floor_div(i, hw)  # [1,1,N,1]
+        ip = ttnn.subtract(i, ttnn.multiply(frame, hw))
+        b = self._floor_div(ip, float(m * m))
+        inside = ttnn.subtract(ip, ttnn.multiply(b, float(m * m)))
+        bw = ttnn.multiply(w, 1.0 / m)
+        br = self._floor_div(b, bw)
+        bc = ttnn.subtract(b, ttnn.multiply(br, bw))
+        dy = self._floor_div(inside, float(m))
+        dx = ttnn.subtract(inside, ttnn.multiply(dy, float(m)))
+        hp = ttnn.add(ttnn.multiply(br, float(m)), dy)
+        wp = ttnn.add(ttnn.multiply(bc, float(m)), dx)
+        return hp, wp, frame
+
+    def __call__(self, hidden_states, grid_thw=None, **kwargs):
+        if grid_thw is None:
+            raise ValueError("vision model requires grid_thw")
+        if grid_thw.shape[0] != 1:
+            raise NotImplementedError("multiple images packed in one call not ported")
+        c = self.ctx
+        x = hidden_states
+        N, K = x.shape[-2], x.shape[-1]
+        if N > MAX_TOKENS:
+            raise NotImplementedError(f"{N} tokens > {MAX_TOKENS}")
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = self.pe(ttnn.reshape(x, [1, 1, N, K]))  # [1,1,N,C] fp32
+
+        hp, wp, frame = self._positions(grid_thw, N)
+        ang = ttnn.add(ttnn.multiply(hp, self.A_row), ttnn.multiply(wp, self.B_row))  # [1,1,N,hd]
+        cos, sin = ttnn.cos(ang), ttnn.sin(ang)
+        mask = ttnn.multiply(ttnn.subtract(ttnn.eq(frame, ttnn.transpose(frame, -2, -1)), 1.0), 1e9)
+        for blk in self.blocks:
+            blk.attn._mask = lambda _cu, _n, _m=mask: _m  # per-frame block-diagonal (all-zero for t == 1)
+            x = blk(x, N, cos, sin, cu_seqlens=None)
+
+        x = _rms(c, x, self.post_w, self.post_eps)
+        R = N // (self.m * self.m)
+        xg = _rs(x, [1, 1, R, self.m * self.m * self.C])
+        part = c.lin(ttnn.typecast(xg, ttnn.bfloat16), self.w_ds)
+        if self.b_ds is not None:
+            part = ttnn.add(part, self.b_ds)
+        last = _gather_cols(c, part)  # [1,1,R,out]
+        pooled = self.merger(last)
+        return ttnn.reshape(last, [R, self.out_dim]), ttnn.reshape(pooled, [R, self.out_dim])
+
+
+def build(device, torch_module=None):
+    return TtVisionModel.build(device, torch_module)
+
+
+def vision_model(device, torch_module=None):
+    return TtVisionModel.build(device, torch_module)

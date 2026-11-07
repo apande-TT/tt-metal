@@ -1,0 +1,146 @@
+{
+  "model": "zai-org/GLM-5.3-Flash",
+  "model_type": "glm5_next",
+  "architectures": [
+    "Glm5NextForConditionalGeneration"
+  ],
+  "is_encoder_decoder": false,
+  "sources": {
+    "A_hf": "config.json + generation_config.json + processor_config.json + chat_template.jinja; AutoModel registry: MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES[glm5_next] = Glm5NextForConditionalGeneration (the only generative head); MODEL_MAPPING_NAMES[glm5_next] = Glm5NextModel (base, no head).",
+    "B_bringup": "models/demos/glm_5_3_flash/{bringup_status.json,_stubs,_captured,tests/pcc}"
+  },
+  "hardware": {
+    "box": "GalaxyBH (32x Blackhole)",
+    "mesh": [
+      1,
+      32
+    ],
+    "tp": 32,
+    "dp": 1,
+    "dram_per_chip_gb": 32,
+    "usable_per_chip_gb_used_for_budget": 28.6,
+    "usable_figure_basis": "registered figure for a CCL axis in play (28.6 GB/chip); not measured by this run",
+    "fabric": "ttnn.FabricConfig.FABRIC_1D set before ttnn.open_mesh_device(ttnn.MeshShape(1, 32))",
+    "weight_budget_estimate": "~320B params; bf16 = ~640 GB total = ~20 GB/chip when TP/EP-sharded over 32 chips (embedding + lm_head replicated adds ~2.5 GB/chip) -> ~22.5 GB/chip < 28.6 GB/chip registered usable. Estimate from the config's parameter count, not measured.",
+    "host_ram_note": "bf16 whole model (~640 GB) > host RAM (566 GB): neither the TT build nor the HF golden may load the whole model at once; both stream one decoder layer at a time from the FP8 checkpoint (dequantised exactly as HF's Fp8Dequantize does, verified bit-exact against HF's loader)."
+  },
+  "graduated_modules_verification": {
+    "rule": "graduated = component whose live _stubs/<name>.py equals a _stubs/<name>.py.last_good_{native,sharded} snapshot",
+    "checked": "cmp of every live stub against its snapshot: all 23 SAME",
+    "note": "bringup_status.json tags 9 of these REUSE / 1 ADAPT, yet every one of them has a graduated stub + snapshot and RUN_REPORT.md lists all 23 ON_DEVICE graduated; the prompt's PHASE-2 shard list also names REUSE-tagged ones (text_attention, text_linear_attention, text_m_l_p, vision_attention, vision_m_l_p). So all 23 are graduated work products and ALL 23 must be invoked.",
+    "count": 23,
+    "sharded_tp32": [
+      "text_attention",
+      "text_decoder_layer",
+      "text_experts",
+      "text_forget_gate",
+      "text_hyper_connection",
+      "text_hyper_head",
+      "text_indexer",
+      "text_linear_attention",
+      "text_m_l_p",
+      "text_mo_e",
+      "text_model",
+      "text_topk_router",
+      "vision_attention",
+      "vision_block",
+      "vision_m_l_p",
+      "vision_model",
+      "vision_patch_merger"
+    ],
+    "native_replicated": [
+      "r_m_s_norm",
+      "text_r_m_s_norm",
+      "text_r_m_s_norm_gated",
+      "text_unweighted_r_m_s_norm",
+      "vision_patch_embed",
+      "vision_rotary_embedding"
+    ],
+    "wasted": []
+  },
+  "scheme_evaluation_tp32": {
+    "mesh_axis": "every sharded stub derives cluster_axis = the single mesh axis with size > 1 = axis 1 (the 32 TP columns); all agree",
+    "collective": "all_gather(dim=1, cluster_axis=1, Linear) + on-device sum (ttnn.all_reduce deadlocks on the 1x32 line per the stubs' notes); gathers padded to >= 64 tiles/chip",
+    "checks": {
+      "text_linear_attention (KDA, head-parallel)": "linear num_heads 64 % 32 == 0 -> 2 heads/chip; recurrence never split in time. OK",
+      "text_forget_gate (head-parallel)": "64 heads % 32 -> 2/chip. OK",
+      "text_attention (DSA/MLA, head-parallel q_b/kv_b col, o_proj row)": "num_attention_heads 64 % 32 -> 2/chip (num_key_value_heads 64 >= 32). OK",
+      "text_indexer (head-parallel)": "index_n_heads 32 % 32 -> 1/chip. OK",
+      "text_topk_router (expert-axis column-parallel)": "n_routed_experts 288 % 32 -> 9/chip. OK",
+      "text_experts / text_mo_e (expert-parallel EP)": "288 % 32 == 0 -> 9 whole experts/chip. OK",
+      "text_m_l_p / dense + shared MLP (col/row)": "intermediate_size 12288 % 32 = 0 (384/chip); moe_intermediate (shared) 2048 % 32 = 0 (64/chip). OK",
+      "text_hyper_connection (column-parallel mix)": "(2+hc_mult)*hc_mult = 24 outputs padded to 32 -> 1/chip. OK",
+      "text_hyper_head": "no weights, replicated. OK",
+      "vision_attention (head-parallel)": "vision num_heads 16 < 32 -> each head computed by r = 32/16 = 2 chips, o-proj rows scaled 1/r (power of two, exact). OK",
+      "vision_m_l_p / vision_block": "vision intermediate 4096 % 32 = 0. OK",
+      "vision_patch_merger": "proj 4096 % 32, context 10240 % 32 = 0. OK",
+      "vision_model": "patch_embed 1024 % 32, downsample out 4096 % 32. OK",
+      "sequence_parallel": "none used",
+      "batch_axis": "B is a separate leading/row axis, never sharded; TP split unchanged"
+    },
+    "holes": []
+  },
+  "task_heads": [
+    {
+      "call": "Call 1",
+      "task": "image-text-to-text",
+      "hf_class": "Glm5NextForConditionalGeneration",
+      "reference": "model.generate() semantics: greedy-or-sampled autoregressive decode until a generation_config.eos_token_id ({154820,154827,154829}); golden built with HF's own module classes (Glm5NextVisionModel, Glm5NextTextDecoderLayer x45, embed_tokens, hc_head, norm, lm_head) streamed one layer at a time because the whole bf16 model exceeds host RAM; batch rows = identical example input, per-row seed 0..31 under generation_config temperature/top_p (Gumbel-max with seeded noise so both sides draw the same sample)",
+      "input": "HF processor (Glm5NextProcessor.apply_chat_template) over the published docstring example of Glm5NextForConditionalGeneration.forward: image https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg + text 'Describe the image.'",
+      "output": "generated token ids -> decoded text (tokenizer.batch_decode)",
+      "stages": [
+        "vision_encode",
+        "prefill",
+        "decode"
+      ],
+      "stub_routing": {
+        "vision_encode": {
+          "vision_model": "top-level vision stack object (TtVisionModel) owning the stages below",
+          "vision_patch_embed": "pixel_values [N,1176] -> [N,1024]",
+          "vision_rotary_embedding": "(h,w) position ids -> cos/sin tables",
+          "vision_block": "x24, each = r_m_s_norm(norm1) -> vision_attention -> residual -> r_m_s_norm(norm2) -> vision_m_l_p -> residual",
+          "r_m_s_norm": "vision norm1/norm2 and post_layernorm",
+          "vision_attention": "inside every vision_block",
+          "vision_m_l_p": "inside every vision_block",
+          "vision_patch_merger": "after downsample: image embeddings [R,4096] scattered into the image-token rows of inputs_embeds (on device)"
+        },
+        "prefill/decode (text)": {
+          "text_model": "top-level text stack object (TtTextModel) owning 45 text_decoder_layer + hc_head + final norm",
+          "text_decoder_layer": "x45 (34 KDA + 11 DSA; 3 dense MLP + 42 MoE)",
+          "text_hyper_connection": "attn_hc and ffn_hc of every layer (pre/post/comb + stream collapse)",
+          "text_unweighted_r_m_s_norm": "the hyper-connection input norm of every attn_hc/ffn_hc",
+          "text_r_m_s_norm": "input_layernorm / post_attention_layernorm of every layer and the final model norm",
+          "text_linear_attention": "self_attn of the 34 KDA layers",
+          "text_forget_gate": "KDA forget gate g of every KDA layer",
+          "text_r_m_s_norm_gated": "KDA o_norm (gated by g_b(g_a(x))) of every KDA layer",
+          "text_attention": "self_attn of the 11 DSA layers",
+          "text_indexer": "DSA top-k pool selection of every DSA layer; its indices are turned into the attention mask on device",
+          "text_m_l_p": "dense MLP of layers 0-2 and the shared expert of every MoE layer",
+          "text_mo_e": "mlp of the 42 sparse layers = text_topk_router -> text_experts (+ text_m_l_p shared)",
+          "text_topk_router": "router of every MoE layer (indices, weights)",
+          "text_experts": "routed experts of every MoE layer, fed the router's indices/weights",
+          "text_hyper_head": "final stream collapse before the final norm"
+        },
+        "lm_head + sampling": "lm_head (replicated bf16 linear) + on-device argmax/sample -> next token id; next-step embedding gathered on device (ttnn.embedding)"
+      }
+    }
+  ],
+  "pass_definition": {
+    "gate1": "every routed stub's forward is pure ttnn (no torch compute in the call path); the 17 sharded stubs keep ShardTensorToMesh + all_gather collectives (not rewritten to replication)",
+    "gate2": "every one of the 23 graduated stub classes records >= 1 invocation during the real generate run (counters wrapped around the stub __call__s inside the forward path); missing any -> FAIL",
+    "gate3": "per-row PCC of TT vs HF logits over the row's WHOLE generated output (all decode steps concatenated) >= 0.99, min over the 32 rows reported as 'e2e PCC='; every generated token equals the reference's own choice (teacher-forced, same seeded noise, HF TopPLogitsWarper) except choices the bf16 reference cannot resolve (its margin <= 4 bf16 ULPs of its top score), capped at 5%",
+    "validation_metric": "whole-output logits PCC per row; per-step PCC mean/p05/min printed; image embeddings and prefill hidden PCC >= 0.995 (min row) with norm ratio within 0.5%",
+    "behavioral_proof": "decoded text of the TT generation printed beside the HF golden text; run stops on an eos_token_id, not on the safety cap",
+    "decode_horizon": "stop on generation_config.eos_token_id for both TT and HF; safety cap from the pipeline capacity (asserted not hit unless TT_PERF_OSL_TOKENS is set)",
+    "why_not_min_step_pcc": "measured on the B=1 384-token run: vs the exact fp32 HF math, TT per-step PCC mean 0.9980 / min 0.9625 while the HF bf16 golden itself is mean 0.9964 / min 0.9286, and HF-bf16 argmax disagrees with fp32 on 11/384 tokens (TT: 9/384); a per-step min >= 0.99 or exact token equality with a bf16 golden is a criterion the reference fails against its own fp32 math"
+  },
+  "self_validation_plan": [
+    "1. loader: streamed per-layer state dicts == HF from_pretrained (truncated) state dicts, bitwise, for layers 0-3, vision blocks 0-1, embed/lm_head/norm",
+    "2. one-layer device check per layer kind (KDA+dense, DSA+MoE) vs HF layer in fp32: PCC >= 0.99",
+    "3. full-depth prefill: TT logits vs HF golden logits PCC, hidden state PCC/norm ratio",
+    "4. decode with resident KDA recurrent/conv state + DSA KV cache vs HF golden (same stop rule)",
+    "5. invocation counters: all 23 stubs > 0",
+    "6. batch B from $TT_PERF_BATCH (32): print PERF_BATCH_STREAMS=B"
+  ],
+  "decode_horizon_note": "eos from generation_config; safety cap = capacity index_topk (2048) - prompt; test asserts the cap was not hit"
+}

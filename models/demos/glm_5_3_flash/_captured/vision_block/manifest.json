@@ -1,0 +1,62 @@
+{
+  "component": "vision_block",
+  "submodule_path": "visual.blocks.0",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "cu_seqlens": {
+        "kind": "tensor",
+        "shape": [
+          2
+        ],
+        "dtype": "torch.int32"
+      },
+      "max_seqlen": {
+        "kind": "none"
+      },
+      "position_embeddings": {
+        "kind": "tuple",
+        "items": [
+          {
+            "kind": "tensor",
+            "shape": [
+              16,
+              64
+            ],
+            "dtype": "torch.float32"
+          },
+          {
+            "kind": "tensor",
+            "shape": [
+              16,
+              64
+            ],
+            "dtype": "torch.float32"
+          }
+        ]
+      }
+    }
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

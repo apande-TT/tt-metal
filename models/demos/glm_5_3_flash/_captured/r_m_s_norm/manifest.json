@@ -1,0 +1,30 @@
+{
+  "component": "r_m_s_norm",
+  "submodule_path": "visual.blocks.0.norm1",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          1024
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

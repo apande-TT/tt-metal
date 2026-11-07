@@ -1,0 +1,5 @@
+{
+  "image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg",
+  "prompt": "Describe the image.",
+  "max_image_tokens": null
+}

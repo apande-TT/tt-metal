@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `Glm5NextVisionRotaryEmbedding` (GLM-5.3-Flash axial 2-D vision rope).
+
+Reference: position_ids [N, 2] = (h, w) per token; f_h = h * inv_freq, f_w = w * inv_freq
+(inv_freq has hd/4 entries); cos/sin = cos/sin(cat(cat(f_h, f_w), cat(f_h, f_w))) * attention_scaling.
+
+On device: angle[n, :] = h[n] * [inv|0|inv|0] + w[n] * [0|inv|0|inv] (constant rows built once in
+build(); attention_scaling folded in -- it is 1.0 for axial rope and multiplies cos/sin, which the
+fold reproduces only when it is 1.0, so anything else is rejected), then ttnn.cos / ttnn.sin.
+No weights; on a mesh the tables are computed replicated.
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+
+
+class TtVisionRotaryEmbedding:
+    def __init__(self, device, m):
+        self.device = device
+        if float(m.attention_scaling) != 1.0:
+            raise NotImplementedError("axial rope attention_scaling != 1")
+        inv = m.inv_freq.detach().to(torch.float32)
+        # [inv, 0, inv, 0] and [0, inv, 0, inv]
+        self.A = self._put(torch.kron(torch.tensor([1.0, 0.0, 1.0, 0.0]), inv).reshape(1, 1, 1, -1))
+        self.B = self._put(torch.kron(torch.tensor([0.0, 1.0, 0.0, 1.0]), inv).reshape(1, 1, 1, -1))
+        self.hd = 4 * int(inv.shape[0])
+
+    def _mesh(self):
+        try:
+            return self.device.get_num_devices() > 1
+        except Exception:
+            return False
+
+    def _put(self, t):
+        kw = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        if self._mesh():
+            kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self.device)
+        return ttnn.from_torch(t.to(torch.float32).contiguous(), **kw)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, x, position_ids=None, **kwargs):
+        if position_ids is None:
+            raise ValueError("vision rope requires position_ids [N, 2]")
+        N = position_ids.shape[0]
+        pos = (
+            self._put(position_ids.reshape(1, 1, N, 2))
+            if isinstance(position_ids, torch.Tensor)
+            else ttnn.typecast(ttnn.to_layout(ttnn.reshape(position_ids, [1, 1, N, 2]), ttnn.TILE_LAYOUT), ttnn.float32)
+        )
+        prm = ttnn.to_layout(pos, ttnn.ROW_MAJOR_LAYOUT)
+        col = lambda j: ttnn.to_layout(ttnn.slice(prm, [0, 0, 0, j], [1, 1, N, j + 1]), ttnn.TILE_LAYOUT)
+        ang = ttnn.add(ttnn.multiply(col(0), self.A), ttnn.multiply(col(1), self.B))  # [1,1,N,hd]
+        cos = ttnn.reshape(ttnn.to_layout(ttnn.cos(ang), ttnn.ROW_MAJOR_LAYOUT), [N, self.hd])
+        sin = ttnn.reshape(ttnn.to_layout(ttnn.sin(ang), ttnn.ROW_MAJOR_LAYOUT), [N, self.hd])
+        return cos, sin
+
+
+def build(device, torch_module=None):
+    return TtVisionRotaryEmbedding.build(device, torch_module)
+
+
+def vision_rotary_embedding(device, torch_module=None):
+    return TtVisionRotaryEmbedding.build(device, torch_module)

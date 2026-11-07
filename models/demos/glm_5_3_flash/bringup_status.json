@@ -1,0 +1,340 @@
+{
+  "new_model_id": "zai-org/GLM-5.3-Flash",
+  "new_model_type": "glm5_next",
+  "sibling_hf_id": "zai-org/GLM-5.3-Flash",
+  "sibling_model_type": "glm5_next",
+  "backend": {
+    "name": "GLM-5 Next (glm5_next hybrid linear-attn/MoE VLM)",
+    "demo_path": "models/demos/glm5_next"
+  },
+  "counts": {
+    "REUSE": 9,
+    "ADAPT": 1,
+    "NEW": 13
+  },
+  "common_reuse": [
+    {
+      "purpose": "LayerNorm / RMSNorm",
+      "path": "models/common/rmsnorm.py"
+    },
+    {
+      "purpose": "LightweightModule base",
+      "path": "models/common/lightweightmodule.py"
+    },
+    {
+      "purpose": "Tensor helpers",
+      "path": "models/common/tensor_utils.py"
+    },
+    {
+      "purpose": "Generic utility funcs",
+      "path": "models/common/utility_functions.py"
+    }
+  ],
+  "components": [
+    {
+      "name": "text_model",
+      "kind": "Glm5NextTextModel",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=1 leaves=942 sample_paths=['language_model']",
+      "submodule_path": "language_model",
+      "class_name": "Glm5NextTextModel"
+    },
+    {
+      "name": "text_decoder_layer",
+      "kind": "Glm5NextTextDecoderLayer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=45 leaves=939 sample_paths=['language_model.layers.0', 'language_model.layers.1']",
+      "submodule_path": "language_model.layers.0",
+      "class_name": "Glm5NextTextDecoderLayer"
+    },
+    {
+      "name": "text_linear_attention",
+      "kind": "Glm5NextTextLinearAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=34 leaves=374 sample_paths=['language_model.layers.0.self_attn', 'language_model.layers.1.self_attn']",
+      "submodule_path": "language_model.layers.0.self_attn",
+      "class_name": "Glm5NextTextLinearAttention"
+    },
+    {
+      "name": "text_mo_e",
+      "kind": "Glm5NextTextMoE",
+      "status": "ADAPT",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mixtral_moe.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: moe_routing_mixtral_style -> models/tt_transformers/tt/mixtral_moe.py::TtMoeLayer (ADAPT). derived from compatibility.py BUILDING_BLOCKS 'MoE routing (Mixtral-style)'. Generic MoE block currently hard-codes num_devices=8 and top-2. Adapting to other top-k or device counts needs a small refactor. Larger-scale MoE (DeepSeek/GPT-OSS) has standalone demos. | module-tree: occ=42 leaves=252 sample_paths=['language_model.layers.3.mlp', 'language_model.layers.4.mlp']",
+      "submodule_path": "language_model.layers.3.mlp",
+      "class_name": "Glm5NextTextMoE"
+    },
+    {
+      "name": "vision_model",
+      "kind": "Glm5NextVisionModel",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=1 leaves=251 sample_paths=['visual']",
+      "submodule_path": "visual",
+      "class_name": "Glm5NextVisionModel"
+    },
+    {
+      "name": "vision_block",
+      "kind": "Glm5NextVisionBlock",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=24 leaves=240 sample_paths=['visual.blocks.0', 'visual.blocks.1']",
+      "submodule_path": "visual.blocks.0",
+      "class_name": "Glm5NextVisionBlock"
+    },
+    {
+      "name": "text_m_l_p",
+      "kind": "Glm5NextTextMLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=45 leaves=180 sample_paths=['language_model.layers.0.mlp', 'language_model.layers.1.mlp']",
+      "submodule_path": "language_model.layers.0.mlp",
+      "class_name": "Glm5NextTextMLP"
+    },
+    {
+      "name": "text_attention",
+      "kind": "Glm5NextTextAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=11 leaves=121 sample_paths=['language_model.layers.3.self_attn', 'language_model.layers.7.self_attn']",
+      "submodule_path": "language_model.layers.3.self_attn",
+      "class_name": "Glm5NextTextAttention"
+    },
+    {
+      "name": "text_r_m_s_norm",
+      "kind": "Glm5NextTextRMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=113 leaves=113 sample_paths=['language_model.layers.0.input_layernorm', 'language_model.layers.0.post_attention_layernorm']",
+      "submodule_path": "language_model.layers.0.input_layernorm",
+      "class_name": "Glm5NextTextRMSNorm"
+    },
+    {
+      "name": "r_m_s_norm",
+      "kind": "Glm5NextRMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=97 leaves=97 sample_paths=['visual.blocks.0.norm1', 'visual.blocks.0.norm2']",
+      "submodule_path": "visual.blocks.0.norm1",
+      "class_name": "Glm5NextRMSNorm",
+      "_added_by_decomposition_of": "vision_block",
+      "_child_short_name": "r_m_s_norm"
+    },
+    {
+      "name": "vision_attention",
+      "kind": "Glm5NextVisionAttention",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/attention.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: gqa_attention -> models/tt_transformers/tt/attention.py::Attention (REUSE). derived from compatibility.py BUILDING_BLOCKS 'GQA attention'. Requires num_attention_heads % num_key_value_heads == 0. | module-tree: occ=24 leaves=96 sample_paths=['visual.blocks.0.attn', 'visual.blocks.1.attn']",
+      "submodule_path": "visual.blocks.0.attn",
+      "class_name": "Glm5NextVisionAttention",
+      "_added_by_decomposition_of": "vision_block",
+      "_child_short_name": "vision_attention"
+    },
+    {
+      "name": "vision_m_l_p",
+      "kind": "Glm5NextVisionMLP",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/mlp.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: swiglu_mlp -> models/tt_transformers/tt/mlp.py::MLP (REUSE). derived from compatibility.py BUILDING_BLOCKS 'SwiGLU MLP'. hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh. | module-tree: occ=24 leaves=96 sample_paths=['visual.blocks.0.mlp', 'visual.blocks.1.mlp']",
+      "submodule_path": "visual.blocks.0.mlp",
+      "class_name": "Glm5NextVisionMLP",
+      "_added_by_decomposition_of": "vision_block",
+      "_child_short_name": "vision_m_l_p"
+    },
+    {
+      "name": "text_hyper_connection",
+      "kind": "Glm5NextTextHyperConnection",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=90 leaves=90 sample_paths=['language_model.layers.0.attn_hc', 'language_model.layers.0.ffn_hc']",
+      "submodule_path": "language_model.layers.0.attn_hc",
+      "class_name": "Glm5NextTextHyperConnection"
+    },
+    {
+      "name": "text_unweighted_r_m_s_norm",
+      "kind": "Glm5NextTextUnweightedRMSNorm",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/common/rmsnorm.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: rmsnorm_text -> models/common/rmsnorm.py::RMSNorm (REUSE). derived from compatibility.py BUILDING_BLOCKS 'RMSNorm (text)'. ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip. | module-tree: occ=90 leaves=90 sample_paths=['language_model.layers.0.attn_hc.input_norm', 'language_model.layers.0.ffn_hc.input_norm']",
+      "submodule_path": "language_model.layers.0.attn_hc.input_norm",
+      "class_name": "Glm5NextTextUnweightedRMSNorm"
+    },
+    {
+      "name": "text_forget_gate",
+      "kind": "Glm5NextTextForgetGate",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=34 leaves=68 sample_paths=['language_model.layers.0.self_attn.forget_gate', 'language_model.layers.1.self_attn.forget_gate']",
+      "submodule_path": "language_model.layers.0.self_attn.forget_gate",
+      "class_name": "Glm5NextTextForgetGate"
+    },
+    {
+      "name": "text_indexer",
+      "kind": "Glm5NextTextIndexer",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=11 leaves=44 sample_paths=['language_model.layers.3.self_attn.indexer', 'language_model.layers.7.self_attn.indexer']",
+      "submodule_path": "language_model.layers.3.self_attn.indexer",
+      "class_name": "Glm5NextTextIndexer"
+    },
+    {
+      "name": "text_experts",
+      "kind": "Glm5NextTextExperts",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=42 leaves=42 sample_paths=['language_model.layers.3.mlp.experts', 'language_model.layers.4.mlp.experts']",
+      "submodule_path": "language_model.layers.3.mlp.experts",
+      "class_name": "Glm5NextTextExperts"
+    },
+    {
+      "name": "text_topk_router",
+      "kind": "Glm5NextTextTopkRouter",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=42 leaves=42 sample_paths=['language_model.layers.3.mlp.gate', 'language_model.layers.4.mlp.gate']",
+      "submodule_path": "language_model.layers.3.mlp.gate",
+      "class_name": "Glm5NextTextTopkRouter"
+    },
+    {
+      "name": "text_r_m_s_norm_gated",
+      "kind": "Glm5NextTextRMSNormGated",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=34 leaves=34 sample_paths=['language_model.layers.0.self_attn.o_norm', 'language_model.layers.1.self_attn.o_norm']",
+      "submodule_path": "language_model.layers.0.self_attn.o_norm",
+      "class_name": "Glm5NextTextRMSNormGated"
+    },
+    {
+      "name": "vision_patch_merger",
+      "kind": "Glm5NextVisionPatchMerger",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=1 leaves=7 sample_paths=['visual.merger']",
+      "submodule_path": "visual.merger",
+      "class_name": "Glm5NextVisionPatchMerger"
+    },
+    {
+      "name": "text_hyper_head",
+      "kind": "Glm5NextTextHyperHead",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=1 leaves=1 sample_paths=['language_model.hc_head']",
+      "submodule_path": "language_model.hc_head",
+      "class_name": "Glm5NextTextHyperHead"
+    },
+    {
+      "name": "vision_patch_embed",
+      "kind": "Glm5NextVisionPatchEmbed",
+      "status": "NEW",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": null,
+      "hf_reference": "transformers/src/transformers/models/glm5_next/modeling_glm5_next.py",
+      "notes": "module-tree: occ=1 leaves=1 sample_paths=['visual.patch_embed']",
+      "submodule_path": "visual.patch_embed",
+      "class_name": "Glm5NextVisionPatchEmbed"
+    },
+    {
+      "name": "vision_rotary_embedding",
+      "kind": "Glm5NextVisionRotaryEmbedding",
+      "status": "REUSE",
+      "new_shape": {},
+      "sibling_shape": {},
+      "tt_reuse_target": "models/tt_transformers/tt/rope.py",
+      "hf_reference": null,
+      "notes": "reuse_registry: standard_rope -> models/tt_transformers/tt/rope.py::RotaryEmbedding (REUSE). derived from compatibility.py BUILDING_BLOCKS 'Standard RoPE'. | module-tree: occ=1 leaves=1 sample_paths=['visual.rotary_pos_emb']",
+      "submodule_path": "visual.rotary_pos_emb",
+      "class_name": "Glm5NextVisionRotaryEmbedding"
+    }
+  ],
+  "notes": [
+    "Top sibling candidates (per-component reuse targets are pulled from whichever sibling provides them, not only the first): GLM-5 Next (glm5_next hybrid linear-attn/MoE VLM) (score 100: exact model_type 'glm5_next'); tt_transformers / simple_text_demo (multimodal) (score 40: category 'VLM' default (generic runner)); Mistral-Small-3.1 (mistral3 VLM) (score 30: category 'VLM' default)"
+  ],
+  "ranked_siblings": [
+    {
+      "rank": 1,
+      "backend": "GLM-5 Next (glm5_next hybrid linear-attn/MoE VLM)",
+      "score": 100,
+      "reason": "exact model_type 'glm5_next'"
+    },
+    {
+      "rank": 2,
+      "backend": "tt_transformers / simple_text_demo (multimodal)",
+      "score": 40,
+      "reason": "category 'VLM' default (generic runner)"
+    },
+    {
+      "rank": 3,
+      "backend": "Mistral-Small-3.1 (mistral3 VLM)",
+      "score": 30,
+      "reason": "category 'VLM' default"
+    }
+  ]
+}

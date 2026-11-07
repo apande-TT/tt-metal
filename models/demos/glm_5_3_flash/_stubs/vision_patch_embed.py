@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, tensor-parallel port of `Glm5NextVisionPatchEmbed` (GLM-5.3-Flash).
+
+Reference: x [N, C*T*P*P] -> view(-1, C, T, P, P) -> Conv3d(kernel = stride = (T, P, P)) -> [N, E].
+With kernel == stride == the whole patch, the conv is exactly one dot product per output channel
+over the flattened patch (same C,T,P,P order as the view), i.e. a Linear with weight
+W.reshape(E, C*T*P*P) plus the conv bias -- computed here as a ttnn.linear.
+
+Tensor parallelism over N chips: the projection is COLUMN-parallel over the E output channels
+(bias sharded with it); an all_gather on the channel axis reassembles [N, E] on every chip
+(padded to >= 64 tiles per chip: all_gather deadlocks on the 1x32 Galaxy line below that).
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+from models.demos.glm_5_3_flash._stubs.text_decoder_layer import _Ctx
+
+
+def _gather_cols(ctx, part):
+    """[1,1,R,c] per chip -> [1,1,R,N*c] in global (chip-major) column order, replicated."""
+    if ctx.n == 1:
+        return part
+    R, c = part.shape[-2], part.shape[-1]
+    pb = ttnn.typecast(part, ttnn.bfloat16)
+    row_tiles = max(1, -(-R // 32))
+    cp = max(c, -(-64 // row_tiles) * 32)
+    if cp > c:
+        pb = ttnn.pad(pb, [(0, 0), (0, 0), (0, 0), (0, cp - c)], 0.0)
+    g = ttnn.all_gather(pb, dim=1, cluster_axis=ctx.axis, topology=ttnn.Topology.Linear)  # [1,N,R,cp]
+    g = ttnn.to_layout(ttnn.typecast(g, ttnn.float32), ttnn.ROW_MAJOR_LAYOUT)
+    if cp > c:
+        g = ttnn.slice(g, [0, 0, 0, 0], [1, ctx.n, R, c])
+    g = ttnn.reshape(ttnn.permute(g, (0, 2, 1, 3)), [1, 1, R, ctx.n * c])
+    return ttnn.to_layout(g, ttnn.TILE_LAYOUT)
+
+
+class _PatchEmbed:
+    def __init__(self, ctx, m):
+        self.ctx = c = ctx
+        W = m.proj.weight.detach().to(torch.float32)  # [E, C, T, P, P]
+        self.E = int(W.shape[0])
+        self.K = int(W[0].numel())
+        if tuple(m.proj.kernel_size) != tuple(m.proj.stride):
+            raise NotImplementedError("patch conv with stride != kernel")
+        if self.E % c.n:
+            raise ValueError(f"embed dim {self.E} not divisible by mesh {c.n}")
+        self.w = c.put(W.reshape(self.E, self.K).t(), shard_dim=-1)
+        self.b = c.f32(m.proj.bias.detach().reshape(1, 1, 1, self.E), shard_dim=-1) if m.proj.bias is not None else None
+
+    def __call__(self, x):
+        """x fp32/bf16 [1,1,N,K] replicated -> fp32 [1,1,N,E] replicated."""
+        c = self.ctx
+        part = c.lin_hp(x, self.w)
+        if self.b is not None:
+            part = ttnn.add(part, self.b)
+        return _gather_cols(c, part)
+
+
+class TtVisionPatchEmbed:
+    def __init__(self, device, m):
+        self.ctx = _Ctx(device)
+        self.pe = _PatchEmbed(self.ctx, m)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        x = hidden_states
+        N = 1
+        for d in list(x.shape)[:-1]:
+            N *= d
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.reshape(x, [1, 1, N, self.pe.K])
+        return ttnn.reshape(self.pe(x), [N, self.pe.E])
+
+
+def build(device, torch_module=None):
+    return TtVisionPatchEmbed.build(device, torch_module)
+
+
+def vision_patch_embed(device, torch_module=None):
+    return TtVisionPatchEmbed.build(device, torch_module)

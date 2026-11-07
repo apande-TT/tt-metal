@@ -1,0 +1,52 @@
+{
+  "component": "text_topk_router",
+  "submodule_path": "language_model.layers.3.mlp.gate",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          288
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  }
+}

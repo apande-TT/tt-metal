@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, expert-axis-parallel port of `Glm5NextTextTopkRouter` (GLM-5.3-Flash MoE router).
+
+Reference (fp32):
+    logits = x @ W^T                         [T, E]
+    s = sigmoid(logits);  c = s + e_score_correction_bias   (n_group == 1: group mask is a no-op)
+    idx = topk(c, k);  w = s[idx] / (sum s[idx] + 1e-20) * routed_scaling_factor
+    returns (logits, w, idx)
+
+Device formulation:
+  * logits to ~16 mantissa bits (they decide a discrete top-k): x split into bf16 hi + lo halves,
+    x_hi @ W + x_lo @ W in fp32 (W is bf16-exact in the checkpoint).
+  * exact top-k from an fp32 rank comparison (rank[t,e] = #{q : c[t,q] > c[t,e]}); indices come out
+    in descending score order (HF's topk(sorted=False) order is unspecified; the set is identical).
+
+Tensor parallelism over N chips: the router weight is split on the EXPERT axis (column-parallel,
+E/N experts per chip -- the same expert partition the expert-parallel MoE uses); each chip computes
+its experts' logits and an all_gather reassembles the full [T, E] logits on every chip (bf16 hi/lo
+pair so the gathered logits keep ~16 bits; padded to >= 64 tiles per chip because all_gather
+deadlocks on the 1x32 Galaxy line below that). Sigmoid, bias, top-k and normalisation are
+per-token and run replicated.
+"""
+from __future__ import annotations
+
+import torch
+
+import ttnn
+from models.demos.glm_5_3_flash._stubs.text_decoder_layer import _Ctx, _rs
+
+
+class TtTextTopkRouter:
+    def __init__(self, device, m):
+        self.ctx = c = _Ctx(device)
+        if int(m.num_group) != 1 or int(m.topk_group) != 1:
+            raise NotImplementedError("grouped routing (n_group > 1) not used by this checkpoint")
+        self.k, self.E, self.D = int(m.top_k), int(m.num_experts), int(m.hidden_dim)
+        if self.E % c.n:
+            raise ValueError(f"num_experts={self.E} not divisible by mesh size {c.n}")
+        self.El = self.E // c.n
+        self.norm_topk = bool(m.norm_topk_prob)
+        self.rsf = float(m.routed_scaling_factor)
+        W = m.weight.detach().to(torch.float32)
+        if not torch.equal(W, W.to(torch.bfloat16).to(torch.float32)):
+            raise NotImplementedError("router weight is not bf16-exact; hi/lo split of W needed")
+        self.w = c.put(W.t(), shard_dim=-1)  # [D, E] -> E/N expert columns per chip
+        self.bias = c.f32(m.e_score_correction_bias.detach().reshape(1, 1, 1, self.E))
+        ar = lambda n: torch.arange(n, dtype=torch.float32)
+        self.e_col = c.f32(ar(self.E).reshape(1, 1, self.E, 1))
+        self.r_row = c.f32(ar(self.k).reshape(1, 1, 1, self.k))
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def _gather_experts(self, part, T):
+        """[1,1,T,El] per chip -> [1,1,T,E] (global expert order) on every chip, ~16-bit precise."""
+        c, El = self.ctx, self.El
+        if c.n == 1:
+            return part
+        hi = ttnn.typecast(part, ttnn.bfloat16)
+        lo = ttnn.typecast(ttnn.subtract(part, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
+        cp = -(-El // 32) * 32
+        pad = lambda t, n: t if n <= 0 else ttnn.pad(t, [(0, 0), (0, 0), (0, 0), (0, n)], 0.0)
+        pk = ttnn.concat([pad(hi, cp - El), pad(lo, cp - El)], dim=-1)  # [1,1,T,2cp]
+        row_tiles = max(1, -(-T // 32))
+        wp = max(2 * cp, -(-64 // row_tiles) * 32)
+        pk = pad(pk, wp - 2 * cp)
+        g = ttnn.all_gather(pk, dim=1, cluster_axis=c.axis, topology=ttnn.Topology.Linear)  # [1,N,T,wp]
+        g = ttnn.to_layout(ttnn.typecast(g, ttnn.float32), ttnn.ROW_MAJOR_LAYOUT)
+        h = ttnn.slice(g, [0, 0, 0, 0], [1, c.n, T, El])
+        l = ttnn.slice(g, [0, 0, 0, cp], [1, c.n, T, cp + El])
+        full = ttnn.add(h, l)  # [1,N,T,El]
+        full = ttnn.reshape(ttnn.permute(full, (0, 2, 1, 3)), [1, 1, T, self.E])
+        return ttnn.to_layout(full, ttnn.TILE_LAYOUT)
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        c, E, k = self.ctx, self.E, self.k
+        x = hidden_states
+        T = 1
+        for d in list(x.shape)[:-1]:
+            T *= d
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(ttnn.reshape(x, [1, 1, T, self.D]), ttnn.float32)
+        hi = ttnn.typecast(x, ttnn.bfloat16)
+        lo = ttnn.typecast(ttnn.subtract(x, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
+        part = ttnn.add(c.lin(hi, self.w), c.lin(lo, self.w))  # [1,1,T,El] this chip's experts
+        logits = self._gather_experts(part, T)  # [1,1,T,E]
+
+        s = ttnn.sigmoid(logits)
+        choice = ttnn.add(s, self.bias)
+        rank = ttnn.sum(ttnn.gt(_rs(choice, [1, T, 1, E]), _rs(choice, [1, T, E, 1])), dim=-1, keepdim=True)
+        onehot = ttnn.eq(rank, self.r_row)  # [1,T,E,k]: expert e sits at rank r
+        idx = ttnn.sum(ttnn.multiply(onehot, self.e_col), dim=2, keepdim=True)  # [1,T,1,k]
+        w = ttnn.sum(ttnn.multiply(onehot, _rs(s, [1, T, E, 1])), dim=2, keepdim=True)  # [1,T,1,k]
+        if self.norm_topk:
+            w = ttnn.divide(w, ttnn.add(ttnn.sum(w, dim=-1, keepdim=True), 1e-20))
+        w = ttnn.multiply(w, self.rsf)
+        to2 = lambda t, n: ttnn.reshape(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [T, n])
+        idx = ttnn.typecast(ttnn.to_layout(to2(idx, k), ttnn.TILE_LAYOUT), ttnn.int32)
+        return to2(logits, E), to2(w, k), idx
+
+
+def build(device, torch_module=None):
+    return TtTextTopkRouter.build(device, torch_module)
+
+
+def text_topk_router(device, torch_module=None):
+    return TtTextTopkRouter.build(device, torch_module)

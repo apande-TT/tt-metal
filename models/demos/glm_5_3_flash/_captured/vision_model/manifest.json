@@ -1,0 +1,52 @@
+{
+  "component": "vision_model",
+  "submodule_path": "visual",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          1176
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {
+      "grid_thw": {
+        "kind": "tensor",
+        "shape": [
+          1,
+          3
+        ],
+        "dtype": "torch.int64"
+      }
+    }
+  },
+  "output": {
+    "kind": "dict",
+    "items": {
+      "last_hidden_state": {
+        "kind": "tensor",
+        "shape": [
+          4,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      "pooler_output": {
+        "kind": "tensor",
+        "shape": [
+          4,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    }
+  }
+}

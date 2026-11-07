@@ -1,0 +1,218 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, tensor-parallel port of `Glm5NextTextAttention` (GLM-5.3-Flash DSA layer).
+
+Reference math (HF `Glm5NextTextAttention.forward`, NoPE: qk_rope_head_dim == 0):
+
+    q_resid = RMSNorm(q_a_proj(x))                 # [B,S,q_lora]
+    q       = q_b_proj(q_resid)  -> [B,H,S,dqk]
+    kv      = RMSNorm(kv_a_proj_with_mqa(x))       # [B,S,kv_lora]
+    k, v    = split_per_head(kv_b_proj(kv))        # [B,H,S,dqk], [B,H,S,dv]
+    mask    = sparse mask from the DSA indexer's top-k pool selection
+    out     = o_proj(softmax(q k^T * scale + mask) v)
+
+DSA selection for S <= index_topk: the indexer scores ceil(S / kpool) pools and keeps
+select_k = min(index_topk // kpool, n_pools) of them, i.e. EVERY pool. Masking drops the pools that
+are not fully visible, and `append_visible_tail` adds back the visible tokens of the open pool, so
+the selected set for query i is exactly {j <= i, j a valid key}: the causal (+ key padding) mask.
+The indexer's scores therefore cannot change the output in that regime, and this port computes the
+mask directly. Longer sequences (where top-k genuinely drops pools) raise instead of silently
+diverging.
+
+Tensor parallelism over the N chips of the mesh (H heads -> H/N heads per chip):
+  * q_a_proj, kv_a_proj_with_mqa and both RMSNorms are REPLICATED (low-rank, feed full-width norms).
+  * q_b_proj, kv_b_proj (K and V halves) are COLUMN-parallel by head: ShardTensorToMesh(dim=-1).
+  * attention runs on the chip-local heads only.
+  * o_proj is ROW-parallel (its input features are the head-major attention output):
+    ShardTensorToMesh(dim=0), then an all-reduce (all_gather of the partials + on-device sum)
+    -> replicated output.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+def _num_devices(device):
+    try:
+        return int(device.get_num_devices())
+    except Exception:
+        return 1
+
+
+def _cluster_axis(device):
+    try:
+        shape = tuple(device.shape)
+    except Exception:
+        return None
+    axes = [i for i, s in enumerate(shape) if s > 1]
+    return axes[0] if len(axes) == 1 else None
+
+
+class TtTextAttention:
+    def __init__(self, device, *, cfg, weights, n_dev):
+        self.device = device
+        self.n_dev = n_dev
+        self.cluster_axis = _cluster_axis(device)
+        self.__dict__.update(cfg)
+        self.w = weights
+        self.compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+
+    # ------------------------------------------------------------------ build
+    @classmethod
+    def build(cls, device, torch_module):
+        m = torch_module
+        n_dev = _num_devices(device)
+        is_mesh = n_dev > 1
+
+        H = int(m.num_heads)
+        d_nope = int(m.qk_nope_head_dim)
+        d_rope = int(m.qk_rope_head_dim)
+        d_qk = int(m.qk_head_dim)
+        d_v = int(m.v_head_dim)
+        kv_lora = int(m.kv_lora_rank)
+        if d_rope != 0:
+            raise NotImplementedError("GLM-5.3-Flash DSA attention is NoPE (qk_rope_head_dim == 0)")
+        if H % n_dev:
+            raise ValueError(f"num_heads={H} not divisible by TP={n_dev}")
+        if m.q_a_proj.bias is not None or m.kv_a_proj_with_mqa.bias is not None or m.o_proj.bias is not None:
+            raise NotImplementedError("attention_bias=True is not used by this checkpoint")
+
+        indexer = getattr(m, "indexer", None)
+        cfg_src = indexer if indexer is not None else m.config
+        index_topk = int(getattr(cfg_src, "index_topk"))
+
+        def _t(w):  # nn.Linear weight [out, in] -> ttnn linear operand [in, out]
+            return w.detach().to(torch.float32).t().contiguous().to(torch.bfloat16)
+
+        def _put(t, shard_dim=None, layout=ttnn.TILE_LAYOUT):
+            kw = dict(dtype=ttnn.bfloat16, layout=layout, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if is_mesh:
+                kw["mesh_mapper"] = (
+                    ttnn.ShardTensorToMesh(device, dim=shard_dim)
+                    if shard_dim is not None
+                    else ttnn.ReplicateTensorToMesh(device)
+                )
+            return ttnn.from_torch(t, **kw)
+
+        def _norm_w(norm):
+            w = norm.weight.detach().to(torch.bfloat16)
+            return _put(w.reshape(-1, 32), layout=ttnn.ROW_MAJOR_LAYOUT)
+
+        # kv_b_proj output is head-major [H, d_nope + d_v]; split into separate K / V weights that stay
+        # head-major so a contiguous dim=-1 shard hands each chip whole heads.
+        kvb = m.kv_b_proj.weight.detach().to(torch.float32).view(H, d_nope + d_v, kv_lora)
+        wk_b = kvb[:, :d_nope, :].reshape(H * d_nope, kv_lora)
+        wv_b = kvb[:, d_nope:, :].reshape(H * d_v, kv_lora)
+
+        weights = dict(
+            wq_a=_put(_t(m.q_a_proj.weight)),
+            q_norm=_norm_w(m.q_a_layernorm),
+            wq_b=_put(_t(m.q_b_proj.weight), shard_dim=-1),
+            wkv_a=_put(_t(m.kv_a_proj_with_mqa.weight)),
+            kv_norm=_norm_w(m.kv_a_layernorm),
+            wk_b=_put(_t(wk_b), shard_dim=-1),
+            wv_b=_put(_t(wv_b), shard_dim=-1),
+            wo=_put(_t(m.o_proj.weight), shard_dim=0),
+        )
+        cfg = dict(
+            H=H,
+            H_local=H // n_dev,
+            d_qk=d_qk,
+            d_v=d_v,
+            kv_lora=kv_lora,
+            scale=float(m.scaling),
+            q_eps=float(m.q_a_layernorm.variance_epsilon),
+            kv_eps=float(m.kv_a_layernorm.variance_epsilon),
+            index_topk=index_topk,
+        )
+        return cls(device, cfg=cfg, weights=weights, n_dev=n_dev)
+
+    # ---------------------------------------------------------------- helpers
+    def _linear(self, x, w):
+        return ttnn.linear(x, w, compute_kernel_config=self.compute_kernel_config)
+
+    def _rms(self, x, w, eps):
+        return ttnn.rms_norm(x, epsilon=eps, weight=w, compute_kernel_config=self.compute_kernel_config)
+
+    def _split_heads(self, x, d):
+        # [1,1,S,Hl*d] -> [1,Hl,S,d] via tile-aligned slices (Hl is small under TP).
+        S = x.shape[-2]
+        heads = [ttnn.slice(x, [0, 0, 0, h * d], [1, 1, S, (h + 1) * d]) for h in range(self.H_local)]
+        return heads[0] if len(heads) == 1 else ttnn.concat(heads, dim=1)
+
+    def _merge_heads(self, x, d):
+        # [1,Hl,S,d] -> [1,1,S,Hl*d], head-major (matches o_proj's input layout).
+        S = x.shape[-2]
+        heads = [ttnn.slice(x, [0, h, 0, 0], [1, h + 1, S, d]) for h in range(self.H_local)]
+        return heads[0] if len(heads) == 1 else ttnn.concat(heads, dim=-1)
+
+    def _mask(self, S, attention_mask):
+        causal = torch.tril(torch.ones(S, S, dtype=torch.bool))
+        if attention_mask is not None:
+            am = attention_mask
+            if not isinstance(am, torch.Tensor):
+                am = ttnn.to_torch(am)
+            am = am.reshape(-1, am.shape[-1]).bool()
+            if am.shape[0] != 1:
+                raise NotImplementedError("batch > 1 not supported by this port")
+            causal = causal & am[0][None, :S]
+        add = torch.where(causal, 0.0, -1e9).to(torch.bfloat16).reshape(1, 1, S, S)
+        kw = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        if self.n_dev > 1:
+            kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(self.device)
+        return ttnn.from_torch(add, **kw)
+
+    # ---------------------------------------------------------------- forward
+    def __call__(self, hidden_states, attention_mask=None, past_key_values=None, prev_topk_indices=None, **kwargs):
+        if past_key_values is not None:
+            raise NotImplementedError("KV-cache path not ported in this component")
+        x = hidden_states
+        in_shape = list(x.shape)
+        S, D = in_shape[-2], in_shape[-1]
+        if S > self.index_topk:
+            raise NotImplementedError(
+                f"S={S} > index_topk={self.index_topk}: DSA top-k drops pools; sparse selection not ported"
+            )
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.reshape(x, [1, 1, S, D])
+
+        # Low-rank down-projections + norms (replicated).
+        q_resid = self._rms(self._linear(x, self.w["wq_a"]), self.w["q_norm"], self.q_eps)
+        kv = self._rms(self._linear(x, self.w["wkv_a"]), self.w["kv_norm"], self.kv_eps)
+
+        # Column-parallel up-projections: chip-local heads only.
+        q = self._split_heads(self._linear(q_resid, self.w["wq_b"]), self.d_qk)  # [1,Hl,S,dqk]
+        k = self._split_heads(self._linear(kv, self.w["wk_b"]), self.d_qk)  # [1,Hl,S,dqk]
+        v = self._split_heads(self._linear(kv, self.w["wv_b"]), self.d_v)  # [1,Hl,S,dv]
+
+        scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=self.compute_kernel_config)
+        scores = ttnn.multiply(scores, self.scale)
+        scores = ttnn.add(scores, self._mask(S, attention_mask))
+        probs = ttnn.softmax(scores, dim=-1, numeric_stable=True)
+        attn = ttnn.matmul(probs, v, compute_kernel_config=self.compute_kernel_config)  # [1,Hl,S,dv]
+
+        # Row-parallel o_proj + all_reduce of the partial sums.
+        out = self._linear(self._merge_heads(attn, self.d_v), self.w["wo"])  # [1,1,S,D] partial
+        if self.n_dev > 1:
+            # All-reduce as all_gather(partials) + sum: ttnn.all_reduce deadlocked on the 1x32
+            # FABRIC_1D Galaxy line, while all_gather on the same mesh completes. Partials are
+            # stacked on dim 1 -> [1, N, S, D], then summed on device -> replicated [1, 1, S, D].
+            gathered = ttnn.all_gather(out, dim=1, cluster_axis=self.cluster_axis, topology=ttnn.Topology.Linear)
+            out = ttnn.sum(gathered, dim=1, keepdim=True)
+        return ttnn.reshape(out, in_shape)
+
+
+def build(device, torch_module=None):
+    return TtTextAttention.build(device, torch_module)
+
+
+def text_attention(device, torch_module=None):
+    return TtTextAttention.build(device, torch_module)

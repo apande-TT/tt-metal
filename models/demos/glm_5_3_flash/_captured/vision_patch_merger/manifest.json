@@ -1,0 +1,30 @@
+{
+  "component": "vision_patch_merger",
+  "submodule_path": "visual.merger",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          4,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      4,
+      4096
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

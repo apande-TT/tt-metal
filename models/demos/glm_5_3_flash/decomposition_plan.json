@@ -1,0 +1,22 @@
+[
+  {
+    "parent_name": "vision_block",
+    "children": [
+      {
+        "name": "r_m_s_norm",
+        "submodule_path": "visual.blocks.0.norm1",
+        "class_name": "Glm5NextRMSNorm"
+      },
+      {
+        "name": "vision_attention",
+        "submodule_path": "visual.blocks.0.attn",
+        "class_name": "Glm5NextVisionAttention"
+      },
+      {
+        "name": "vision_m_l_p",
+        "submodule_path": "visual.blocks.0.mlp",
+        "class_name": "Glm5NextVisionMLP"
+      }
+    ]
+  }
+]

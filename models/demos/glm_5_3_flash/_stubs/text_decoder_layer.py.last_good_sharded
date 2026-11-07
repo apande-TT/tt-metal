@@ -1,0 +1,387 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, tensor-parallel port of `Glm5NextTextDecoderLayer` (GLM-5.3-Flash), KDA + dense-MLP layers.
+
+Layer math (HF):
+    post, comb, x = attn_hc(H)                 # mHC: collapse hc_mult residual streams
+    a  = LinearAttention(RMSNorm(x))           # Kimi delta attention (KDA)
+    H  = post (x) a + comb^T @ H               # expand back into the streams
+    post, comb, x = ffn_hc(H)
+    m  = MLP(RMSNorm(x))                       # SwiGLU with swiglu_limit clamps
+    H  = post (x) m + comb^T @ H
+
+Tensor parallelism over N mesh chips:
+  * hyper-connections, both RMSNorms, f_a_proj / g_a_proj, o_norm: REPLICATED (fp32).
+  * KDA is HEAD-parallel: q/k/v_proj, the depthwise conv channels, f_b_proj, dt_bias, A_log,
+    b_proj, g_b_proj are sharded so each chip owns num_heads/N whole heads; the recurrence runs
+    unchanged within a head (never split over time). o_proj is ROW-parallel + all-reduce.
+  * MLP: gate/up COLUMN-parallel, down ROW-parallel + all-reduce.
+  * All-reduce = all_gather(partials) + on-device sum (ttnn.all_reduce deadlocks on the 1x32 line).
+
+KDA (chunked, chunk C=64, fp32) per head, with exact reformulations that are device friendly:
+    G = cumsum(g) within the chunk (ttnn.cumsum -- exact; a triangular matmul is not)
+    dec[i,j,:] = exp(min(G_i - G_j, 0))           explicit [C, C, dk] tensor (no exp overflow)
+    L = -(sum_d kb_i k_j dec) strictly-lower;  T = (I - L)^-1 = prod_{p<6} (I + L^(2^p))  (nilpotent)
+    A = (sum_d q_i k_j dec) lower-incl.
+    v' = T (v*beta);  kc = T (kb * e^G);  v_new = v' - kc S;  o = (q e^G) S + A v_new
+    S <- S * e^{G_last}^T + (k e^{G_last - G})^T v_new
+Verified against `chunk_kimi_delta_attention` in torch to 1e-7.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+CHUNK = 64
+
+
+def _num_devices(device):
+    try:
+        return int(device.get_num_devices())
+    except Exception:
+        return 1
+
+
+def _cluster_axis(device):
+    try:
+        shape = tuple(device.shape)
+    except Exception:
+        return None
+    axes = [i for i, s in enumerate(shape) if s > 1]
+    return axes[0] if len(axes) == 1 else None
+
+
+class _Ctx:
+    def __init__(self, device):
+        self.device = device
+        self.n = _num_devices(device)
+        self.axis = _cluster_axis(device)
+        self.ckc = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+
+    def put(self, t, *, shard_dim=None, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+        kw = dict(dtype=dtype, layout=layout, device=self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if self.n > 1:
+            kw["mesh_mapper"] = (
+                ttnn.ShardTensorToMesh(self.device, dim=shard_dim)
+                if shard_dim is not None
+                else ttnn.ReplicateTensorToMesh(self.device)
+            )
+        return ttnn.from_torch(t.contiguous(), **kw)
+
+    def f32(self, t, shard_dim=None):
+        return self.put(t.to(torch.float32), shard_dim=shard_dim, dtype=ttnn.float32)
+
+    def lin(self, x, w, dtype=ttnn.float32):
+        return ttnn.linear(x, w, dtype=dtype, compute_kernel_config=self.ckc)
+
+    def mm(self, a, b):
+        return ttnn.matmul(a, b, dtype=ttnn.float32, compute_kernel_config=self.ckc)
+
+    def all_reduce(self, x):
+        if self.n == 1:
+            return x
+        g = ttnn.all_gather(x, dim=1, cluster_axis=self.axis, topology=ttnn.Topology.Linear)
+        return ttnn.sum(g, dim=1, keepdim=True)
+
+
+def _rs(x, shape):
+    """Reshape through ROW_MAJOR (a pure view there), back to TILE."""
+    x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+    x = ttnn.reshape(x, shape)
+    return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+
+
+def _wT(w):  # nn.Linear weight [out, in] -> [in, out]
+    return w.detach().to(torch.float32).t().contiguous()
+
+
+def _rms(ctx, x, w, eps):
+    # fp32 RMSNorm over the last dim; w is a [1,1,1,D] fp32 tensor (or None).
+    var = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True)
+    y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(var, eps)))
+    return ttnn.multiply(y, w) if w is not None else y
+
+
+# --------------------------------------------------------------------------- hyper-connection
+class _HC:
+    def __init__(self, ctx, hc, eps_norm):
+        self.ctx = ctx
+        H = int(hc.hc_mult)
+        self.H = H
+        self.iters = int(hc.hc_sinkhorn_iters)
+        self.hc_eps = float(hc.hc_eps)
+        self.norm_eps = float(eps_norm)
+        fn = hc.fn.detach().to(torch.float32)
+        base = hc.base.detach().to(torch.float32)
+        s = hc.scale.detach().to(torch.float32)
+        # Fold the per-output scale into the projection; split pre / post / comb so no slicing on device.
+        self.w_pre = ctx.f32((fn[:H] * s[0]).t())
+        self.w_post = ctx.f32((fn[H : 2 * H] * s[1]).t())
+        self.w_comb = ctx.f32((fn[2 * H :] * s[2]).t())
+        self.b_pre = ctx.f32(base[:H].reshape(1, 1, 1, H))
+        self.b_post = ctx.f32(base[H : 2 * H].reshape(1, 1, 1, H))
+        self.b_comb = ctx.f32(base[2 * H :].reshape(1, 1, 1, H * H))
+
+    def __call__(self, X, S, D):
+        """X: [1,S,H,D] fp32 streams -> post [1,S,H,1], comb [1,S,H,H], collapsed [1,1,S,D]."""
+        c, H = self.ctx, self.H
+        flat = _rms(c, _rs(X, [1, 1, S, H * D]), None, self.norm_eps)
+        pre = ttnn.add(ttnn.sigmoid(ttnn.add(c.lin(flat, self.w_pre), self.b_pre)), self.hc_eps)
+        post = ttnn.multiply(ttnn.sigmoid(ttnn.add(c.lin(flat, self.w_post), self.b_post)), 2.0)
+        logits = _rs(ttnn.add(c.lin(flat, self.w_comb), self.b_comb), [1, S, H, H])
+        e = ttnn.exp(logits)
+        comb = ttnn.add(ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True)), self.hc_eps)
+        comb = ttnn.divide(comb, ttnn.add(ttnn.sum(comb, dim=-2, keepdim=True), self.hc_eps))
+        for _ in range(self.iters - 1):
+            comb = ttnn.divide(comb, ttnn.add(ttnn.sum(comb, dim=-1, keepdim=True), self.hc_eps))
+            comb = ttnn.divide(comb, ttnn.add(ttnn.sum(comb, dim=-2, keepdim=True), self.hc_eps))
+        collapsed = c.mm(_rs(pre, [1, S, 1, H]), X)  # [1,S,1,D]
+        return _rs(post, [1, S, H, 1]), comb, _rs(collapsed, [1, 1, S, D])
+
+    def expand(self, post, comb, sub, X, S, D):
+        """post (x) sub + comb^T @ X  -> [1,S,H,D]."""
+        c = self.ctx
+        a = c.mm(post, _rs(sub, [1, S, 1, D]))
+        b = c.mm(ttnn.transpose(comb, -2, -1), X)
+        return ttnn.add(a, b)
+
+
+# --------------------------------------------------------------------------- KDA linear attention
+class _KDA:
+    def __init__(self, ctx, m):
+        self.ctx = ctx
+        n = ctx.n
+        self.nh = int(m.num_heads)
+        self.dk = int(m.head_dim)
+        if self.nh % n:
+            raise ValueError(f"linear num_heads={self.nh} not divisible by TP={n}")
+        self.hl = self.nh // n
+        self.K = int(m.conv_kernel_size)
+        if m.conv1d.bias is not None:
+            raise NotImplementedError("conv1d bias not used by this checkpoint")
+        if m.activation != "silu":
+            raise NotImplementedError(m.activation)
+        qkv = self.nh * self.dk
+        self.w_q = ctx.put(_wT(m.q_proj.weight), shard_dim=-1)
+        self.w_k = ctx.put(_wT(m.k_proj.weight), shard_dim=-1)
+        self.w_v = ctx.put(_wT(m.v_proj.weight), shard_dim=-1)
+        # depthwise causal conv weights [3*qkv, K] -> per-region taps, sharded along channels (heads)
+        cw = m.conv1d.weight.detach().to(torch.float32).squeeze(1)  # [3*qkv, K]
+        self.conv = []
+        for r in range(3):
+            reg = cw[r * qkv : (r + 1) * qkv]  # [qkv, K]
+            # tap for shift s (y[t] += w[K-1-s] * x[t-s])
+            self.conv.append([ctx.f32(reg[:, self.K - 1 - s].reshape(1, 1, 1, qkv), shard_dim=-1) for s in range(self.K)])
+        fg = m.forget_gate
+        self.w_fa = ctx.put(_wT(fg.f_a_proj.weight))
+        self.w_fb = ctx.put(_wT(fg.f_b_proj.weight), shard_dim=-1)
+        self.dt_bias = ctx.f32(fg.dt_bias.detach().reshape(1, 1, 1, qkv), shard_dim=-1)
+        decay = torch.exp(fg.A_log.detach().to(torch.float32)).repeat_interleave(self.dk)  # per channel
+        self.decay = ctx.f32(decay.reshape(1, 1, 1, qkv), shard_dim=-1)
+        if fg.safe_gate_lower_bound is None:
+            raise NotImplementedError("softplus forget gate not used by this checkpoint")
+        self.lb = float(fg.safe_gate_lower_bound)
+        wb = _wT(m.b_proj.weight)  # [D, nh]
+        # one [D,1] column per local head (sharded via a [D, n*1] stack per local slot)
+        self.w_b = []
+        for j in range(self.hl):
+            cols = torch.stack([wb[:, d * self.hl + j] for d in range(n)], dim=-1)  # [D, n]
+            self.w_b.append(ctx.put(cols, shard_dim=-1))
+        self.w_ga = ctx.put(_wT(m.g_a_proj.weight))
+        self.w_gb = ctx.put(_wT(m.g_b_proj.weight), shard_dim=-1)
+        self.o_norm_w = ctx.f32(m.o_norm.weight.detach().reshape(1, 1, 1, self.dk))
+        self.o_eps = float(m.o_norm.variance_epsilon)
+        self.w_o = ctx.put(_wT(m.o_proj.weight), shard_dim=0)
+        # chunk constants
+        C = CHUNK
+        self.shift = [ctx.f32(torch.diag(torch.ones(C - s), -s).reshape(1, 1, C, C)) for s in range(self.K)]
+        self.eye = ctx.f32(torch.eye(C).reshape(1, 1, C, C))
+        self.tril_strict = ctx.f32(torch.tril(torch.ones(C, C), -1).reshape(1, 1, C, C))
+        self.tril_incl = ctx.f32(torch.tril(torch.ones(C, C)).reshape(1, 1, C, C))
+
+    def _heads(self, x, S):  # [1,1,S,hl*dk] -> [1,hl,S,dk]
+        hs = [ttnn.slice(x, [0, 0, 0, h * self.dk], [1, 1, S, (h + 1) * self.dk]) for h in range(self.hl)]
+        return hs[0] if len(hs) == 1 else ttnn.concat(hs, dim=1)
+
+    def _merge(self, x, S):  # [1,hl,S,dk] -> [1,1,S,hl*dk]
+        hs = [ttnn.slice(x, [0, h, 0, 0], [1, h + 1, S, self.dk]) for h in range(self.hl)]
+        return hs[0] if len(hs) == 1 else ttnn.concat(hs, dim=-1)
+
+    def _conv_silu(self, x, taps, C):
+        # x: one chunk [1,1,C,W] fp32 (whole sequence only when S == C; general path below)
+        acc = None
+        for s, w in enumerate(taps):
+            xs = x if s == 0 else self.ctx.mm(self.shift[s], x)
+            term = ttnn.multiply(xs, w)
+            acc = term if acc is None else ttnn.add(acc, term)
+        return ttnn.silu(acc)
+
+    def _decay_dot(self, a, b, G):
+        """sum_d a[i,d] b[j,d] exp(min(G_i[d] - G_j[d], 0)) per head -> [1,hl,C,C]."""
+        C, dk = CHUNK, self.dk
+        outs = []
+        for h in range(self.hl):
+            sl = lambda t: ttnn.slice(t, [0, h, 0, 0], [1, h + 1, C, dk])  # [1,1,C,dk]
+            Gh, ah, bh = sl(G), sl(a), sl(b)
+            diff = ttnn.subtract(_rs(Gh, [1, C, 1, dk]), Gh)  # [1,C,C,dk]  G_i - G_j
+            dec = ttnn.exp(ttnn.clamp(diff, max=0.0))
+            prod = ttnn.multiply(ttnn.multiply(dec, _rs(ah, [1, C, 1, dk])), bh)
+            outs.append(_rs(ttnn.sum(prod, dim=-1, keepdim=True), [1, 1, C, C]))
+        return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=1)
+
+    def _l2(self, x):
+        return ttnn.multiply(x, ttnn.rsqrt(ttnn.add(ttnn.sum(ttnn.multiply(x, x), dim=-1, keepdim=True), 1e-6)))
+
+    def __call__(self, h, S, mask=None):
+        c, C = self.ctx, CHUNK
+        if S % C:
+            raise NotImplementedError(f"S={S} must be a multiple of {C} in this port")
+        if mask is not None:
+            h = ttnn.multiply(h, mask)
+        hb = ttnn.typecast(h, ttnn.bfloat16)
+        proj = [c.lin(hb, w) for w in (self.w_q, self.w_k, self.w_v)]  # [1,1,S,hl*dk] fp32
+        g_lin = c.lin(ttnn.typecast(c.lin(hb, self.w_fa), ttnn.bfloat16), self.w_fb)
+        g = ttnn.multiply(ttnn.sigmoid(ttnn.multiply(ttnn.add(g_lin, self.dt_bias), self.decay)), self.lb)
+        beta = [ttnn.sigmoid(c.lin(hb, w)) for w in self.w_b]  # each [1,1,S,1]
+        beta = beta[0] if len(beta) == 1 else ttnn.concat(beta, dim=1)  # [1,hl,S,1]
+        gate = c.lin(ttnn.typecast(c.lin(hb, self.w_ga), ttnn.bfloat16), self.w_gb)
+
+        state = None
+        outs = []
+        n_chunks = S // C
+        prev_tail = None
+        for ci in range(n_chunks):
+            rows = lambda t: t if n_chunks == 1 else ttnn.slice(t, [0, 0, ci * C, 0], [t.shape[0], t.shape[1], (ci + 1) * C, t.shape[3]])
+            # causal depthwise conv needs the previous K-1 rows of the raw projections
+            qkv = []
+            for r in range(3):
+                x = rows(proj[r])
+                if ci == 0:
+                    qkv.append(self._conv_silu(x, self.conv[r], C))
+                else:
+                    raise NotImplementedError("multi-chunk conv carry not ported (S > 64)")
+            q = self._l2(self._heads(qkv[0], C))
+            q = ttnn.multiply(q, self.dk**-0.5)
+            k = self._l2(self._heads(qkv[1], C))
+            v = self._heads(qkv[2], C)
+            gc = self._heads(rows(g), C)
+            bc = rows(beta)
+            G = ttnn.cumsum(gc, dim=2)
+            kb = ttnn.multiply(k, bc)
+            L = ttnn.multiply(ttnn.neg(self._decay_dot(kb, k, G)), self.tril_strict)
+            A = ttnn.multiply(self._decay_dot(q, k, G), self.tril_incl)
+            T, Lp = None, L
+            for p in range(6):
+                f = ttnn.add(self.eye, Lp)
+                T = f if T is None else c.mm(T, f)
+                if p < 5:
+                    Lp = c.mm(Lp, Lp)
+            vp = c.mm(T, ttnn.multiply(v, bc))
+            if state is None:
+                vnew = vp
+                o = c.mm(A, vnew)
+            else:
+                eG = ttnn.exp(G)
+                kc = c.mm(T, ttnn.multiply(kb, eG))
+                vnew = ttnn.subtract(vp, c.mm(kc, state))
+                o = ttnn.add(c.mm(ttnn.multiply(q, eG), state), c.mm(A, vnew))
+            outs.append(o)
+            Glast = ttnn.sum(gc, dim=2, keepdim=True)  # [1,hl,1,dk]
+            kd = ttnn.multiply(k, ttnn.exp(ttnn.subtract(Glast, G)))
+            upd = c.mm(ttnn.transpose(kd, -2, -1), vnew)  # [1,hl,dk,dv]
+            state = upd if state is None else ttnn.add(ttnn.multiply(state, ttnn.transpose(ttnn.exp(Glast), -2, -1)), upd)
+        core = outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=2)  # [1,hl,S,dv]
+
+        y = _rms(c, core, self.o_norm_w, self.o_eps)
+        y = ttnn.multiply(y, ttnn.sigmoid(self._heads(gate, S)))
+        out = c.lin(ttnn.typecast(self._merge(y, S), ttnn.bfloat16), self.w_o, dtype=ttnn.bfloat16)
+        return ttnn.typecast(c.all_reduce(out), ttnn.float32)
+
+
+# --------------------------------------------------------------------------- dense MLP
+class _MLP:
+    def __init__(self, ctx, m):
+        self.ctx = ctx
+        if m.intermediate_size % ctx.n:
+            raise ValueError("intermediate_size not divisible by TP")
+        self.w_gate = ctx.put(_wT(m.gate_proj.weight), shard_dim=-1)
+        self.w_up = ctx.put(_wT(m.up_proj.weight), shard_dim=-1)
+        self.w_down = ctx.put(_wT(m.down_proj.weight), shard_dim=0)
+        self.limit = float(m.swiglu_limit)
+
+    def __call__(self, x):
+        c = self.ctx
+        xb = ttnn.typecast(x, ttnn.bfloat16)
+        gate = ttnn.clamp(c.lin(xb, self.w_gate), max=self.limit)
+        up = ttnn.clamp(c.lin(xb, self.w_up), min=-self.limit, max=self.limit)
+        hmid = ttnn.typecast(ttnn.multiply(ttnn.silu(gate), up), ttnn.bfloat16)
+        out = c.lin(hmid, self.w_down, dtype=ttnn.bfloat16)
+        return ttnn.typecast(c.all_reduce(out), ttnn.float32)
+
+
+# --------------------------------------------------------------------------- decoder layer
+class TtTextDecoderLayer:
+    def __init__(self, ctx, m):
+        self.ctx = ctx
+        if m.block_type != "linear_attention":
+            raise NotImplementedError("this port covers the KDA (linear_attention) decoder layers")
+        if type(m.mlp).__name__ != "Glm5NextTextMLP":
+            raise NotImplementedError("this port covers the dense-MLP decoder layers")
+        self.D = int(m.hidden_size)
+        self.attn_hc = _HC(ctx, m.attn_hc, m.attn_hc.input_norm.eps)
+        self.ffn_hc = _HC(ctx, m.ffn_hc, m.ffn_hc.input_norm.eps)
+        self.ln1_w = ctx.f32(m.input_layernorm.weight.detach().reshape(1, 1, 1, -1))
+        self.ln1_eps = float(m.input_layernorm.variance_epsilon)
+        self.ln2_w = ctx.f32(m.post_attention_layernorm.weight.detach().reshape(1, 1, 1, -1))
+        self.ln2_eps = float(m.post_attention_layernorm.variance_epsilon)
+        self.attn = _KDA(ctx, m.self_attn)
+        self.mlp = _MLP(ctx, m.mlp)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(_Ctx(device), torch_module)
+
+    def _mask(self, attention_mask, S):
+        if attention_mask is None:
+            return None
+        am = attention_mask if isinstance(attention_mask, torch.Tensor) else ttnn.to_torch(attention_mask)
+        am = am.reshape(-1, am.shape[-1])
+        if am.shape[0] != 1:
+            raise NotImplementedError("batch > 1 not supported by this port")
+        if bool(am.bool().all()):
+            return None
+        return self.ctx.f32(am[0, :S].to(torch.float32).reshape(1, 1, S, 1))
+
+    def __call__(self, hidden_states, attention_mask=None, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            raise NotImplementedError("cache path not ported in this component")
+        X = hidden_states
+        if X.layout != ttnn.TILE_LAYOUT:
+            X = ttnn.to_layout(X, ttnn.TILE_LAYOUT)
+        X = ttnn.typecast(X, ttnn.float32)
+        B, S, Hc, D = X.shape
+        if B != 1:
+            raise NotImplementedError("batch > 1 not supported by this port")
+        mask = self._mask(attention_mask, S)
+
+        post, comb, x = self.attn_hc(X, S, D)
+        a = self.attn(_rms(self.ctx, x, self.ln1_w, self.ln1_eps), S, mask)
+        X = self.attn_hc.expand(post, comb, a, X, S, D)
+
+        post, comb, x = self.ffn_hc(X, S, D)
+        mo = self.mlp(_rms(self.ctx, x, self.ln2_w, self.ln2_eps))
+        return self.ffn_hc.expand(post, comb, mo, X, S, D)
+
+
+def build(device, torch_module=None):
+    return TtTextDecoderLayer.build(device, torch_module)
+
+
+def text_decoder_layer(device, torch_module=None):
+    return TtTextDecoderLayer.build(device, torch_module)

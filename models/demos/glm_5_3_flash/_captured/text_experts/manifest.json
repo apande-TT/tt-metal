@@ -1,0 +1,46 @@
+{
+  "component": "text_experts",
+  "submodule_path": "language_model.layers.3.mlp.experts",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "torch.int64"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      16,
+      4096
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, tensor-parallel port of `Glm5NextTextModel` (GLM-5.3-Flash language model).
+
+Reference (prefill from inputs_embeds, no cache, unpadded):
+    H = inputs_embeds.unsqueeze(2).expand(hc_mult)          # hc_mult residual streams
+    for layer in layers[:num_hidden_layers]:
+        H = layer(H)          # mHC( KDA | DSA attention ) then mHC( dense MLP | MoE )
+    out = norm(hc_head(H))   # mean over streams, RMSNorm
+
+Composed from the graduated component ports (one implementation each, so they cannot drift):
+  * hyper-connections, RMSNorm, KDA, dense MLP     <- _stubs/text_decoder_layer.py
+  * DSA (MLA + indexer) attention                  <- _stubs/text_attention.py
+  * MoE (router + expert-parallel experts + shared) <- _stubs/text_mo_e.py
+Tensor parallelism is each component's own (heads / columns / experts split over the mesh, an
+all-reduce after every row-parallel projection); the residual streams, norms and hyper-connections
+stay replicated, so every layer's output is replicated on all chips. The DSA layers use the exact
+sparse==causal identity for S <= index_topk documented in text_attention.py.
+"""
+from __future__ import annotations
+
+import ttnn
+from models.demos.glm_5_3_flash._stubs.text_attention import TtTextAttention
+from models.demos.glm_5_3_flash._stubs.text_decoder_layer import _HC, _KDA, _MLP, _Ctx, _rms, _rs
+from models.demos.glm_5_3_flash._stubs.text_mo_e import TtTextMoE
+
+
+class _Layer:
+    def __init__(self, ctx, device, m):
+        self.ctx = ctx
+        self.kind = m.block_type
+        self.attn_hc = _HC(ctx, m.attn_hc, m.attn_hc.input_norm.eps)
+        self.ffn_hc = _HC(ctx, m.ffn_hc, m.ffn_hc.input_norm.eps)
+        self.ln1_w = ctx.f32(m.input_layernorm.weight.detach().reshape(1, 1, 1, -1))
+        self.ln1_eps = float(m.input_layernorm.variance_epsilon)
+        self.ln2_w = ctx.f32(m.post_attention_layernorm.weight.detach().reshape(1, 1, 1, -1))
+        self.ln2_eps = float(m.post_attention_layernorm.variance_epsilon)
+        if self.kind == "linear_attention":
+            self.attn = _KDA(ctx, m.self_attn)
+        else:
+            if getattr(m.self_attn, "skip_topk", False):
+                raise NotImplementedError("shared-indexer (skip_topk) DSA layers not ported")
+            self.attn = TtTextAttention.build(device, m.self_attn)
+        self.moe = type(m.mlp).__name__ == "Glm5NextTextMoE"
+        self.mlp = TtTextMoE.build(device, m.mlp) if self.moe else _MLP(ctx, m.mlp)
+
+    def __call__(self, X, S, D):
+        c = self.ctx
+        post, comb, x = self.attn_hc(X, S, D)
+        h = _rms(c, x, self.ln1_w, self.ln1_eps)  # [1,1,S,D] fp32
+        if self.kind == "linear_attention":
+            a = self.attn(h, S, None)
+        else:
+            a = ttnn.typecast(self.attn(ttnn.typecast(h, ttnn.bfloat16)), ttnn.float32)
+        X = self.attn_hc.expand(post, comb, a, X, S, D)
+
+        post, comb, x = self.ffn_hc(X, S, D)
+        h = _rms(c, x, self.ln2_w, self.ln2_eps)
+        mo = self.mlp(h)
+        return self.ffn_hc.expand(post, comb, mo, X, S, D)
+
+
+class TtTextModel:
+    def __init__(self, device, m):
+        self.ctx = _Ctx(device)
+        cfg = m.config
+        self.hc = int(cfg.hc_mult)
+        n_layers = min(len(m.layers), int(cfg.num_hidden_layers))
+        self.layers = [_Layer(self.ctx, device, m.layers[i]) for i in range(n_layers)]
+        self.norm_w = self.ctx.f32(m.norm.weight.detach().reshape(1, 1, 1, -1))
+        self.norm_eps = float(m.norm.variance_epsilon)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, inputs_embeds, attention_mask=None, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            raise NotImplementedError("cache path not ported")
+        if attention_mask is not None:
+            raise NotImplementedError("padding masks not ported at model level")
+        x = inputs_embeds
+        B, S, D = x.shape
+        if B != 1:
+            raise NotImplementedError("batch > 1 not supported by this port")
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(x, ttnn.float32)
+        X = ttnn.repeat(_rs(x, [1, S, 1, D]), ttnn.Shape([1, 1, self.hc, 1]))  # [1,S,hc,D] streams
+        for layer in self.layers:
+            X = layer(X, S, D)
+        h = _rs(ttnn.mean(X, dim=2, keepdim=True), [1, 1, S, D])  # hc_head: mean over streams
+        h = _rms(self.ctx, h, self.norm_w, self.norm_eps)
+        return ttnn.reshape(h, [B, S, D])
+
+
+def build(device, torch_module=None):
+    return TtTextModel.build(device, torch_module)
+
+
+def text_model(device, torch_module=None):
+    return TtTextModel.build(device, torch_module)

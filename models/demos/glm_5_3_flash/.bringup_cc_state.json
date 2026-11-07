@@ -1,0 +1,93 @@
+{
+  "last_failure_class": {
+    "r_m_s_norm": "UNEXPECTED_KWARG",
+    "text_attention": "HANG",
+    "text_decoder_layer": "HARNESS_SKIP",
+    "text_experts": "HARNESS_SKIP",
+    "text_forget_gate": "HANG",
+    "text_indexer": "HARNESS_SKIP",
+    "text_model": "HARNESS_SKIP",
+    "text_r_m_s_norm_gated": "HARNESS_SKIP",
+    "vision_attention": "HARNESS_SKIP",
+    "vision_patch_embed": "HARNESS_SKIP"
+  },
+  "last_failure_text": {
+    "r_m_s_norm": "  - FAILED  models.demos.glm_5_3_flash.tests.pcc.test_r_m_s_norm::test_r_m_s_norm[device_params0]\n      RuntimeError: Canonical RMSNorm constructor failed: TypeError: RMSNorm.__init__() got an unexpected keyword argument 'mesh_device'. LLM refinement: pass the additional required args (tt_ccl, transformation_mats, configuration, etc.). See `models/common/rmsnorm.py` for the full __init__ signature.\n### models.demos.glm_5_3_flash.tests.pcc.test_r_m_s_norm::test_r_m_s_norm[device_params0]\nRuntimeError: Canonical RMSNorm constructor failed: TypeError: RMSNorm.__init__() got an unexpected keyword argument 'mesh_device'. LLM refinement: pass the additional required args (tt_ccl, transformation_mats, configuration, etc.). See `models/common/rmsnorm.py` for the full __init__ signature.\ncls = <class 'models.demos.glm_5_3_flash._stubs.r_m_s_norm.TtRMSNorm'>\ndevice = MeshDevice(1x1 grid, 1 devices)\ntorch_module = Glm5NextRMSNorm((1024,), eps=1e-05)\n\n    @classmethod\n    def build(cls, device, torch_module):\n        # Pre-wired construction using tt_transformers helpers.\n        # If iter-0 PCC < 0.99, the LLM refines THIS function \u2014 usually by\n        # adjusting ModelArgs constructor args for this model's specifics.\n        try:\n            from models.tt_transformers.tt.model_config import ModelArgs\n    \n            args = ModelArgs(mesh_device=device, instruct=True)\n        except Exception as _ma_exc:\n            # ModelArgs construction failed \u2014 surface for LLM to handle.\n            raise RuntimeError(\n                f\"ModelArgs(mesh_device=device) failed for 'r_m_s_norm': \"\n                f\"{type(_ma_exc).__name__}: {_ma_exc}. LLM refinement: \"\n                f\"adjust the ModelArgs constructor args to match this model's \"\n                f\"config.\"\n            )\n    \n        # Build the canonical instance. The exact constructor signature\n        # varies per class (Attention takes 14 args, MLP takes 11, RMSNorm\n        # different, RotaryEmbedding different). The LLM refines this call\n        # on PCC failure to pass the right args for this model.\n        try:\n>           canonical = RMSNorm(\n                mesh_device=device,\n                args=args,\n                state_dict=torch_module.state_dict() if torch_module is not None else None,\n                layer_num=0,\n                dtype=ttnn.bfloat16,\n            )\nE           TypeError: RMSNorm.__init__() got an unexpected keyword argument 'mesh_device'\n\nmodels/demos/glm_5_3_flash/_stubs/r_m_s_norm.py:64: TypeError\n\nDuring handling of the above exception, another exception occurred:\n\ndevice_params = {'l1_small_size': 24576}\ndevice = MeshDevice(1x1 grid, 1 devices)\n\n    @pytest.mark.parametrize(\"device_params\", [{\"l1_small_size\": 24576}], indirect=True)\n    def test_r_m_s_norm(device_params, device):\n        stage_budget_s = int(os.environ.get(\"TT_PLANNER_TEST_STAGE_S\", \"120\"))\n    \n        try:\n            _seed = int(os.environ.get(\"TT_PLANNER_TEST_SEED\", \"0\"))\n        except ValueError:\n            _seed = 0\n        torch.manual_seed(_seed)\n    \n        _module_level = os.environ.get(\"TT_PLANNER_GOLDEN_CACHE\", \"1\") not in (\"\", \"0\", \"false\", \"False\")\n        _golden_cache_file = None\n        _golden_hit = None\n        if _module_level:\n            try:\n                from models.common.golden_cache import golden_cache_path, load_golden_cache\n    ",
+    "text_attention": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 5400s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 5400s \u2014 killing process group (likely a hang)\nkernel wchan of pytest tree:\n  pid=624724 comm=python wchan=futex_wait_queue",
+    "text_decoder_layer": "HF reference forward raised RuntimeError: mat1 and mat2 shapes cannot be multiplied (64x4096 and 16384x24)",
+    "text_experts": "HF reference forward raised IndexError: index 12 is out of bounds for dimension 0 with size 1",
+    "text_forget_gate": "focused pytest WALL-CLOCK BUDGET EXHAUSTED at 5400s \u2014 killing process group (likely a hang)\nfocused pytest WALL-CLOCK BUDGET EXHAUSTED at 5400s \u2014 killing process group (likely a hang)\nkernel wchan of pytest tree:\n  pid=683378 comm=python wchan=futex_wait_queue",
+    "text_indexer": "HF reference forward raised RuntimeError: mat1 and mat2 shapes cannot be multiplied (64x1536 and 4096x128)",
+    "text_model": "HF reference forward raised ValueError: You must specify exactly one of input_ids or inputs_embeds",
+    "text_r_m_s_norm_gated": "HF reference forward(['hidden_states']) raised AttributeError for text_r_m_s_norm_gated: 'NoneType' object has no attribute 'to' -- the synthetic inputs from _make_arg_for() are incompatible with this submodule's expected shapes. Either edit the test to provide model-specific kwargs, or skip this Phase-2 PCC and validate via the top-level demo instead.",
+    "vision_attention": "HF reference forward raised RuntimeError: The size of tensor a (64) must match the size of tensor b (16384) at non-singleton dimension 2",
+    "vision_patch_embed": "HF reference forward(['hidden_states']) raised RuntimeError for vision_patch_embed: shape '[-1, 3, 2, 14, 14]' is invalid for input of size 192 -- the synthetic inputs from _make_arg_for() are incompatible with this submodule's expected shapes. Either edit the test to provide model-specific kwargs, or skip this Phase-2 PCC and validate via the top-level demo instead."
+  },
+  "attempts": {
+    "r_m_s_norm": 1,
+    "text_r_m_s_norm": 1,
+    "text_r_m_s_norm_gated": 1,
+    "text_unweighted_r_m_s_norm": 1,
+    "vision_patch_embed": 1,
+    "vision_rotary_embedding": 1
+  },
+  "best_pcc": {
+    "r_m_s_norm": 0.9999985,
+    "text_r_m_s_norm": 0.9999985,
+    "text_r_m_s_norm_gated": 1.0,
+    "text_unweighted_r_m_s_norm": 1.0,
+    "vision_patch_embed": 0.99999997,
+    "vision_rotary_embedding": 1.0
+  },
+  "consecutive_same_class": {
+    "r_m_s_norm": 0,
+    "text_r_m_s_norm": 0,
+    "text_r_m_s_norm_gated": 0,
+    "text_unweighted_r_m_s_norm": 0,
+    "vision_patch_embed": 0,
+    "vision_rotary_embedding": 0
+  },
+  "pcc_history": {
+    "r_m_s_norm": [
+      0.9999985
+    ],
+    "text_r_m_s_norm": [
+      0.9999985
+    ],
+    "text_r_m_s_norm_gated": [
+      1.0
+    ],
+    "text_unweighted_r_m_s_norm": [
+      1.0
+    ],
+    "vision_patch_embed": [
+      0.99999997
+    ],
+    "vision_rotary_embedding": [
+      1.0
+    ]
+  },
+  "shard_reset_done": true,
+  "harness_skip_reason": {},
+  "hang_stub_sha": {},
+  "hang_device_dirty": false,
+  "shard_attempts": {
+    "text_attention": 1,
+    "text_decoder_layer": 1,
+    "text_experts": 1,
+    "text_forget_gate": 1,
+    "text_hyper_connection": 1,
+    "text_hyper_head": 1,
+    "text_indexer": 1,
+    "text_linear_attention": 1,
+    "text_m_l_p": 1,
+    "text_mo_e": 1,
+    "text_model": 1,
+    "text_topk_router": 1,
+    "vision_attention": 1,
+    "vision_block": 1,
+    "vision_m_l_p": 1,
+    "vision_model": 1,
+    "vision_patch_merger": 1
+  }
+}

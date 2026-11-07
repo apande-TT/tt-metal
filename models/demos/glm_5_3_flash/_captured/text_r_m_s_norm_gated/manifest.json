@@ -1,0 +1,41 @@
+{
+  "component": "text_r_m_s_norm_gated",
+  "submodule_path": "language_model.layers.0.self_attn.o_norm",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          128
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16,
+      128
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

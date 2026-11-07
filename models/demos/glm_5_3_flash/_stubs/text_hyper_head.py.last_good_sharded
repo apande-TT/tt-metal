@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `Glm5NextTextHyperHead` (GLM-5.3-Flash final mHC stream collapse).
+
+Reference: `hidden_streams.mean(dim=2)` -- an unweighted mean over the hc_mult residual streams,
+[B, S, hc_mult, D] -> [B, S, D].
+
+Tensor parallelism: the module has NO weights, so there is nothing to split. On a mesh the incoming
+streams are replicated (they are the output of the replicated residual path), each chip computes
+the mean locally, and the result is already replicated -- no collective is needed and adding one
+would only move data. (Per TP principle 1: elementwise / reduction ops without weights stay
+replicated.)
+"""
+from __future__ import annotations
+
+import ttnn
+
+
+class TtTextHyperHead:
+    def __init__(self, device):
+        self.device = device
+
+    @classmethod
+    def build(cls, device, torch_module=None):
+        return cls(device)
+
+    def __call__(self, hidden_streams, *args, **kwargs):
+        x = hidden_streams
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(x, ttnn.float32)
+        shape = list(x.shape)
+        if len(shape) != 4:
+            raise NotImplementedError(f"expected [B,S,hc_mult,D] streams, got {shape}")
+        B, S, H, D = shape
+        out = ttnn.mean(x, dim=2, keepdim=True)  # [B,S,1,D]
+        return ttnn.reshape(ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT), [B, S, D])
+
+
+def build(device, torch_module=None):
+    return TtTextHyperHead.build(device, torch_module)
+
+
+def text_hyper_head(device, torch_module=None):
+    return TtTextHyperHead.build(device, torch_module)

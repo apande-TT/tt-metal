@@ -1,0 +1,57 @@
+{
+  "component": "text_hyper_connection",
+  "submodule_path": "language_model.layers.0.attn_hc",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          8,
+          4,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          8,
+          4
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          8,
+          4,
+          4
+        ],
+        "dtype": "torch.float32"
+      },
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          8,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  }
+}

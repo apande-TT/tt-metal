@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, expert-parallel port of `Glm5NextTextMoE` (GLM-5.3-Flash sparse MLP).
+
+Reference:
+    logits = x @ W_router^T (fp32);  s = sigmoid(logits);  c = s + e_score_correction_bias
+    (n_group == 1, so the group mask is a no-op)
+    top-k experts by c;  w = s[topk] / (sum s[topk] + 1e-20) * routed_scaling_factor
+    out = sum_k w_k * expert_k(x)  +  shared_experts(x)
+
+Device formulation:
+  * router REPLICATED (TP principle 3). Its logits decide a discrete selection, so they are computed
+    to ~16 mantissa bits: x is split into bf16 hi + lo halves and x_hi @ W + x_lo @ W accumulates in
+    fp32 (the checkpoint router weight is bf16-exact, so W needs no split). A plain fp32 matmul on
+    device rounds like bf16 and would flip near-tied 8th/9th experts.
+  * exact top-k: rank[t,e] = #{q : c[t,q] > c[t,e]}; selected iff rank < k (an [T,E,E] comparison).
+  * EXPERT-parallel routed experts (E/N whole experts per chip, weights from the experts stub). Each
+    chip extracts its experts' combine weights from the replicated [T,E] weights by an exact 0/1
+    identity-block product (sharded with the experts), runs them as one batched SwiGLU, and reduces.
+  * shared expert = the decoder-stub `_MLP` (column/row parallel).
+  * routed + shared partials are summed over the mesh (all_gather + on-device sum).
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+from models.demos.glm_5_3_flash._stubs.text_decoder_layer import _MLP, _Ctx, _rs
+from models.demos.glm_5_3_flash._stubs.text_experts import TtTextExperts
+
+
+class TtTextMoE:
+    def __init__(self, device, m):
+        self.ctx = _Ctx(device)
+        c = self.ctx
+        g = m.gate
+        if int(g.num_group) != 1 or int(g.topk_group) != 1:
+            raise NotImplementedError("grouped routing (n_group > 1) not used by this checkpoint")
+        self.k = int(g.top_k)
+        self.E = int(g.num_experts)
+        self.norm_topk = bool(g.norm_topk_prob)
+        self.rsf = float(g.routed_scaling_factor)
+        self.D = int(g.hidden_dim)
+        W = g.weight.detach().to(torch.float32)
+        if not torch.equal(W, W.to(torch.bfloat16).to(torch.float32)):
+            raise NotImplementedError("router weight is not bf16-exact; hi/lo split of W needed")
+        self.w_router = c.put(W.t())  # bf16 [D, E], replicated
+        self.bias = c.f32(g.e_score_correction_bias.detach().reshape(1, 1, 1, self.E))
+        self.experts = TtTextExperts(device, m.experts)
+        if self.experts.E != self.E:
+            raise ValueError("router / experts expert-count mismatch")
+        # identity block: chip d gets columns [d*El, (d+1)*El) of I_E -> exact local extraction
+        self.sel_local = c.f32(torch.eye(self.E).reshape(1, 1, self.E, self.E), shard_dim=-1)
+        self.shared = _MLP(c, m.shared_experts)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def _router(self, x, T):
+        """x fp32 [1,1,T,D] -> combine weights for THIS chip's experts, [1,El,T,1]."""
+        c, E, El = self.ctx, self.E, self.experts.El
+        hi = ttnn.typecast(x, ttnn.bfloat16)
+        lo = ttnn.typecast(ttnn.subtract(x, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
+        logits = ttnn.add(c.lin(hi, self.w_router), c.lin(lo, self.w_router))  # [1,1,T,E] fp32
+        s = ttnn.sigmoid(logits)
+        choice = ttnn.add(s, self.bias)
+        rank = ttnn.sum(ttnn.gt(_rs(choice, [1, T, 1, E]), _rs(choice, [1, T, E, 1])), dim=-1, keepdim=True)
+        sel = _rs(ttnn.lt(rank, float(self.k)), [1, 1, T, E])  # exactly k ones per token (no ties)
+        w = ttnn.multiply(sel, s)
+        if self.norm_topk:
+            w = ttnn.divide(w, ttnn.add(ttnn.sum(w, dim=-1, keepdim=True), 1e-20))
+        w = ttnn.multiply(w, self.rsf)  # [1,1,T,E]
+        # exact local extraction: [1,T,E,1] * [1,1,E,El] -> sum over E -> [1,T,1,El]
+        wl = ttnn.sum(ttnn.multiply(_rs(w, [1, T, E, 1]), self.sel_local), dim=2, keepdim=True)
+        return ttnn.permute(wl, (0, 3, 1, 2))  # [1,El,T,1]
+
+    def _routed_partial(self, x, cw):
+        ex = self.experts
+        xb = ttnn.typecast(x, ttnn.bfloat16)
+        xr = ttnn.repeat(xb, ttnn.Shape([1, ex.El, 1, 1]))
+        mm = lambda a, b: ttnn.matmul(a, b, dtype=ttnn.float32, compute_kernel_config=ex.ckc)
+        gate = ttnn.clamp(mm(xr, ex.w_gate), max=ex.limit)
+        up = ttnn.clamp(mm(xr, ex.w_up), min=-ex.limit, max=ex.limit)
+        h = ttnn.typecast(ttnn.multiply(ttnn.silu(gate), up), ttnn.bfloat16)
+        y = mm(h, ex.w_down)  # [1,El,T,D]
+        return ttnn.sum(ttnn.multiply(y, cw), dim=1, keepdim=True)  # [1,1,T,D] partial
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        x = hidden_states
+        in_shape = list(x.shape)
+        D = in_shape[-1]
+        T = 1
+        for d in in_shape[:-1]:
+            T *= d
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(ttnn.reshape(x, [1, 1, T, D]), ttnn.float32)
+        routed = self.ctx.all_reduce(ttnn.typecast(self._routed_partial(x, self._router(x, T)), ttnn.bfloat16))
+        shared = self.shared(x)  # already all-reduced, fp32
+        out = ttnn.add(ttnn.typecast(routed, ttnn.float32), shared)
+        return ttnn.reshape(out, in_shape)
+
+
+def build(device, torch_module=None):
+    return TtTextMoE.build(device, torch_module)
+
+
+def text_mo_e(device, torch_module=None):
+    return TtTextMoE.build(device, torch_module)

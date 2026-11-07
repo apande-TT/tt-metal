@@ -1,0 +1,30 @@
+{
+  "component": "vision_patch_embed",
+  "submodule_path": "visual.patch_embed",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          16,
+          1176
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      16,
+      1024
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

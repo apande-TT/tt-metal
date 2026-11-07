@@ -1,0 +1,31 @@
+{
+  "component": "text_hyper_head",
+  "submodule_path": "language_model.hc_head",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

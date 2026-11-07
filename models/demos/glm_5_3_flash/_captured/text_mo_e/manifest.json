@@ -1,0 +1,32 @@
+{
+  "component": "text_mo_e",
+  "submodule_path": "language_model.layers.3.mlp",
+  "samples": 1,
+  "args": {
+    "kind": "tuple",
+    "items": [
+      {
+        "kind": "tensor",
+        "shape": [
+          1,
+          16,
+          4096
+        ],
+        "dtype": "torch.bfloat16"
+      }
+    ]
+  },
+  "kwargs": {
+    "kind": "dict",
+    "items": {}
+  },
+  "output": {
+    "kind": "tensor",
+    "shape": [
+      1,
+      16,
+      4096
+    ],
+    "dtype": "torch.bfloat16"
+  }
+}

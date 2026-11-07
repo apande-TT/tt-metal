@@ -1,0 +1,270 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn, head-parallel port of `Glm5NextTextIndexer` (GLM-5.3-Flash DSA k-pool indexer).
+
+Reference (prefill, no cache, unpadded batch):
+    q   = wq_b(q_resid)                          [S, Hi, dk]
+    k   = LayerNorm(wk(x))                        [S, dk]
+    gs  = x @ compress_gate^T                     [S, dk]
+    pool p = tokens kpool*p .. kpool*p+kpool-1;  pk[p] = sum_t softmax_t(gs[t] + ape[t%kpool]) * k[t]
+    score[s,p] = sum_h w[s,h] * relu(q[s,h] . pk[p] * dk^-0.5),   w = weights_proj(x) * Hi^-0.5
+    a pool is a candidate for query s iff its last token is causal-visible (kpool*p+kpool-1 <= s)
+    selected = topk(score, min(index_topk // kpool, P)), descending; each pool expanded to its token
+    ids (invalid -> -1); then the visible tail of the open pool; -1 padding to index_topk + kpool - 1.
+
+Device formulation (all fp32):
+  * ranking is exact instead of a bf16 top-k: rank[s,p] = #{q : score[s,q] > score[s,p]} from an
+    [S,P,P] comparison; the pool at rank r is sum_p p * (rank[s,p] == r). Non-candidates are pushed
+    below every candidate, and every rank >= #candidates(s) is emitted as -1, so ties among
+    non-candidates can never leak into the output.
+  * pool expansion / tail are integer arithmetic on device (small integers are exact in fp32).
+  * attention_mask: padded query rows are set to -1 on device (HF's final masked_fill). Pools are
+    anchored at token 0, which is exact for unpadded and RIGHT-padded prefill; LEFT padding (HF
+    re-anchors pools at the first valid token) is NOT ported.
+  * constant index tables are built once in build() (up to MAX_POOLS pools) and sliced on device.
+
+Tensor parallelism over N chips: the Hi indexer heads are split across chips (Hi/N per chip):
+wq_b and weights_proj are COLUMN-parallel by head; each chip forms its heads' weighted ReLU scores
+and the partial [S,P] scores are ALL-REDUCED (padded all_gather + sum; the partials travel as a bf16
+hi/lo pair so the reduced scores keep ~16 mantissa bits -- the ranking depends on them). The key
+path (wk, k_norm, compress gate, ape pooling) is single-head and REPLICATED.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+def _num_devices(device):
+    try:
+        return int(device.get_num_devices())
+    except Exception:
+        return 1
+
+
+def _cluster_axis(device):
+    try:
+        shape = tuple(device.shape)
+    except Exception:
+        return None
+    axes = [i for i, s in enumerate(shape) if s > 1]
+    return axes[0] if len(axes) == 1 else None
+
+
+def _rs(x, shape):
+    x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
+    x = ttnn.reshape(x, shape)
+    return ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+
+
+class TtTextIndexer:
+    MAX_POOLS = 128  # [S,P,P] ranking tensor; longer prefills need a top-k kernel path
+
+    def __init__(self, device, m):
+        self.device = device
+        self.n = _num_devices(device)
+        self.axis = _cluster_axis(device)
+        self.Hi, self.dk = int(m.n_heads), int(m.head_dim)
+        if self.Hi % self.n:
+            raise ValueError(f"index_n_heads={self.Hi} not divisible by mesh size {self.n}")
+        self.hl = self.Hi // self.n
+        self.kpool = int(m.index_kpool)
+        self.topk = int(m.index_topk)
+        self.tail = bool(m.index_kpool_always_select_tail)
+        self.scale = float(m.softmax_scale)
+        self.ln_eps = float(m.k_norm.eps)
+        self.ckc = ttnn.init_device_compute_kernel_config(
+            device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        T = lambda w: w.detach().to(torch.float32).t()
+        self.w_q = self._put(T(m.wq_b.weight), shard_dim=-1)  # head-major cols -> Hi/N heads per chip
+        self.w_w = self._put(T(m.weights_proj.weight), shard_dim=-1)
+        self.w_k = self._put(T(m.wk.weight))
+        self.ln_w = self._put(m.k_norm.weight.detach().reshape(1, 1, 1, -1))
+        self.ln_b = self._put(m.k_norm.bias.detach().reshape(1, 1, 1, -1))
+        self.w_gate = self._put(m.index_kpool_compress_gate.detach().to(torch.float32).t())
+        # Constant index tables, built ONCE here for the largest supported prefill and sliced on device
+        # per call (no host work in forward).
+        kp, MP = self.kpool, self.MAX_POOLS
+        smax = MP * kp
+        ar = lambda n: torch.arange(n, dtype=torch.float32)
+        ape = m.index_kpool_compress_ape.detach().to(torch.float32)  # [kpool, dk]
+        self.c_ape = self._put(ape.repeat(MP, 1).reshape(1, 1, smax, self.dk))
+        self.c_s_col = self._put(ar(smax).reshape(1, 1, smax, 1))
+        self.c_p_row = self._put(ar(MP).reshape(1, 1, 1, MP))
+        self.c_p_col = self._put(ar(MP).reshape(1, 1, MP, 1))
+        self.c_E01 = self._put((ar(MP * kp)[None, :] // kp == ar(MP)[:, None]).to(torch.float32).reshape(1, 1, MP, MP * kp))
+        self.c_off = self._put(ar(kp).repeat(MP).reshape(1, 1, 1, MP * kp))
+        self.c_o_row = self._put(ar(max(kp - 1, 1)).reshape(1, 1, 1, max(kp - 1, 1)))
+
+    def _put(self, t, *, shard_dim=None, dtype=ttnn.float32):
+        kw = dict(dtype=dtype, layout=ttnn.TILE_LAYOUT, device=self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if self.n > 1:
+            kw["mesh_mapper"] = (
+                ttnn.ShardTensorToMesh(self.device, dim=shard_dim)
+                if shard_dim is not None
+                else ttnn.ReplicateTensorToMesh(self.device)
+            )
+        return ttnn.from_torch(t.to(torch.float32).contiguous(), **kw)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    # ---------------------------------------------------------------- helpers
+    def _mm(self, a, b):
+        return ttnn.matmul(a, b, dtype=ttnn.float32, compute_kernel_config=self.ckc)
+
+    @staticmethod
+    def _cut(t, ends):
+        """Leading slice [0:e] per dim of a TILE tensor (row-major route handles unaligned ends)."""
+        if list(t.shape) == list(ends):
+            return t
+        r = ttnn.slice(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT), [0] * len(ends), list(ends))
+        return ttnn.to_layout(r, ttnn.TILE_LAYOUT)
+
+    def _all_reduce_precise(self, part, rows, cols):
+        """Sum [1,1,rows,cols] partials over the mesh, keeping ~16 mantissa bits (bf16 hi + lo)."""
+        if self.n == 1:
+            return part
+        hi = ttnn.typecast(part, ttnn.bfloat16)
+        lo = ttnn.typecast(ttnn.subtract(part, ttnn.typecast(hi, ttnn.float32)), ttnn.bfloat16)
+        cpad = -(-cols // 32) * 32
+        if cpad > cols:
+            hi = ttnn.pad(hi, [(0, 0), (0, 0), (0, 0), (0, cpad - cols)], 0.0)
+            lo = ttnn.pad(lo, [(0, 0), (0, 0), (0, 0), (0, cpad - cols)], 0.0)
+        pk = ttnn.concat([hi, lo], dim=-1)  # [1,1,rows,2*cpad]
+        # all_gather deadlocks on the 1x32 Galaxy line below ~64 tiles per chip (measured): pad up.
+        w = pk.shape[-1]
+        row_tiles = max(1, -(-rows // 32))
+        wp = max(w, -(-64 // row_tiles) * 32)
+        if wp > w:
+            pk = ttnn.pad(pk, [(0, 0), (0, 0), (0, 0), (0, wp - w)], 0.0)
+        g = ttnn.all_gather(pk, dim=1, cluster_axis=self.axis, topology=ttnn.Topology.Linear)  # [1,N,rows,wp]
+        g = ttnn.sum(ttnn.typecast(g, ttnn.float32), dim=1, keepdim=True)  # hi and lo summed separately
+        g = ttnn.to_layout(g, ttnn.ROW_MAJOR_LAYOUT)
+        hi_s = ttnn.slice(g, [0, 0, 0, 0], [1, 1, rows, cols])
+        lo_s = ttnn.slice(g, [0, 0, 0, cpad], [1, 1, rows, cpad + cols])
+        return ttnn.add(ttnn.to_layout(hi_s, ttnn.TILE_LAYOUT), ttnn.to_layout(lo_s, ttnn.TILE_LAYOUT))
+
+    def _pool_keys(self, x, S, P):
+        kp = self.kpool
+        k = self._mm(x, self.w_k)  # [1,1,S,dk]
+        mu = ttnn.mean(k, dim=-1, keepdim=True)
+        kc = ttnn.subtract(k, mu)
+        var = ttnn.mean(ttnn.multiply(kc, kc), dim=-1, keepdim=True)
+        k = ttnn.add(ttnn.multiply(ttnn.multiply(kc, ttnn.rsqrt(ttnn.add(var, self.ln_eps))), self.ln_w), self.ln_b)
+        ape = self._cut(self.c_ape, [1, 1, S, self.dk])
+        logits = _rs(ttnn.add(self._mm(x, self.w_gate), ape), [1, P, kp, self.dk])
+        mx = ttnn.max(logits, dim=-2, keepdim=True)
+        e = ttnn.exp(ttnn.subtract(logits, mx))
+        prob = ttnn.divide(e, ttnn.sum(e, dim=-2, keepdim=True))
+        pk = ttnn.sum(ttnn.multiply(prob, _rs(k, [1, P, kp, self.dk])), dim=-2, keepdim=True)  # [1,P,1,dk]
+        return _rs(pk, [1, 1, P, self.dk])
+
+    # ---------------------------------------------------------------- forward
+    def __call__(self, hidden_states, q_resid=None, attention_mask=None, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            raise NotImplementedError("indexer cache path not ported in this component")
+        x, qr = hidden_states, q_resid
+        B, S, D = x.shape
+        if B != 1:
+            raise NotImplementedError("batch > 1 not supported by this port")
+        kp = self.kpool
+        if S % kp:
+            raise NotImplementedError(f"S={S} not a multiple of index_kpool={kp}")
+        P = S // kp
+        if P > self.MAX_POOLS:
+            raise NotImplementedError(f"{P} pools > {self.MAX_POOLS}: needs a device top-k path")
+        sel_k = min(self.topk // kp, P)
+
+        def to4(t, d):
+            if isinstance(t, torch.Tensor):  # extra inputs may arrive host-side: upload replicated
+                return self._put(t.reshape(1, 1, S, d))
+            if t.layout != ttnn.TILE_LAYOUT:
+                t = ttnn.to_layout(t, ttnn.TILE_LAYOUT)
+            return ttnn.typecast(ttnn.reshape(t, [1, 1, S, d]), ttnn.float32)
+
+        x, qr = to4(x, D), to4(qr, qr.shape[-1])
+
+        # ---- scores (head-parallel partials, all-reduced)
+        pk_T = ttnn.transpose(self._pool_keys(x, S, P), -2, -1)  # [1,1,dk,P]
+        q = self._mm(qr, self.w_q)  # [1,1,S,hl*dk]
+        w = ttnn.multiply(self._mm(x, self.w_w), self.Hi**-0.5)  # [1,1,S,hl]
+        part = None
+        for h in range(self.hl):
+            qh = ttnn.slice(q, [0, 0, 0, h * self.dk], [1, 1, S, (h + 1) * self.dk])
+            wh = w if self.hl == 1 else ttnn.to_layout(
+                ttnn.slice(ttnn.to_layout(w, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, h], [1, 1, S, h + 1]), ttnn.TILE_LAYOUT
+            )
+            sh = ttnn.multiply(ttnn.relu(ttnn.multiply(self._mm(qh, pk_T), self.scale)), wh)
+            part = sh if part is None else ttnn.add(part, sh)
+        score = self._all_reduce_precise(part, S, P)  # [1,1,S,P]
+
+        # ---- candidates: pool p usable by query s iff kp*p + kp - 1 <= s
+        s_col = self._cut(self.c_s_col, [1, 1, S, 1])
+        p_row = self._cut(self.c_p_row, [1, 1, 1, P])
+        vis = ttnn.le(ttnn.add(ttnn.multiply(p_row, float(kp)), float(kp - 1)), s_col)  # [1,1,S,P]
+        masked = ttnn.add(ttnn.multiply(score, vis), ttnn.multiply(ttnn.subtract(vis, 1.0), 1e9))
+
+        # ---- exact descending rank and its inverse
+        a = _rs(masked, [1, S, 1, P])  # score[s, q] along last dim
+        b = _rs(masked, [1, S, P, 1])  # score[s, p] along dim 2
+        rank = ttnn.sum(ttnn.gt(a, b), dim=-1, keepdim=True)  # [1,S,P,1]
+        p_col = self._cut(self.c_p_col, [1, 1, P, 1])
+        sel = ttnn.sum(ttnn.multiply(ttnn.eq(rank, p_row), p_col), dim=2, keepdim=True)  # [1,S,1,P] pool @ rank r
+        sel = _rs(sel, [1, 1, S, P])
+        if sel_k < P:
+            sel = ttnn.to_layout(
+                ttnn.slice(ttnn.to_layout(sel, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, S, sel_k]), ttnn.TILE_LAYOUT
+            )
+        # rank r is a real selection iff r < #candidates(s) = floor((s+1)/kp)
+        n_cand = ttnn.floor(ttnn.multiply(ttnn.add(s_col, 1.0), 1.0 / kp))
+        r_sel = self._cut(self.c_p_row, [1, 1, 1, sel_k])
+        valid = ttnn.lt(r_sel, n_cand)  # [1,1,S,sel_k]
+
+        # ---- expand pools to token ids: tok[s, r*kp + j] = kp*sel[s,r] + j
+        E01 = self._cut(self.c_E01, [1, 1, sel_k, sel_k * kp])
+        off = self._cut(self.c_off, [1, 1, 1, sel_k * kp])
+        tok = ttnn.add(ttnn.multiply(self._mm(sel, E01), float(kp)), off)
+        vexp = self._mm(valid, E01)
+        main = ttnn.subtract(ttnn.multiply(vexp, ttnn.add(tok, 1.0)), 1.0)  # invalid -> -1
+        pieces = [main]
+        width = sel_k * kp
+        out_w = self.topk
+        if self.tail and kp > 1:
+            # open pool: tail_count = (s+1) mod kp tokens starting at (s+1) - tail_count
+            s1 = ttnn.add(s_col, 1.0)
+            tc = ttnn.subtract(s1, ttnn.multiply(ttnn.floor(ttnn.multiply(s1, 1.0 / kp)), float(kp)))
+            start = ttnn.subtract(s1, tc)
+            o_row = self._cut(self.c_o_row, [1, 1, 1, kp - 1])
+            tval = ttnn.lt(o_row, tc)
+            tail = ttnn.subtract(ttnn.multiply(tval, ttnn.add(ttnn.add(start, o_row), 1.0)), 1.0)
+            pieces.append(tail)
+            width += kp - 1
+            out_w += kp - 1
+        pieces = [ttnn.to_layout(p_, ttnn.ROW_MAJOR_LAYOUT) for p_ in pieces]
+        out = pieces[0] if len(pieces) == 1 else ttnn.concat(pieces, dim=-1)
+        if out_w > width:
+            out = ttnn.pad(out, [(0, 0), (0, 0), (0, 0), (0, out_w - width)], -1.0)
+        elif out_w < width:
+            out = ttnn.slice(out, [0, 0, 0, 0], [1, 1, S, out_w])
+        out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)  # [1,1,S,out_w]
+        if attention_mask is not None:
+            # HF: topk_indices.masked_fill(~attention_mask[..., None], -1) -- padded query rows -> -1
+            am = to4(attention_mask, 1)
+            out = ttnn.subtract(ttnn.multiply(am, ttnn.add(out, 1.0)), 1.0)
+        out = ttnn.reshape(ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT), [B, S, out_w])
+        return ttnn.typecast(ttnn.to_layout(out, ttnn.TILE_LAYOUT), ttnn.int32)
+
+
+def build(device, torch_module=None):
+    return TtTextIndexer.build(device, torch_module)
+
+
+def text_indexer(device, torch_module=None):
+    return TtTextIndexer.build(device, torch_module)

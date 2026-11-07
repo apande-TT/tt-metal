@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Native ttnn port of `Glm5NextTextUnweightedRMSNorm` (GLM-5.3-Flash mHC input norm).
+
+Reference: y = x * rsqrt(mean(x^2, -1) + eps)   (the rsqrt factor in fp32, no learned weight)
+Computed on device in fp32. No weights, so on a mesh every chip computes the replicated result.
+"""
+from __future__ import annotations
+
+import torch
+import ttnn
+
+
+class TtTextUnweightedRMSNorm:
+    def __init__(self, device, m):
+        self.device = device
+        self.eps = float(m.eps)
+
+    @classmethod
+    def build(cls, device, torch_module):
+        return cls(device, torch_module)
+
+    def __call__(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor):
+            raise TypeError("expected a ttnn tensor input")
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+        x = ttnn.typecast(x, ttnn.float32)
+        var = ttnn.mean(ttnn.multiply(x, x), dim=-1, keepdim=True)
+        return ttnn.multiply(x, ttnn.rsqrt(ttnn.add(var, self.eps)))
+
+
+def build(device, torch_module=None):
+    return TtTextUnweightedRMSNorm.build(device, torch_module)
+
+
+def text_unweighted_r_m_s_norm(device, torch_module=None):
+    return TtTextUnweightedRMSNorm.build(device, torch_module)
