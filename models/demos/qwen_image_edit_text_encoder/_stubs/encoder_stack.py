@@ -224,9 +224,15 @@ class TtVisionBlock:
         """x: fp32 residual stream; the branches are accumulated back in fp32. With precise_inputs the
         normalised activations enter the branch matmuls in fp32 instead of being rounded to bf16 first."""
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
-        a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
         l1 = 0 < 4 * math.prod([int(d) for d in x.padded_shape]) <= RESIDUAL_L1_BYTES
-        x = ttnn.add(x, _fp32(a), **({"memory_config": ttnn.L1_MEMORY_CONFIG} if l1 else {}))
+        mid_mem = ttnn.L1_MEMORY_CONFIG if l1 else None
+        # x + attn: with the attention's TP reduce, bias and this add in one pass where it applies
+        h = cast(self.norm1(x))
+        mid = self.attn.add_to(h, x, tt_cos, tt_sin, tt_mask, mid_mem) if VISION_ATTN_RESIDUAL_FUSED else None
+        if mid is None:
+            a = self.attn.forward_padded(h, tt_cos, tt_sin, tt_mask)
+            mid = ttnn.add(x, _fp32(a), **({"memory_config": mid_mem} if l1 else {}))
+        x = mid
         # x + mlp: with the MLP's TP reduce, bias and this add in one pass where it applies
         out = self.mlp.add_to(cast(self.norm2(x)), x) if VISION_MLP_RESIDUAL_FUSED else None
         if out is None:
@@ -246,6 +252,8 @@ VISION_MLP_FUSED_SILU = False
 # the vision block's x + mlp(...) with the MLP's exact TP reduce and bias in one per-device pass
 # (_attention.exact_all_reduce_add; needs _attention.A2A_RESIDUAL_FN)
 VISION_MLP_RESIDUAL_FUSED = False
+# likewise the vision block's x + attn(...) with the attention's exact TP reduce and output-projection bias
+VISION_ATTN_RESIDUAL_FUSED = False
 
 
 class TtPatchMerger:

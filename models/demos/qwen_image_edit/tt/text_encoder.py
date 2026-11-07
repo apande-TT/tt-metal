@@ -211,6 +211,7 @@ class TtQwenTextEncoder:
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
         _te_stack.VISION_MLP_RESIDUAL_FUSED = True
+        _te_stack.VISION_ATTN_RESIDUAL_FUSED = True  # and its attention's (x + attn)
         _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
         _te_stack.RESIDUAL_L1_BYTES = 8 * 1024 * 1024  # and the block's mid residual x + attn (7.2 MB)
         self.set_precise(True)

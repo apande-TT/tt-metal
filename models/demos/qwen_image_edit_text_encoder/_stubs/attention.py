@@ -208,11 +208,12 @@ def _a2a_sum(y, n, cluster_axis):
 A2A_RESIDUAL_FN = None
 
 
-def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1):
+def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1, out_mem=None):
     """residual + (exact_all_reduce(y) [+ bias]) with the all_to_all reduce's local sum, the bias and the residual
     add in one pass on each device's batch item before the all_gather (the same float32 adds in the same order).
     -> (that sum, True); (exact_all_reduce(y), False) when the kernel does not take the shapes (the caller adds the
-    bias and the residual); None, with nothing run, where this path does not apply. y, residual: [n, 1, S, C]."""
+    bias and the residual); None, with nothing run, where this path does not apply. y, residual: [n, 1, S, C].
+    out_mem: the gathered result's memory config (None: the all_gather's default)."""
     n = mesh_shape(device)[cluster_axis]
     shape = list(y.shape)
     if A2A_RESIDUAL_FN is None or n == 1 or not A2A_REDUCE or len(shape) != 4 or shape[1] != 1 or shape[0] != n:
@@ -234,7 +235,9 @@ def exact_all_reduce_add(y, device, residual, bias_rows=None, cluster_axis=1):
         ttnn.deallocate(g)
         return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear), False
     ttnn.deallocate(g)
-    return ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear), True
+    kw = {} if out_mem is None else {"memory_config": out_mem}
+    res = ttnn.all_gather(out, dim=0, cluster_axis=cluster_axis, num_links=1, topology=ttnn.Topology.Linear, **kw)
+    return res, True
 
 
 def exact_all_reduce_residual(y, device, residual, cluster_axis=1):
@@ -879,6 +882,16 @@ class TtVisionAttention:
             device, torch_module.proj.weight.detach().float().t().contiguous(), mapper=shard_mapper(device, 0)
         )
         self.bproj = upload(device, torch_module.proj.bias.detach().float().reshape(1, 1, 1, -1))
+        # add_to's bias rows likewise built on host: bproj's bf16 value in float32 over a tile's rows
+        pb = torch_module.proj.bias.detach().float().reshape(1, -1)
+        pb16 = ttnn.to_torch(ttnn.from_torch(pb, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)).float()
+        prows = ttnn.from_torch(
+            pb16.expand(TILE, -1).contiguous(),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=replicate(device),
+        )
+        self._b_rows = ttnn.to_device(prows, device)
         # rotate_half(x) == x @ R
         half = D // 2
         r = np.zeros((D, D), dtype=np.float32)
@@ -934,7 +947,18 @@ class TtVisionAttention:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
         return ttnn.add(out, self.bproj)
 
-    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
+    def add_to(self, x, residual, tt_cos, tt_sin, tt_mask, out_mem=None):
+        """residual + self.forward_padded(x, ...), with the output projection's exact TP reduce, its bias and the
+        residual add in one per-device pass (exact_all_reduce_add: residual + (sum + bias), the same float32 adds
+        in the same order); None, with nothing run, where that path does not apply (the caller runs both)."""
+        if not (self.precise and self.tp > 1 and A2A_RESIDUAL_FN is not None and A2A_REDUCE):
+            return None
+        shape = list(residual.shape)
+        if len(shape) != 4 or shape[1] != 1 or shape[0] != self.tp or residual.dtype != ttnn.float32:
+            return None
+        return self._forward_precise(x, tt_cos, tt_sin, tt_mask, residual=residual, out_mem=out_mem)
+
+    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, residual=None, out_mem=None):
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         loc = hp * D
@@ -1003,12 +1027,24 @@ class TtVisionAttention:
             o = ttnn.permute(o, (0, 2, 1, 3))
             o = ttnn.reshape(o, (n, 1, s_pad, loc))
         out = split_linear(o, self.wproj, compute_kernel_config=cfg, exact=ex, limbs=L)
+        b32 = None
+        if residual is not None:  # add_to: residual + (reduce + bias) in the reduce's pass
+            r = exact_all_reduce_add(out, self.device, residual, self._b_rows, out_mem=out_mem)
+            if r is not None and r[1]:
+                return r[0]
+            b32 = ttnn.typecast(self.bproj, ttnn.float32)
+            if r is not None:  # the reduce ran, the bias and the residual add did not
+                y = ttnn.add(r[0], b32)
+                return ttnn.add(residual, y, **({} if out_mem is None else {"memory_config": out_mem}))
         if self.tp > 1:
             out = exact_all_reduce(out, self.device)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)
-        y = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        b32 = ttnn.typecast(self.bproj, ttnn.float32) if b32 is None else b32
+        y = ttnn.add(out, b32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if out.memory_config().buffer_type == ttnn.BufferType.L1:
             ttnn.deallocate(out)
+        if residual is not None:
+            return ttnn.add(residual, y, **({} if out_mem is None else {"memory_config": out_mem}))
         return y
 
     def __call__(self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
