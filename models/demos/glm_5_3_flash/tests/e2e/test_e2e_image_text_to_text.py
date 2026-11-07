@@ -4,7 +4,8 @@
 
 Inputs (provenance): the published example of Glm5NextForConditionalGeneration.forward (transformers
 glm5_next docstring) -- image pipeline-cat-chonk.jpeg + "Describe the image." -- through the HF
-Glm5NextProcessor chat template at its default image resolution (893 prompt tokens), IDENTICAL on every batch row; rows differ
+Glm5NextProcessor chat template, the image scaled to the pipeline's input size ($TT_PERF_AREA, default
+P.DEFAULT_AREA = 1024: a 1382-token prompt), IDENTICAL on every batch row; rows differ
 only in their sampling seed (TOOL-AUTHORED seeds 0..B-1) under the model's own generation_config
 (temperature, top_p). B is read from $TT_PERF_BATCH (else the pipeline default).
 

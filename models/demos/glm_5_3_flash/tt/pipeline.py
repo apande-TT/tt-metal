@@ -21,6 +21,7 @@ run, sharded over 32 chips (~20 GB/chip). No weight moves host->device during a 
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections import defaultdict
@@ -48,6 +49,10 @@ EXAMPLE_PROMPT = "Describe the image."
 # Optional processor cap on image tokens. None = the processor's own default, i.e. the published example
 # exactly as the model card runs it (893 prompt tokens); any prompt up to index_topk is supported.
 DEFAULT_MAX_IMAGE_TOKENS = None
+# Input SIZE the pipeline is built and gated for: the side of the equivalent square (the image is scaled to
+# that area keeping its aspect ratio; the processor's own resizing rule then decides the exact grid). The
+# perf harness's area variable overrides it at run time; 0 = the image exactly as given.
+DEFAULT_AREA = 1024
 CHUNK = 64  # KDA chunk; prefill length is padded to a multiple of it
 DEFAULT_BATCH = 32  # samples per call (one 32-row tile of every projection)
 # Token rows (samples x padded prompt) one prefill pass carries. Samples are independent in prefill, so a batch
@@ -129,6 +134,23 @@ def example_messages(prompt: str = EXAMPLE_PROMPT, image_url: str = EXAMPLE_IMAG
     return [{"role": "user", "content": [{"type": "image", "image": image_url}, {"type": "text", "text": prompt}]}]
 
 
+def input_area() -> int:
+    """The input size to run at: the harness's area variable when set, else DEFAULT_AREA."""
+    from models.experimental.perf_automation.agent.perf_adapter import AREA_ENV
+
+    return int(os.environ.get(AREA_ENV) or DEFAULT_AREA)
+
+
+def sized_image(image_url, area: int):
+    """The image (URL, path or PIL) scaled to area x area pixels in total, aspect ratio kept."""
+    from PIL import Image
+    from transformers.image_utils import load_image
+
+    im = load_image(image_url)
+    s = area / math.sqrt(im.width * im.height)
+    return im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.Resampling.BICUBIC)
+
+
 def load_processor(model_id: str = HF_MODEL_ID):
     from transformers import AutoProcessor
 
@@ -141,11 +163,15 @@ def encode_example(
     image_url: str = EXAMPLE_IMAGE_URL,
     max_image_tokens: Optional[int] = DEFAULT_MAX_IMAGE_TOKENS,
     chat_kwargs: Optional[dict] = None,
+    area: Optional[int] = None,
 ):
-    """HF processor over the published example -> dict(input_ids [1,L], pixel_values [N,1176], image_grid_thw [1,3])."""
+    """HF processor over the published example -> dict(input_ids [1,L], pixel_values [N,1176], image_grid_thw [1,3]).
+    The image is first scaled to ``area`` (None: input_area(); 0: as given)."""
     processor = processor or load_processor()
+    area = input_area() if area is None else int(area)
+    image = sized_image(image_url, area) if area else image_url
     enc = processor.apply_chat_template(
-        example_messages(prompt, image_url),
+        example_messages(prompt, image),
         tokenize=True,
         add_generation_prompt=True,
         return_dict=True,

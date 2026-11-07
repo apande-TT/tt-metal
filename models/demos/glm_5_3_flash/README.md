@@ -77,8 +77,10 @@ Per-component PCC tests from bring-up:
 
 ### Inputs
 - The published example of `Glm5NextForConditionalGeneration` (cat image + "Describe the image."),
-  encoded by the HF processor's chat template at its default image resolution. That gives an 893-token prompt
-  (875 image tokens). Verified at batch 32 on the Galaxy, also with a 1024x1024 image (1387-token prompt).
+  scaled to an input size of 1024 (`DEFAULT_AREA`: 1024 x 1024 pixels in total, aspect ratio kept) and
+  encoded by the HF processor's chat template. That gives a 1382-token prompt. `TT_PERF_AREA` (the
+  optimize/emit-e2e `--area` flag) overrides the size; `TT_PERF_AREA=0` runs the image as published
+  (893 tokens). Verified at batch 32 on the Galaxy at both sizes.
 - A copy is kept under `_captured/e2e_example/` for the trace stages.
 - Change the input with `--image`, `--prompt`, `--max-image-tokens` and `--reasoning-effort`.
 - With `--batch N --sample`, every row carries the same input and row `b` samples with seed
