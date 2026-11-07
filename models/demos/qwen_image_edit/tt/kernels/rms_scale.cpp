@@ -4,7 +4,8 @@
 
 // The row scale rs = rsqrt(mean(x * x, -1) + eps) of the precise float32 RMSNorm, one tile row (Wt tiles of
 // 32 rows) at a time, bit-identical to the stock chain it replaces (_stubs/encoder_stack.py TtRMSNorm):
-//   sq = x * x               binary_ng SFPU (both float32): copy a, copy b, mul_binary_tile
+//   sq = x * x               binary_ng SFPU (both float32): copy a, copy b, mul_binary_tile (here square_tile, the
+//                            same float32 v * v on one copy)
 //   ms = mean(sq, -1)        the accurate float32 reduce W (SFPU): copy + add_binary_tile fold over the Wt
 //                            tiles in order, sfpu_reduce<SUM, REDUCE_ROW>, then the 1 / W post-mul
 //                            (mul_unary_tile with the scaler's bits) before the pack
@@ -39,6 +40,7 @@ void kernel_main() {
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t inv_w_bits = get_compile_time_arg_val(1);  // float32 bits of 1 / W
     constexpr uint32_t eps_bits = get_compile_time_arg_val(2);    // float32 bits of eps
+    constexpr uint32_t G = Wt % 2 == 0 ? 2 : 1;                   // x tiles per step
 
     CircularBuffer x(cb_x);
     CircularBuffer out(cb_out);
@@ -46,19 +48,24 @@ void kernel_main() {
     compute_kernel_hw_startup(cb_x, cb_out);
     for (uint32_t r = 0; r < num_rows; ++r) {
         tile_regs_acquire();
-        for (uint32_t wt = 0; wt < Wt; ++wt) {
-            // sq into DST 0 for the first tile (the fold's seed), else into DST 2 and folded into DST 0
-            const uint32_t d = wt == 0 ? 0 : 2;
-            x.wait_front(1);
+        // G tiles per step (G divides Wt and the CB, so a step never straddles the CB's wrap): each copied once and
+        // squared in place (square_tile: the same SFPU float32 v * v as mul_binary_tile(x, x)), one init per op per
+        // step; the first step's first square seeds the fold in DST 0, the rest are folded into it in order
+        for (uint32_t wt = 0; wt < Wt; wt += G) {
+            const uint32_t d = wt == 0 ? 0 : 1;
+            x.wait_front(G);
             copy_init(cb_x);
-            copy_tile(cb_x, 0, d);
-            copy_tile(cb_x, 0, d + 1);
-            x.pop_front(1);
-            mul_binary_tile_init();
-            mul_binary_tile(d, d + 1, d);
-            if (wt > 0) {
-                add_binary_tile_init();
-                add_binary_tile(0, 2, 0);
+            for (uint32_t i = 0; i < G; ++i) {
+                copy_tile(cb_x, i, d + i);
+            }
+            x.pop_front(G);
+            square_tile_init();
+            for (uint32_t i = 0; i < G; ++i) {
+                square_tile(d + i);
+            }
+            add_binary_tile_init();
+            for (uint32_t i = wt == 0 ? 1 : 0; i < G; ++i) {
+                add_binary_tile(0, d + i, 0);
             }
         }
         sfpu_reduce_init<ckernel::PoolType::SUM, DataFormat::Float32>();
