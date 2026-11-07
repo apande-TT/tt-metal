@@ -36,6 +36,18 @@ _CURRENT = object()  # sentinel: "the current build-time TP axis"
 _TP_AXIS = None  # build-time default; ports capture it in __init__
 
 
+# fn(t, dtype, layout, device, mesh_mapper) -> the device tensor ttnn.from_torch makes (e.g. tilized on the host);
+# None: ttnn.from_torch. Used by the block stack's TP-sharded weight uploads.
+FROM_TORCH_FN = None
+
+
+def from_torch(t, dtype, device, mesh_mapper):
+    """TILE-layout device tensor of host t under mesh_mapper (FROM_TORCH_FN when set)."""
+    if FROM_TORCH_FN is not None:
+        return FROM_TORCH_FN(t, dtype, ttnn.TILE_LAYOUT, device, mesh_mapper)
+    return ttnn.from_torch(t, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, mesh_mapper=mesh_mapper)
+
+
 def get_tp_axis():
     return _TP_AXIS
 

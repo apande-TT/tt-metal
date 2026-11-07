@@ -59,6 +59,7 @@ from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
+from models.demos.qwen_image_edit.tt.upload import host_tiled_from_torch
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _tr_ccl
@@ -221,6 +222,8 @@ class QwenImageEditTT:
         # q/k/v (and the text stream's add_q/k/v) as one fused column-parallel weight per stream: one limb
         # linear pair reads the activation limbs and the weights once instead of three times
         _tr_attention.FUSED_QKV = True
+        # the block stack's sharded weights (modulation) tilized on the host (see tt/upload.py)
+        _tr_ccl.FROM_TORCH_FN = host_tiled_from_torch
         with _tr_ccl.tp_axis(TP_AXIS):  # TP=8 over mesh axis 0, replicated over axis 1 (see _ccl)
             self.transformer = TtQwenImageTransformer(
                 device, hf_pipe.transformer, layers=pick(denoise_layers), tracker=self.tracker

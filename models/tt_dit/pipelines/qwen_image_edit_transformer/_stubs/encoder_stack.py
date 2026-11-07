@@ -42,13 +42,7 @@ def _replicated(t, device, dtype=ttnn.float32):
 
 def _sharded(t, device, dim, dtype=ttnn.bfloat16):
     if _is_mesh(device):
-        return ttnn.from_torch(
-            t.contiguous(),
-            dtype=dtype,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            mesh_mapper=_ccl.shard_mapper(device, dim),  # TP axis: see _ccl.tp_axis
-        )
+        return _ccl.from_torch(t.contiguous(), dtype, device, _ccl.shard_mapper(device, dim))  # TP axis: _ccl.tp_axis
     return _replicated(t, device, dtype=dtype)
 
 

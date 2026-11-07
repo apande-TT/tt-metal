@@ -68,28 +68,15 @@ def hifi4_config():
     )
 
 
-# upload / upload_rows tilize (and cast) on the host and copy the finished tiles, instead of copying row-major
-# float32 and running a tilize + typecast on every device (load-time device work, same tiles). The device path's
-# transient buffers are still allocated and freed in its order (no kernels run), so every later DRAM allocation
-# lands where it did -- the traced denoise is sensitive to that layout.
-HOST_TILIZE = False
+# fn(t, dtype, layout, device, mesh_mapper) -> the device tensor ttnn.from_torch makes (e.g. tilized on the host);
+# None: ttnn.from_torch
+FROM_TORCH_FN = None
 
 
 def _from_torch(t, dtype, layout, device, mapper):
-    if not HOST_TILIZE or t.dtype != torch.float32 or layout != ttnn.TILE_LAYOUT:
-        return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, mesh_mapper=mapper)
-    host = ttnn.from_torch(t, dtype=dtype, layout=layout, mesh_mapper=mapper)
-    shape, dram = host.shape, ttnn.DRAM_MEMORY_CONFIG
-    src_rm = ttnn.allocate_tensor_on_device(shape, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, device, dram)
-    if dtype == ttnn.float32:  # RM -> tilize: the tiles land beside the row-major copy, which is then freed
-        out = ttnn.to_device(host, device)
-        ttnn.deallocate(src_rm)
-        return out
-    src_tile = ttnn.allocate_tensor_on_device(shape, ttnn.float32, ttnn.TILE_LAYOUT, device, dram)
-    ttnn.deallocate(src_rm)  # RM -> tilize -> typecast: the cast tiles land after the row-major copy is freed
-    out = ttnn.to_device(host, device)
-    ttnn.deallocate(src_tile)
-    return out
+    if FROM_TORCH_FN is not None:
+        return FROM_TORCH_FN(t, dtype, layout, device, mapper)
+    return ttnn.from_torch(t, dtype=dtype, layout=layout, device=device, mesh_mapper=mapper)
 
 
 def upload(device, array, dtype=ttnn.bfloat16, mapper=None):

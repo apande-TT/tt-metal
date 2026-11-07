@@ -32,6 +32,7 @@ from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_blo
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_rows
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
+from models.demos.qwen_image_edit.tt.upload import host_tiled_from_torch
 from models.demos.qwen_image_edit_text_encoder._stubs import (
     language_model_layers_0_mlp,
     v_l_decoder_layer,
@@ -96,7 +97,7 @@ class TtQwenTextEncoder:
         )
         # the towers' weights arrive already tiled (host tilize + cast, the device path's transient buffers replayed),
         # not as row-major float32 tilized on device
-        _te_attention.HOST_TILIZE = True
+        _te_attention.FROM_TORCH_FN = host_tiled_from_torch
         # Depth caps build fewer repeats of each stack; the rest of each module is intact.
         vis_blocks, lm_layers = visual.blocks, lm.layers
         try:
