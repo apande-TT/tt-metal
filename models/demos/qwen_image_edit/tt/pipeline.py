@@ -74,6 +74,52 @@ def to_host(t, device):
     return ttnn.to_torch(t)
 
 
+_BMM_2D = {}
+
+
+def _divisor_upto(n, cap):
+    return next(d for d in range(min(n, cap), 0, -1) if n % d == 0)
+
+
+def bmm_config_2d(p, q, transpose_b=False):
+    """bmm_program_config, else -- for a FEW-entry batched p @ q^T with a short K (the denoiser's dense QK^T limb
+    products: 3 heads x 864 query rows x 9696 keys, K = 128) -- a 2D-multicast config over the whole grid. The stock
+    pick for those is a 1D multicast with each core holding all 27 M tiles x 5 N tiles (61 cores); this splits M over
+    the rows and N over the columns, with the whole K in one block (each output tile's K order unchanged)."""
+    cfg = _te_attention.bmm_program_config(p, q, transpose_b)
+    if cfg is not None or not transpose_b:
+        return cfg
+    ps, qs = list(p.padded_shape), list(q.padded_shape)
+    if len(ps) < 3 or ps[:-2] != qs[:-2] or ps[-1] % 32 or ps[-2] % 32 or qs[-2] % 32:
+        return None
+    mt, kt, nt = ps[-2] // 32, ps[-1] // 32, qs[-2] // 32
+    batch = 1
+    for d in ps[:-2]:
+        batch *= d
+    grid = q.device().compute_with_storage_grid_size()
+    if kt > 4 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
+        return None
+    key = (mt, kt, nt, grid.x, grid.y)
+    if key not in _BMM_2D:
+        pcm, pcn = -(-mt // grid.y), -(-nt // grid.x)
+        obw = pcn if pcn <= 16 else _divisor_upto(pcn, 20)
+        sbw = _divisor_upto(obw, 4)
+        sbh = _divisor_upto(pcm, max(1, 4 // sbw))
+        _BMM_2D[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=(grid.x, grid.y),
+            in0_block_w=kt,
+            out_subblock_h=sbh,
+            out_subblock_w=sbw,
+            out_block_h=pcm,
+            out_block_w=obw,
+            per_core_M=pcm,
+            per_core_N=pcn,
+            transpose_mcast=False,
+            fuse_batch=False,
+        )
+    return _BMM_2D[key]
+
+
 _HF = {}
 
 
@@ -335,7 +381,9 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
-        ), self._fused_tail():
+        ), self._fused_tail(), self._hook(
+            _te_attention, "BMM_CONFIG", bmm_config_2d if self.bmm_config else None
+        ):
             v = self.transformer(x_in, t, st.prompt, st.rotary)
         v = ttnn.slice(v, [0, 0, 0], [B, S, C])  # noise_pred[:, : latents.size(1)]
         ttnn.copy(ttnn.add(st.lat, ttnn.multiply(v, dt)), st.lat)
