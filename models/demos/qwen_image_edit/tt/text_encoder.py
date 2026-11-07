@@ -122,6 +122,7 @@ class TtQwenTextEncoder:
         _te_attention.A2A_RESIDUAL_FN = fused_block_sum_gated
         _te_attention.A2A_L1_BYTES = 12 * 1024 * 1024  # the all_to_all's received partials in L1
         _te_attention.A2A_GATHER_L1_BYTES = 16 * 1024 * 1024  # the vision attention reduce's gathered sum (14.4 MB)
+        _te_attention.A2A_RESIDUAL_GATHER_L1_BYTES = 4 * 1024 * 1024  # the LM's residual after each fused reduce
         _te_attention.A2A_FOLD = True  # several items per device: one fused sum over row-folded blocks
         # (its local sum in L1 too when it fits A2A_L1_BYTES)
         _te_attention.A2A_FOLD_L1_BYTES = 24 * 1024 * 1024  # and its received partials (22 MB) in L1
