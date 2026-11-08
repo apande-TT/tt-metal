@@ -86,6 +86,9 @@ SOFTMAX_IO_L1 = False
 # fn(t, cos, sin) -> the precise LM attention's RoPE t * cos + rotate_half(t) * sin in one call (e.g. a fused kernel),
 # or None to run the stock ops (None: slices + neg + concat + multiplies + add)
 ROPE_FN = None
+# optional fn(qkv, lo, n, head_dim, cos, sin) -> ROPE_FN of heads [lo, lo + n) read straight from the fused qkv
+# projection (no per-head slices + concat first), or None where it does not apply
+ROPE_HEADS_FN = None
 
 
 def _t(lin):
@@ -251,7 +254,6 @@ class TtTextAttention:
             t = ttnn.reshape(t, (b, s_pad, n, D))
             return ttnn.permute(t, (0, 2, 1, 3))
 
-        q, k, v = _heads(0, hl), _heads(hl, kvl), _heads(hl + kvl, kvl)
         cos = tt_cos if tt_cos.dtype == ttnn.float32 else ttnn.typecast(tt_cos, ttnn.float32)
         sin = tt_sin if tt_sin.dtype == ttnn.float32 else ttnn.typecast(tt_sin, ttnn.float32)
 
@@ -261,7 +263,12 @@ class TtTextAttention:
                 return y
             return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
 
-        q, k = _rope(q), _rope(k)
+        def _rope_heads(lo, n):
+            """RoPE of heads [lo, lo + n): read straight from qkv by ROPE_HEADS_FN where it applies."""
+            y = ROPE_HEADS_FN(qkv, lo, n, D, cos, sin) if ROPE_HEADS_FN is not None else None
+            return y if y is not None else _rope(_heads(lo, n))
+
+        q, k, v = _rope_heads(0, hl), _rope_heads(hl, kvl), _heads(hl + kvl, kvl)
         if kv is not None:
             mode, cache, key, P = kv
             if mode == "store":

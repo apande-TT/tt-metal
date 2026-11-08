@@ -20,15 +20,32 @@ _TT_METAL = os.environ.get("TT_METAL_HOME", "")
 _WRITER = "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp"
 
 
-def fused_rope(x, cos, sin, mem=None):
+def fused_rope_heads(qkv, lo, n, D, cos, sin, mem=None):
+    """fused_rope of heads [lo, lo + n) of a fused projection qkv [B, 1, S, W] float32 TILE (head h in columns
+    [h * D, (h + 1) * D)) read straight from it -> [B, n, S, D], the same tiles and math as slicing those heads into
+    a [B, n, S, D] tensor and running fused_rope on it; None when the shapes do not fit."""
+    if len(qkv.shape) != 4 or int(qkv.shape[1]) != 1 or D % 64 or int(qkv.shape[-1]) < (lo + n) * D:
+        return None
+    if list(qkv.padded_shape) != list(qkv.shape) or int(qkv.shape[-1]) % 32:
+        return None
+    B, _, S, W = (int(d) for d in qkv.shape)
+    return fused_rope(qkv, cos, sin, mem, heads=(B, n, S, D, W // 32, lo * D // 32))
+
+
+def fused_rope(x, cos, sin, mem=None, heads=None):
     """x [B, H, S, D] float32 TILE (interleaved), cos / sin [1 or B, 1, S, D] float32 TILE -> x * cos +
     rotate_half(x) * sin, bit-identical to the ttnn chain; None when the shapes do not fit (D / 2 not tile
-    aligned, padding, other layouts) so the caller runs the chain."""
+    aligned, padding, other layouts) so the caller runs the chain. heads (fused_rope_heads): (B, H, S, D, Wt, col0),
+    x then being the fused projection the heads are read from."""
     if len(x.shape) != 4 or any(t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT for t in (x, cos, sin)):
         return None
     if x.is_sharded() or cos.is_sharded() or sin.is_sharded():
         return None
-    B, H, S, D = (int(d) for d in x.shape)
+    if heads is None:
+        B, H, S, D = (int(d) for d in x.shape)
+        wt, col0 = 0, 0
+    else:
+        B, H, S, D, wt, col0 = heads
     if D % 64 or S % 32 or list(x.padded_shape) != list(x.shape):
         return None
     cb = int(cos.shape[0])
@@ -36,9 +53,11 @@ def fused_rope(x, cos, sin, mem=None):
         return None
     Dt, St = D // 32, S // 32
     device = x.device()
-    out = ttnn.allocate_tensor_on_device(x.shape, ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG)
+    out = ttnn.allocate_tensor_on_device(
+        ttnn.Shape([B, H, S, D]), ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG
+    )
     n_tiles = B * H * St * Dt
-    reader_ct = [Dt, St, H, 1 if cb > 1 else 0]
+    reader_ct = [Dt, St, H, 1 if cb > 1 else 0, wt, col0]
     for t in (x, cos, sin):
         reader_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
 
