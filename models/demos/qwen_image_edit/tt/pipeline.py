@@ -378,6 +378,8 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "B_SIDE_REUSE", True),
             # (the K-stacked exact-lane QK^T at HiFi3, the fidelity of the linears' K-stacked lane products)
             (_te_attention, "QK_STACK_FIDELITY", ttnn.MathFidelity.HiFi3),
+            # (the softmax's exp(s - max) fused into the subtract: one pass over the float32 scores, not two)
+            (_dit_precise, "SOFTMAX_FUSED_EXP", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:

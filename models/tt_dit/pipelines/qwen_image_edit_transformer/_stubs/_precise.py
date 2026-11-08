@@ -187,6 +187,8 @@ SCORE_ROW_ALIGN = TILE
 # Row-chunked joint attention: the keys' side of the exact QK^T formed once and reused by every query-row chunk
 # (the text encoder's B_SIDE_CACHE) instead of once per chunk.
 B_SIDE_REUSE = False
+# The joint attention's softmax exp(s - max) as the subtract's post-activation (one pass over the scores, not two).
+SOFTMAX_FUSED_EXP = False
 
 
 def score_rows(keys):
