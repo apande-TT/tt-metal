@@ -81,14 +81,48 @@ def _divisor_upto(n, cap):
     return next(d for d in range(min(n, cap), 0, -1) if n % d == 0)
 
 
+def _bmm_long_k(p, q):
+    """A FEW-entry batched p @ q with a long K and a narrow N (the denoiser's P @ V lane products: 3 heads x 768 query
+    rows x 9696 keys @ 128): M over the grid rows, N over as many columns as it has tiles, and K in blocks of up to 4
+    tiles instead of the auto pick's 1 (303 single-tile K steps per output block). None for other shapes."""
+    ps, qs = list(p.padded_shape), list(q.padded_shape)
+    if len(ps) < 3 or ps[:-2] != qs[:-2] or ps[-1] % 32 or ps[-2] % 32 or qs[-1] % 32:
+        return None
+    mt, kt, nt = ps[-2] // 32, ps[-1] // 32, qs[-1] // 32
+    batch = 1
+    for d in ps[:-2]:
+        batch *= d
+    grid = q.device().compute_with_storage_grid_size()
+    if kt < 64 or batch > 8 or mt < grid.y or nt > grid.x:
+        return None
+    key = ("long_k", mt, kt, nt, grid.x, grid.y)
+    if key not in _BMM_2D:
+        pcm = -(-mt // grid.y)
+        _BMM_2D[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+            compute_with_storage_grid_size=(nt, grid.y),
+            in0_block_w=_divisor_upto(kt, 4),
+            out_subblock_h=_divisor_upto(pcm, 4),
+            out_subblock_w=1,
+            out_block_h=pcm,
+            out_block_w=1,
+            per_core_M=pcm,
+            per_core_N=1,
+            transpose_mcast=False,
+            fuse_batch=False,
+        )
+    return _BMM_2D[key]
+
+
 def bmm_config_2d(p, q, transpose_b=False):
     """bmm_program_config, else -- for a FEW-entry batched p @ q^T with a short K (the denoiser's dense QK^T limb
     products: 3 heads x 864 query rows x 9696 keys, K = 128) -- a 2D-multicast config over the whole grid. The stock
     pick for those is a 1D multicast with each core holding all 27 M tiles x 5 N tiles (61 cores); this splits M over
     the rows and N over the columns, with the whole K in one block (each output tile's K order unchanged)."""
     cfg = _te_attention.bmm_program_config(p, q, transpose_b)
-    if cfg is not None or not transpose_b:
+    if cfg is not None:
         return cfg
+    if not transpose_b:
+        return _bmm_long_k(p, q)
     ps, qs = list(p.padded_shape), list(q.padded_shape)
     if len(ps) < 3 or ps[:-2] != qs[:-2] or ps[-1] % 32 or ps[-2] % 32 or qs[-2] % 32:
         return None
