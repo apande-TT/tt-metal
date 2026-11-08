@@ -493,6 +493,8 @@ LANE_KSTACK = None
 LANE_STACK_MAX_K_PER_N = 0
 # Math fidelity of the K-stacked weight-lane products (HiFi4: each lane's bf16 x bf16 tile products exact).
 LANE_STACK_FIDELITY = ttnn.MathFidelity.HiFi4
+# Math fidelity of the K-stacked exact-lane QK^T (q's 8 lanes side by side along K @ k's lead repeated 8x).
+QK_STACK_FIDELITY = ttnn.MathFidelity.HiFi4
 # Optional for the weight-side lanes the K-stack does not take: LANE_NSTACK(g, n) -> the left-to-right sum of g's n
 # column blocks, g = x @ [lane 0 | ... | lane 7] (N' = 8N), or None. The 8 lane products then run as ONE product over
 # the whole grid (a narrow N fills only part of it) and their sum is one pass over its float32 output.
@@ -1084,7 +1086,20 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
             n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
             # (a padded lead limb is formed per call: cached only when it is the cached limb itself)
             kr, kr_kept = _b_side(keep_b and pb0 is terms[0][1], "kr", (pb0,), lambda: LANE_STACK(pb0, n_lanes))
-            acc.push(mm(xs, kr))
+            if QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4:
+                pc = None if BMM_CONFIG is None else BMM_CONFIG(xs, kr, True)
+                acc.push(
+                    ttnn.matmul(
+                        xs,
+                        kr,
+                        transpose_b=True,
+                        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+                        dtype=ttnn.float32,
+                        program_config=pc,
+                    )
+                )
+            else:
+                acc.push(mm(xs, kr))
             ttnn.deallocate(xs)
             if not kr_kept:
                 ttnn.deallocate(kr)

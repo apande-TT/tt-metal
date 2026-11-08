@@ -376,6 +376,8 @@ class TtQwenImageEditPipeline:
             # (the keys' side of the exact QK^T -- limbs, norms, K-repeated / K-concatenated limbs -- and the values'
             # limbs and norms formed once per attention, not once per query-row chunk)
             (_dit_precise, "B_SIDE_REUSE", True),
+            # (the K-stacked exact-lane QK^T at HiFi3, the fidelity of the linears' K-stacked lane products)
+            (_te_attention, "QK_STACK_FIDELITY", ttnn.MathFidelity.HiFi3),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:
