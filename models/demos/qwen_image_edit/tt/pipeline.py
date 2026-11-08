@@ -326,6 +326,20 @@ class TtQwenImageEditPipeline:
         st.rotary = self.transformer.rotary(up.img_shapes, prompt_embeds.shape[1])
         return st
 
+    @contextlib.contextmanager
+    def _denoise_extras(self):
+        """Denoise-only hooks entered after _fused_tail (so they override its BMM_CONFIG): the few-entry QK^T limb
+        products' 2D full-grid config, and score chunks a whole number of grid rows (768 query rows, not 864) so that
+        config fills all 8 rows."""
+        hooks = (
+            (_te_attention, "BMM_CONFIG", bmm_config_2d if self.bmm_config else None),
+            (_dit_precise, "SCORE_ROW_ALIGN", 32 * self.device.compute_with_storage_grid_size().y),
+        )
+        with contextlib.ExitStack() as stack:
+            for module, name, fn in hooks:
+                stack.enter_context(self._hook(module, name, fn))
+            yield
+
     def denoise_step(self, st):
         """One denoising step on the persistent buffers: transformer forward + Euler update."""
         B, S, C = st.lat.shape[0], st.lat.shape[1], st.lat.shape[2]
@@ -381,14 +395,7 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
-        ), self._fused_tail(), self._hook(
-            _te_attention, "BMM_CONFIG", bmm_config_2d if self.bmm_config else None
-        ), self._hook(
-            # (the score chunks' query rows a whole number of grid rows -- 768, not 864 -- so the QK^T 2D config fills 8x8)
-            _dit_precise,
-            "SCORE_ROW_ALIGN",
-            32 * self.device.compute_with_storage_grid_size().y,
-        ):
+        ), self._fused_tail(), self._denoise_extras():
             v = self.transformer(x_in, t, st.prompt, st.rotary)
         v = ttnn.slice(v, [0, 0, 0], [B, S, C])  # noise_pred[:, : latents.size(1)]
         ttnn.copy(ttnn.add(st.lat, ttnn.multiply(v, dt)), st.lat)
