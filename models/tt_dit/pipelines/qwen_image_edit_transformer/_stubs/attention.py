@@ -285,7 +285,18 @@ class TtQwenJointAttention:
         if _precise.row_cuts(q.shape, chunk, dim=-2) is None:
             return self._attend_rows(q, kh, kl, v, mask_add)
         # mask_add is [B, 1, 1, Sk]: one value per KEY, so every row chunk reads the same one
-        return _precise._row_chunked(lambda qc: self._attend_rows(qc, kh, kl, v, mask_add), q, chunk, dim=-2)
+        if not (_precise.ENABLED and _precise.EXACT_QK and _precise.B_SIDE_REUSE):
+            return _precise._row_chunked(lambda qc: self._attend_rows(qc, kh, kl, v, mask_add), q, chunk, dim=-2)
+        # the keys' side of every chunk's exact QK^T (limbs, column norms, K-repeated and K-concatenated limbs) is
+        # the same: formed by the first chunk, reused by the rest, freed here
+        from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te
+
+        prev, _te.B_SIDE_CACHE = _te.B_SIDE_CACHE, {}
+        try:
+            return _precise._row_chunked(lambda qc: self._attend_rows(qc, kh, kl, v, mask_add), q, chunk, dim=-2)
+        finally:
+            _te.free_b_side(_te.B_SIDE_CACHE)
+            _te.B_SIDE_CACHE = prev
 
     def _attend_rows(self, q, kh, kl, v, mask_add):
         if _precise.ENABLED:  # kh = k (float32) in precise mode

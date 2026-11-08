@@ -184,6 +184,9 @@ CHUNK_ROWS_BYTES = 48 * 1024 * 1024
 # Query rows per attention score chunk rounded down to a multiple of this (TILE: no extra rounding). The denoise
 # stage sets 32 x grid rows, so the chunk's M tiles split evenly over the grid's rows in the QK^T products.
 SCORE_ROW_ALIGN = TILE
+# Row-chunked joint attention: the keys' side of the exact QK^T formed once and reused by every query-row chunk
+# (the text encoder's B_SIDE_CACHE) instead of once per chunk.
+B_SIDE_REUSE = False
 
 
 def score_rows(keys):

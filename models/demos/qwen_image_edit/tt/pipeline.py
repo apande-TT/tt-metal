@@ -337,6 +337,9 @@ class TtQwenImageEditPipeline:
             # (the QK^T's five trailing limb terms as ONE K-concatenated product: one fp32 output, not five)
             (_te_attention, "REST_KCAT", True),
             (_te_attention, "NORMS_L1", True),
+            # (the keys' side of the exact QK^T -- limbs, norms, K-repeated / K-concatenated limbs -- and the values'
+            # limbs and norms formed once per attention, not once per query-row chunk)
+            (_dit_precise, "B_SIDE_REUSE", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:

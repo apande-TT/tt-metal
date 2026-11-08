@@ -929,6 +929,13 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     entry per b_rep consecutive entries of a (a's entry e uses b's entry e // b_rep) -- never materialised when the
     batched kernel takes it. b_pre: (b's limbs, b's column norms) formed earlier (b itself then unused: None)."""
     cfg = precise_config()
+    keep_b = False
+    if B_SIDE_CACHE is not None and b_pre is None and b is not None and exact and EXACT_MODE == "guarded":
+        ent = B_SIDE_CACHE.get(("b", id(b), transpose_b, limbs))
+        if ent is None or ent[0] is not b:
+            ent = (b, split_bf16(b, limbs), _col_norms(b, transpose_b, cache=False))
+            B_SIDE_CACHE[("b", id(b), transpose_b, limbs)] = ent
+        b_pre, keep_b = (ent[1], ent[2]), True
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
@@ -957,7 +964,9 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = t if y is None else ttnn.add(y, t)
         return y
     if EXACT_MODE == "guarded":
-        return _guarded_terms(mm, terms, a, b, transpose_b, b_rep=b_rep, b_norm=None if b_pre is None else b_pre[1])
+        return _guarded_terms(
+            mm, terms, a, b, transpose_b, b_rep=b_rep, b_norm=None if b_pre is None else b_pre[1], keep_b=keep_b
+        )
     ests = []
     for pattern in LANE_PATTERNS:
         y = None
@@ -1008,7 +1017,32 @@ def _b_side_lanes(pa, pb, transpose_b):
     return None if lanes is None else [ttnn.view(t, sb) for t in lanes]
 
 
-def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
+def _b_side(keep_b, tag, key, make):
+    """make() -- or, with keep_b (b's limbs come from B_SIDE_CACHE), its value cached there under (tag, key) for the
+    rest of the owner's row chunks. Returns (value, cached): a cached value is freed by the cache's owner."""
+    if not keep_b or B_SIDE_CACHE is None:
+        return make(), False
+    k = (tag,) + tuple(id(t) for t in key)
+    ent = B_SIDE_CACHE.get(k)
+    if ent is None or any(x is not y for x, y in zip(ent[0], key)):
+        ent = (tuple(key), make())
+        B_SIDE_CACHE[k] = ent
+    return ent[1], True
+
+
+def free_b_side(cache):
+    """Free what a B_SIDE_CACHE dict holds (b's limbs, norms, repeated / K-concatenated limbs; never b itself)."""
+    for k, ent in cache.items():
+        vals = [ent[1], ent[2]] if k[0] == "b" else [ent[1]]
+        held = ent[0] if k[0] == "b" else None
+        for v in vals:
+            for t in v if isinstance(v, (tuple, list)) else (v,):
+                if t is not None and t is not held:
+                    ttnn.deallocate(t)
+    cache.clear()
+
+
+def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=False):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
     (pa0, pb0), rest = terms[0], terms[1:]
@@ -1047,10 +1081,13 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
             stacked = LANE_KSTACK(pa0)
         if stacked is not None:
             xs, neg0 = stacked
-            kr = LANE_STACK(pb0, len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided")))
+            n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
+            # (a padded lead limb is formed per call: cached only when it is the cached limb itself)
+            kr, kr_kept = _b_side(keep_b and pb0 is terms[0][1], "kr", (pb0,), lambda: LANE_STACK(pb0, n_lanes))
             acc.push(mm(xs, kr))
             ttnn.deallocate(xs)
-            ttnn.deallocate(kr)
+            if not kr_kept:
+                ttnn.deallocate(kr)
         else:
             lanes, neg0 = _lead_lanes(pa0)
             for lane in lanes:
@@ -1064,10 +1101,13 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
         # limbs ([a_i | ...] @ [b_j | ...]^T): one float32 output instead of len(rest), summed in the matmul's fp32 DST
         def _kcat_rest():
             ac = ttnn.concat([pa for pa, _ in rest], dim=-1)
-            bc = ttnn.concat([pb for _, pb in rest], dim=-1)
+            bc, bc_kept = _b_side(
+                keep_b, "kcat", [pb for _, pb in rest], lambda: ttnn.concat([pb for _, pb in rest], dim=-1)
+            )
             r = mm(ac, bc)
             ttnn.deallocate(ac)
-            ttnn.deallocate(bc)
+            if not bc_kept:
+                ttnn.deallocate(bc)
             return r
 
         first = [_kcat_rest]
@@ -1425,3 +1465,8 @@ REST_KCAT = False
 
 # Optional: the guard's row / column norms staged in L1 for the tolerance outer product (see _guarded).
 NORMS_L1 = False
+
+# Within one row-chunked product against a fixed b (the denoiser's query-row score chunks against the same keys):
+# a dict that keeps b's limbs and column norms, its K-repeated lead limb and its K-concatenated trailing limbs from
+# the first chunk for the rest (None = formed per call). Its owner frees it with free_b_side when the chunks are done.
+B_SIDE_CACHE = None
