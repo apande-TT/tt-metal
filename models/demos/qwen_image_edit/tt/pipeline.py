@@ -30,6 +30,7 @@ Mesh: Galaxy, 32 Wormhole chips as an 8x4 mesh (build_pipeline reshapes a 1x32 /
 from __future__ import annotations
 
 import gc
+import math
 import os
 import time
 
@@ -158,6 +159,18 @@ def to_host(t):
 
 class PreparedInputs:
     """Device-resident encoded inputs for one batched image_edit call (uploaded once, outside the forward)."""
+
+
+def _one_row_limb_linear(hi, lo, w, bias_rows):
+    """fused_limb_linear + bias for limbs of a single tile row with K < N (the timestep MLP's linear_1), its output
+    columns split over the grid columns (wide_groups); None for any other shape."""
+    if lo is None or math.prod(int(d) for d in list(hi.padded_shape)[:-1]) != 32:
+        return None
+    if int(w.padded_shape[-2]) >= int(w.padded_shape[-1]):
+        return None
+    return fused_limb_linear(
+        hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=True, bias_rows=bias_rows, chunk_tiles=128, full_dest=True
+    )
 
 
 def _limb_linear_config(x, w):
@@ -314,6 +327,7 @@ class QwenImageEditTT:
             hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=False, chunk_tiles=128, full_dest=True
         )
         # and a column-parallel one's float32 bias added in that same pass (no separate bias add over the output)
+        # a one-tile-row one (the timestep MLP's, no whole rows to deal over the grid) takes the grid-column groups
         _tr_precise.LIMB_LINEAR_BIAS_FN = lambda hi, lo, w, bias_rows: fused_limb_linear(
             hi,
             lo,
@@ -324,7 +338,7 @@ class QwenImageEditTT:
             chunk_tiles=128,
             heads_out=_tr_precise.HEADS_OUT,
             full_dest=True,  # 8 float32 DEST tiles: 4-column output blocks
-        )
+        ) or _one_row_limb_linear(hi, lo, w, bias_rows)
         _tr_precise.MATMUL_PRODUCTS_L1 = True  # the attention P @ V limb products and their partial sum in L1
         _tr_precise.MATMUL_A_L1 = True  # and P's bf16 limbs split straight into L1 for them
         # and the three limb products + two adds as one kernel over the full grid (P's rows read once per row block)
