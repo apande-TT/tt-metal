@@ -1153,12 +1153,19 @@ def pad_rows(array, s_pad):
     return out
 
 
+# softmax_f32's exp(s - max) as the subtract's post-activation: one pass over the scores, not two.
+SOFTMAX_FUSED_EXP = True
+
+
 def softmax_f32(scores, compute_kernel_config=None):
     """float32 softmax along the last dim, written out rather than fused: the fused op mis-scales some
     masked window rows (one token of block 12 measured 6.7% off with exact inputs). Both precise paths
     and the segmented one take it from here so the three cannot drift apart."""
     mx = ttnn.max(scores, dim=-1, keepdim=True)
-    e = ttnn.exp(ttnn.subtract(scores, mx))
+    if SOFTMAX_FUSED_EXP:  # exp(s - max) in the subtract's own pass (exp_tile<0>, ttnn.exp's exact exp)
+        e = ttnn.subtract(scores, mx, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 0.0)])
+    else:
+        e = ttnn.exp(ttnn.subtract(scores, mx))
     return ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=compute_kernel_config))
 
 

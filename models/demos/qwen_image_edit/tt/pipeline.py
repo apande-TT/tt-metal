@@ -362,6 +362,7 @@ class TtQwenImageEditPipeline:
         st.rotary = self.transformer.rotary(up.img_shapes, prompt_embeds.shape[1])
         return st
 
+    # (the encoders' float32 softmax fuses its exp into the max-subtract too: _te_attention.SOFTMAX_FUSED_EXP)
     @contextlib.contextmanager
     def _denoise_extras(self):
         """Denoise-only hooks entered after _fused_tail (so they override its BMM_CONFIG): the few-entry QK^T limb
