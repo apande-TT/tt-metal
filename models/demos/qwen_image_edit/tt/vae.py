@@ -138,6 +138,7 @@ class TtQwenVAE:
         with _host_weight_prep() if HOST_WEIGHT_PREP else contextlib.nullcontext():
             # the edit image is a single frame too: the encoder's causal convs keep only their live temporal
             # tap, so neither their T front pad nor its zero frames' MACs run
+            qwen_image_encoder3d.BATCH_GATHER_TILED = True  # its batch gather on the tiled latent
             self.encoder = qwen_image_encoder3d.build(
                 device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=4
             )

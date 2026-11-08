@@ -31,6 +31,10 @@ _H_AXIS = 0
 _W_AXIS = 1
 
 
+# the batch-parallel output gather on the tiled latent (the tilize that follows it moved before it)
+BATCH_GATHER_TILED = False
+
+
 class TtQwenImageEncoder3d:
     def __init__(self, device, torch_module, batch_parallel=False, single_frame=False, blocking=None, ccl_links=1):
         """batch_parallel: split the batch over mesh axis 0 (DP) instead of partitioning H there. The
@@ -120,6 +124,8 @@ class TtQwenImageEncoder3d:
             if (oh, ow) != (lh, lw):
                 out = ttnn.slice(out, (0, 0, 0, 0, 0), (ob, ot, lh, lw, oc))
         if self.batch_axis is not None:
+            if BATCH_GATHER_TILED:  # its last two dims tile aligned: the native tiled gather, not a row-major broadcast
+                out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
             out = self.ccl_manager.all_gather(out, dim=0, mesh_axis=self.batch_axis, use_hyperparams=False)
 
         out = ttnn.to_layout(out, ttnn.TILE_LAYOUT)
