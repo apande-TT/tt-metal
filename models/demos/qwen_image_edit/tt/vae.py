@@ -142,6 +142,9 @@ class TtQwenVAE:
             self.encoder = qwen_image_encoder3d.build(
                 device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=4
             )
+            # the latents' 1x1x1 convs (a few thousand tokens, K = 32 / 16) replicated on every chip: no token split
+            # and no row-major gathers over the mesh (~6 ms each)
+            vae_pointwise.REPLICATED_MAX_TOKENS = 64 * 1024
             self.quant_conv = vae_pointwise.build(device, hf_vae.quant_conv)
             self.post_quant_conv = vae_pointwise.build(device, hf_vae.post_quant_conv)
             # its gathered 3-channel output turned BCTHW by tile transposes + whole-row moves, never as 12-byte rows

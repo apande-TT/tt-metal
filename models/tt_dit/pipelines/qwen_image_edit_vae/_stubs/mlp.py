@@ -23,6 +23,8 @@ from models.tt_dit.parallel.manager import CCLManager
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs._mesh import mesh_shape, pad_to_multiple, physical_grid
 
 _TOKEN_DIM = 2
+# up to this many tokens the projection runs replicated on every chip instead of token-split + gathered (0: always split)
+REPLICATED_MAX_TOKENS = 0
 
 
 class TtQwenImagePointwiseProj:
@@ -71,6 +73,13 @@ class TtQwenImagePointwiseProj:
         n_tokens = B * T * H * W
 
         x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
+        if n_tokens <= REPLICATED_MAX_TOKENS and n_tokens % 32 == 0:
+            # few tokens: every chip projects all of them (each token's row is the same one-tile-K product either
+            # way), so no token split and no row-major gathers back over the mesh
+            x = ttnn.reshape(x, (1, 1, n_tokens, C))
+            out = ttnn.linear(x, self.weight, bias=self.bias, compute_kernel_config=self.compute_kernel_config)
+            out = ttnn.reshape(out, (B, T, H, W, self.out_channels))
+            return ttnn.permute(out, (0, 4, 1, 2, 3))  # BCTHW
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
         x = ttnn.reshape(x, (1, 1, n_tokens, C))
         x, _ = pad_to_multiple(x, _TOKEN_DIM, self.tp)
