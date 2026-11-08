@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import ttnn
 
+# the lookup's output left ROW_MAJOR (the caller splices rows at unaligned offsets, then tilizes once)
+OUT_ROW_MAJOR = False
+
 
 class TtTokenEmbed:
     """On a mesh the table is sharded over the TP (column) axis by hidden dim -- 3584 / 4 columns per
@@ -36,7 +39,8 @@ class TtTokenEmbed:
             input_ids = ttnn.typecast(input_ids, ttnn.uint32)
         if input_ids.layout != ttnn.ROW_MAJOR_LAYOUT:
             input_ids = ttnn.to_layout(input_ids, ttnn.ROW_MAJOR_LAYOUT)
-        out = ttnn.embedding(input_ids, self.weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        layout = ttnn.ROW_MAJOR_LAYOUT if OUT_ROW_MAJOR else ttnn.TILE_LAYOUT
+        out = ttnn.embedding(input_ids, self.weight, layout=layout, dtype=ttnn.bfloat16)
         if self.tp > 1:
             out = ttnn.all_gather(
                 out, dim=len(out.shape) - 1, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear

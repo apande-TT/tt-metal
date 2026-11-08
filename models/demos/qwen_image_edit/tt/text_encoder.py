@@ -44,6 +44,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
     vision_transformer_pretrained_model,
 )
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.demos.qwen_image_edit_text_encoder._stubs import token_embed as _te_embed_mod
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import MASK_NEG, pad_to_tile
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
 
@@ -211,6 +212,7 @@ class TtQwenTextEncoder:
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
         _te_stack.VISION_MLP_FUSED_SILU = True  # the vision MLP's SiLU likewise
+        _te_embed_mod.OUT_ROW_MAJOR = True  # token embeddings row major: the image splice slices them unaligned
         _te_stack.VISION_MLP_RESIDUAL_FUSED = True
         _te_stack.VISION_ATTN_RESIDUAL_FUSED = True  # and its attention's (x + attn)
         _te_stack.NORM_L1_BYTES = 8 * 1024 * 1024  # the vision RMSNorm's x * x and x * rsqrt (7.2 MB) in L1
@@ -416,6 +418,9 @@ class TtQwenTextEncoder:
         # HF: inputs_embeds.masked_scatter(image_mask, image_embeds) in the embeddings' dtype (float32 in
         # the golden): splice in float32 (the bf16 table values are exact in float32)
         img = ttnn.typecast(img, ttnn.float32)
+        rm = _te_embed_mod.OUT_ROW_MAJOR  # row-major splice: unaligned row slices, no untilize
+        if rm:
+            img = ttnn.to_layout(img, ttnn.ROW_MAJOR_LAYOUT)
         cos, sin = self._rope(p.positions)
         drop = PROMPT_TEMPLATE_DROP
         prefix = getattr(p, "prefix", None)
@@ -430,6 +435,8 @@ class TtQwenTextEncoder:
             x = ttnn.concat(
                 [ttnn.slice(t, [0, 0, 0], [B, a, C]), img, ttnn.slice(t, [0, a + m, 0], [B, s_pad, C])], dim=1
             )  # sequence lo + b uses condition image b
+            if rm:
+                x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
             x = ttnn.reshape(x, (B, 1, s_pad, C))
             if lo and prefix:
                 # negatives: run [P, P + su) only, attending to the prompts' cached prefix K/V
