@@ -767,6 +767,20 @@ BMM_CONCAT_K = False
 LIMB_BMM_FN = None
 
 
+# LIMB_BMM_FN's operand limbs split straight into L1 when an operand's two limbs take at most this many bytes (0: the
+# split's default placement)
+BMM_LIMBS_L1_BYTES = 0
+
+
+def _bmm_limbs(x):
+    """split_bf16(x, 2) for LIMB_BMM_FN, into L1 within BMM_LIMBS_L1_BYTES."""
+    x32 = x if x.dtype == ttnn.float32 else None
+    if BMM_LIMBS_L1_BYTES and SPLIT_FN is not None and x32 is not None and x32.layout == ttnn.TILE_LAYOUT:
+        if not x32.is_sharded() and 2 * 2 * math.prod(int(d) for d in x32.padded_shape) <= BMM_LIMBS_L1_BYTES:
+            return tuple(SPLIT_FN(x32, ttnn.L1_MEMORY_CONFIG))
+    return split_bf16(x, 2)
+
+
 def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
@@ -774,7 +788,7 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     cfg = precise_config()
     if not exact and limbs == 2 and LIMB_BMM_FN is not None and not transpose_b:
         # the three limb terms in one C++ program (b as [K, N]: P @ V)
-        pa2, pb2 = split_bf16(a, 2), split_bf16(b, 2)
+        pa2, pb2 = _bmm_limbs(a), _bmm_limbs(b)
         y = LIMB_BMM_FN(pa2[0], pa2[1], pb2[0], pb2[1])
         for t in list(pa2) + list(pb2):
             ttnn.deallocate(t)
