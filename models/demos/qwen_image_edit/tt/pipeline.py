@@ -169,7 +169,7 @@ def _one_row_limb_linear(hi, lo, w, bias_rows):
     if int(w.padded_shape[-2]) >= int(w.padded_shape[-1]):
         return None
     return fused_limb_linear(
-        hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, wide_groups=True, bias_rows=bias_rows, chunk_tiles=128, full_dest=True
+        hi, lo, w, ttnn.L1_MEMORY_CONFIG, wide_groups=True, bias_rows=bias_rows, chunk_tiles=128, full_dest=True
     )
 
 
