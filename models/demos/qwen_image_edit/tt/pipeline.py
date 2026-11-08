@@ -97,7 +97,9 @@ def bmm_config_2d(p, q, transpose_b=False):
     for d in ps[:-2]:
         batch *= d
     grid = q.device().compute_with_storage_grid_size()
-    if kt > 20 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
+    # (K up to 32 tiles: the K-stacked exact-lane QK^T, 8 lanes x 128, takes it too -- a narrower K block keeps its
+    # 3 x 38-tile blocks within L1)
+    if kt > 32 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
         return None
     key = (mt, kt, nt, grid.x, grid.y)
     if key not in _BMM_2D:
@@ -107,7 +109,7 @@ def bmm_config_2d(p, q, transpose_b=False):
         sbh = _divisor_upto(pcm, max(1, 4 // sbw))
         _BMM_2D[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
-            in0_block_w=_divisor_upto(kt, 4),
+            in0_block_w=_divisor_upto(kt, 4 if kt <= 20 else 2),
             out_subblock_h=sbh,
             out_subblock_w=sbw,
             out_block_h=pcm,
