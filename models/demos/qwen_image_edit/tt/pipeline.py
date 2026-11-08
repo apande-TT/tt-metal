@@ -383,6 +383,11 @@ class TtQwenImageEditPipeline:
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._hook(
             _te_attention, "BMM_CONFIG", bmm_config_2d if self.bmm_config else None
+        ), self._hook(
+            # (the score chunks' query rows a whole number of grid rows -- 768, not 864 -- so the QK^T 2D config fills 8x8)
+            _dit_precise,
+            "SCORE_ROW_ALIGN",
+            32 * self.device.compute_with_storage_grid_size().y,
         ):
             v = self.transformer(x_in, t, st.prompt, st.rotary)
         v = ttnn.slice(v, [0, 0, 0], [B, S, C])  # noise_pred[:, : latents.size(1)]

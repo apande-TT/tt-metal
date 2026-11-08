@@ -274,6 +274,14 @@ class TtQwenJointAttention:
         2.1 GB: a full-resolution denoise step died inside this product on a 943,718,400 B buffer with 662 MB
         free. A softmax row reads only its own scores, so the rows can be cut."""
         chunk = _precise.score_rows(kh.shape[-2])
+        align = _precise.SCORE_ROW_ALIGN
+        if align > _precise.TILE:  # query rows per chunk a multiple of `align` (a whole number of grid rows)
+            per = 1
+            for s in list(q.shape)[:-2]:
+                per *= s
+            step = chunk // per // align * align
+            if step >= align:
+                chunk = step * per
         if _precise.row_cuts(q.shape, chunk, dim=-2) is None:
             return self._attend_rows(q, kh, kl, v, mask_add)
         # mask_add is [B, 1, 1, Sk]: one value per KEY, so every row chunk reads the same one

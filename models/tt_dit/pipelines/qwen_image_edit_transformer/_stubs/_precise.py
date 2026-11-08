@@ -181,6 +181,11 @@ WHOLE_ROWS_BYTES = 80 * 1024 * 1024
 CHUNK_ROWS_BYTES = 48 * 1024 * 1024
 
 
+# Query rows per attention score chunk rounded down to a multiple of this (TILE: no extra rounding). The denoise
+# stage sets 32 x grid rows, so the chunk's M tiles split evenly over the grid's rows in the QK^T products.
+SCORE_ROW_ALIGN = TILE
+
+
 def score_rows(keys):
     """Rows per chunk for an attention whose scores are `keys` float32 columns wide: as many as fill
     CHUNK_ROWS_BYTES of them. Counted over every leading dim, the way row_cuts counts rows, so a chunk holds
