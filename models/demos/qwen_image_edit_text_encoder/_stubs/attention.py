@@ -437,7 +437,14 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     limb terms' first product) when given; nn = mm(-x), the negated-input product before its sign is restored.
     The negation and the |ex - dn| are fused into the binary ops that consume them and the slack scales the
     [.., M, 1] norm, so no output-sized pass is spent on any of them."""
-    tol = ttnn.multiply(ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12), b_norm)
+    if NORMS_L1:  # the outer product re-reads a broadcast operand tile per output tile: from L1, not DRAM
+        a_norm = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12, memory_config=ttnn.L1_MEMORY_CONFIG)
+        b_norm = ttnn.to_memory_config(b_norm, ttnn.L1_MEMORY_CONFIG)
+        tol = ttnn.multiply(a_norm, b_norm, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(a_norm)
+        ttnn.deallocate(b_norm)
+    else:
+        tol = ttnn.multiply(ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12), b_norm)
     if rest_fn is not None and GUARD_TAIL is not None:
         y = GUARD_TAIL(ex, dn, nn, tol, rest_fn) if rest2_fn is None else GUARD_TAIL(ex, dn, nn, tol, rest_fn, rest2_fn)
         if y is not None:
@@ -1414,3 +1421,7 @@ def attention(device, torch_module=None):
 
 # Optional: a transpose_b guarded product's trailing limb terms as one K-concatenated product (see _guarded_terms).
 REST_KCAT = False
+
+
+# Optional: the guard's row / column norms staged in L1 for the tolerance outer product (see _guarded).
+NORMS_L1 = False

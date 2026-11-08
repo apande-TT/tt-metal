@@ -336,6 +336,7 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "SCORE_ROW_ALIGN", 32 * self.device.compute_with_storage_grid_size().y),
             # (the QK^T's five trailing limb terms as ONE K-concatenated product: one fp32 output, not five)
             (_te_attention, "REST_KCAT", True),
+            (_te_attention, "NORMS_L1", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:
