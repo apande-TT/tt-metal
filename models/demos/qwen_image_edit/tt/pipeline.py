@@ -97,7 +97,7 @@ def bmm_config_2d(p, q, transpose_b=False):
     for d in ps[:-2]:
         batch *= d
     grid = q.device().compute_with_storage_grid_size()
-    if kt > 4 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
+    if kt > 20 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
         return None
     key = (mt, kt, nt, grid.x, grid.y)
     if key not in _BMM_2D:
@@ -107,7 +107,7 @@ def bmm_config_2d(p, q, transpose_b=False):
         sbh = _divisor_upto(pcm, max(1, 4 // sbw))
         _BMM_2D[key] = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=(grid.x, grid.y),
-            in0_block_w=kt,
+            in0_block_w=_divisor_upto(kt, 4),
             out_subblock_h=sbh,
             out_subblock_w=sbw,
             out_block_h=pcm,
@@ -334,6 +334,8 @@ class TtQwenImageEditPipeline:
         hooks = (
             (_te_attention, "BMM_CONFIG", bmm_config_2d if self.bmm_config else None),
             (_dit_precise, "SCORE_ROW_ALIGN", 32 * self.device.compute_with_storage_grid_size().y),
+            # (the QK^T's five trailing limb terms as ONE K-concatenated product: one fp32 output, not five)
+            (_te_attention, "REST_KCAT", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:

@@ -1051,7 +1051,21 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
                 ttnn.deallocate(lane)
     ex = acc.value()
     dn = mm(pa0, pb0_l1)
-    first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
+    kcat = REST_KCAT and transpose_b and b_rep == 1 and len(rest) > 1
+    if kcat:
+        # every trailing limb term is only added after the guard, so they are ONE product over the K-concatenated
+        # limbs ([a_i | ...] @ [b_j | ...]^T): one float32 output instead of len(rest), summed in the matmul's fp32 DST
+        def _kcat_rest():
+            ac = ttnn.concat([pa for pa, _ in rest], dim=-1)
+            bc = ttnn.concat([pb for _, pb in rest], dim=-1)
+            r = mm(ac, bc)
+            ttnn.deallocate(ac)
+            ttnn.deallocate(bc)
+            return r
+
+        first = [_kcat_rest]
+    else:
+        first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
     neg0 = ttnn.neg(pa0) if neg0 is None else neg0
     nn = mm(neg0, pb0_l1)
     if pb0_l1 is not pb0:
@@ -1062,6 +1076,8 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None):
         b_norm = _repeat_entries(b_norm, b_rep)
     y = _guarded(ex, dn, nn, _norm_last(a), b_norm, *first)
     # the further terms (3 limbs: three more) summed after it, in order, through the lane-sum pass
+    if kcat:
+        return y
     acc = _LaneAcc()
     acc.push(y)
     for pa, pb in rest[2:]:
@@ -1394,3 +1410,7 @@ def build(device, torch_module=None):
 
 def attention(device, torch_module=None):
     return TtVisionAttention(device, torch_module)
+
+
+# Optional: a transpose_b guarded product's trailing limb terms as one K-concatenated product (see _guarded_terms).
+REST_KCAT = False
