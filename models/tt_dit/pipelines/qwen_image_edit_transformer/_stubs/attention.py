@@ -312,6 +312,15 @@ class TtQwenJointAttention:
             e = ttnn.subtract(s, mx, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 0.0)])
         else:
             e = ttnn.exp(ttnn.subtract(s, mx))
+        if _precise.ENABLED and _precise.SOFTMAX_DEFER_DIV:
+            # (e @ v) / rowsum(e) == (e / rowsum(e)) @ v: the division on the [.., Sq, D] output, not the scores
+            sm = ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+            o = _precise.matmul(e, v)
+            ttnn.deallocate(e)
+            o2 = ttnn.divide(o, sm)
+            ttnn.deallocate(o)
+            ttnn.deallocate(sm)
+            return o2
         p = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi))
         if _precise.ENABLED:
             o = _precise.matmul(p, v)  # float32 [B, Hl, Sq, D]

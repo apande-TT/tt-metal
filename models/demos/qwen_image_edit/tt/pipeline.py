@@ -381,6 +381,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "QK_STACK_FIDELITY", ttnn.MathFidelity.HiFi3),
             # (the softmax's exp(s - max) fused into the subtract: one pass over the float32 scores, not two)
             (_dit_precise, "SOFTMAX_FUSED_EXP", True),
+            # (and its division by the row sum applied to the [.., Sq, D] P @ V output instead of the scores)
+            (_dit_precise, "SOFTMAX_DEFER_DIV", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:

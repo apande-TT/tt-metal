@@ -189,6 +189,8 @@ SCORE_ROW_ALIGN = TILE
 B_SIDE_REUSE = False
 # The joint attention's softmax exp(s - max) as the subtract's post-activation (one pass over the scores, not two).
 SOFTMAX_FUSED_EXP = False
+# The softmax's division moved past P @ V: (e @ v) / rowsum(e), a [.., Sq, D] pass instead of a score-sized one.
+SOFTMAX_DEFER_DIV = False
 
 
 def score_rows(keys):
