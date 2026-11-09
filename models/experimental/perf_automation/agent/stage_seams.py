@@ -50,6 +50,23 @@ OPTIONAL = (INPUTS, ITEMS, SPLIT, SEQ_SPLIT, REPEATS)
 
 ALL = REQUIRED + OPTIONAL
 
+# THE WORKLOAD'S PROMPT, OFFERED TO A STAGE'S INPUTS HOOK under this keyword when the hook accepts it:
+# [batch, ISL] token ids, one row per user, the request the run declares. A hook without the parameter
+# keeps assembling its own inputs from the captured golden, and the length that stage really ran on
+# is reported (PROMPT_TOKENS_MARK) instead of assumed. MiniCPM's zero-arg hooks timed decode on its
+# captured 20-token request (99 tok/s/u) while the run quoted, and priced KV at, ISL 128 (93 served).
+INPUTS_PROMPT_ARG = "prompt_ids"
+
+# THE PROMPT LENGTH A STAGE WAS MEASURED ON, printed beside its time: TRACE_STAGE_PROMPT_TOKENS[<stage>]=<n>.
+# The declared ISL is what the run asked for; this is what the stage's inputs carried, so a report can
+# label and price the context the number was taken at.
+PROMPT_TOKENS_MARK = "TRACE_STAGE_PROMPT_TOKENS"
+
+
+def prompt_tokens_line(stage: str, tokens: int) -> str:
+    """The marker line saying `stage` was measured on a `tokens`-long prompt."""
+    return "%s[%s]=%d" % (PROMPT_TOKENS_MARK, stage, int(tokens))
+
 
 # The tensor-parallel degree a pipeline runs at, when it states one -- read off the pipeline, never
 # assumed from the mesh the operator typed: a 4x8 Galaxy can run TP=8 x DP=4 or TP=4 x DP=8, and only

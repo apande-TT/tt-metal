@@ -3352,6 +3352,11 @@ For EACH stage expose, ON THE PIPELINE object, the generic contract the perf eng
     calls to obtain the stage's inputs with NO per-model knowledge -- the model-specific assembly (which
     captured tensors, in what order, plus any fixed extras) lives HERE, behind this fixed name. It MUST
     exist for every stage that has _trace_setup/_trace_step, or the perf test cannot drive the stage.
+    A stage that consumes the text prompt, or decodes after one, takes ONE optional keyword,
+    <stage>_trace_inputs(prompt_ids=None): when the perf engine passes prompt_ids (a [batch, ISL]
+    int64 tensor, the run's declared prompt, one row per user), build the inputs from THOSE ids
+    instead of the captured request, so the stage is timed at the ISL the run reports; with None,
+    fall back to the captured request as above. A stage that does not consume the prompt omits it.
   <stage>_trace_items(): ZERO-ARG. Returns how many ITEMS one call of _trace_step retires -- the
     TOTAL for that one call, batch included. This is the ONLY input to the stage's arithmetic
     ceiling, which is 2 x params x items: a stage that does not state it is priced at ONE item, so

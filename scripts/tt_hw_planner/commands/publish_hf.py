@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -150,6 +151,127 @@ def _yaml_quote(s: str) -> str:
     return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# The vLLM TT plugin's own names for on-chip sampling: the capability a generator class declares, and
+# the launch setting that turns it on. The plugin's vocabulary, not any model's.
+_CAPS_ATTR = "model_capabilities"
+_CAP_SAMPLE_ON_DEVICE = "supports_sample_on_device"
+_PLUGIN_CONFIG_KEY = "tt"
+_SAMPLE_MODE_KEY = "sample_on_device_mode"
+# Decode tokens sampled on the chip; a request's single prefill sample stays on the host. Unset, the
+# plugin samples every decode step on the host: a stock-generator MiniCPM package served 32 users at
+# 54 tok/s/user that way, ~89 with decode sampled on the chip.
+_SAMPLE_MODE_DEFAULT = "decode_only"
+# How far to follow a class's bases looking for its capabilities. Generators sit one or two levels
+# above the adapter class, so this only bounds a cycle.
+_CAPS_MAX_DEPTH = 6
+
+
+# Finds a module's file the way the import system would, importing only its parent packages.
+_FIND_MODULE_FILE = (
+    "import importlib, importlib.machinery, sys\n"
+    "m = sys.argv[1]\n"
+    "parent = importlib.import_module(m.rpartition('.')[0])\n"
+    "s = importlib.machinery.PathFinder.find_spec(m, list(parent.__path__))\n"
+    "print(s.origin if s and s.origin else '')\n"
+)
+
+
+def _module_file(checkout: Path, module: str) -> Path | None:
+    """The source file of dotted `module` inside `checkout`, or None. A dotted path can be an import-only
+    alias with no file of its own (a package moved, its old name kept by a meta-path finder), so when
+    nothing sits at the plain path the parent packages are imported in a child interpreter rooted at
+    the checkout -- nothing of the checkout is loaded into this process -- and the file they resolve
+    to is read instead. The child skips site-packages (-S) so an installed package of the same name
+    cannot stand in for the checkout's."""
+    base = Path(checkout) / Path(*module.split("."))
+    for cand in (base.with_suffix(".py"), base / "__init__.py"):
+        if cand.is_file():
+            return cand
+    if "." not in module:
+        return None
+    try:
+        r = subprocess.run(
+            [sys.executable, "-S", "-W", "ignore", "-c", _FIND_MODULE_FILE, module],
+            cwd=str(checkout),
+            env={**os.environ, "PYTHONPATH": str(checkout)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    origin = (r.stdout or "").strip().splitlines()[-1:] if r.returncode == 0 else []
+    return Path(origin[0]) if origin and Path(origin[0]).is_file() else None
+
+
+def _class_capabilities(checkout: Path, module_file: Path, cls: str, _depth: int = 0) -> dict | None:
+    """The literal `model_capabilities` dict class `cls` in `module_file` declares or inherits, following
+    its bases through that file's `from X import Y [as Z]` imports into `checkout`. Read from source, so
+    nothing is imported. None when no class in the chain states it as a literal: unknown, not False."""
+    import ast
+
+    if module_file is None or _depth > _CAPS_MAX_DEPTH:
+        return None
+    try:
+        tree = ast.parse(Path(module_file).read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    imported = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                imported[alias.asname or alias.name] = (node.module, alias.name)
+    for node in tree.body:
+        if not (isinstance(node, ast.ClassDef) and node.name == cls):
+            continue
+        for st in node.body:
+            if isinstance(st, ast.Assign):
+                targets, value = st.targets, st.value
+            elif isinstance(st, ast.AnnAssign):
+                targets, value = [st.target], st.value
+            else:
+                continue
+            if value is None or not any(isinstance(t, ast.Name) and t.id == _CAPS_ATTR for t in targets):
+                continue
+            try:
+                caps = ast.literal_eval(value)
+            except Exception:  # noqa: BLE001
+                return None
+            return dict(caps) if isinstance(caps, dict) else None
+        for base in node.bases:
+            if not isinstance(base, ast.Name):
+                continue
+            if base.id in imported:
+                mod, name = imported[base.id]
+                caps = _class_capabilities(checkout, _module_file(checkout, mod), name, _depth + 1)
+            else:
+                caps = _class_capabilities(checkout, module_file, base.id, _depth + 1)
+            if caps is not None:
+                return caps
+        return None
+    return None
+
+
+def _with_declared_device_sampling(additional: dict, checkout: Path, bundle_dir: Path, main_class) -> dict:
+    """`additional` (the bundle's additional_config) with on-chip decode sampling turned on when the
+    class the package serves declares it supports it and the author stated no sampling mode. The
+    author's settings are never changed, including an explicit mode of None."""
+    tt = (additional or {}).get(_PLUGIN_CONFIG_KEY)
+    if (tt is not None and not isinstance(tt, dict)) or (isinstance(tt, dict) and _SAMPLE_MODE_KEY in tt):
+        return additional
+    mod, _, cls = str(main_class or "").partition(":")
+    if not (mod and cls):
+        return additional
+    caps = _class_capabilities(checkout, _module_file(bundle_dir, mod), cls)
+    if not (caps or {}).get(_CAP_SAMPLE_ON_DEVICE):
+        return additional
+    print(
+        f"  [publish-hf] serve: {cls} declares {_CAP_SAMPLE_ON_DEVICE} and the bundle sets no "
+        f"{_SAMPLE_MODE_KEY}; serving with {_SAMPLE_MODE_KEY}={_SAMPLE_MODE_DEFAULT} (decode sampled on the chip)"
+    )
+    return {**(additional or {}), _PLUGIN_CONFIG_KEY: {**(tt or {}), _SAMPLE_MODE_KEY: _SAMPLE_MODE_DEFAULT}}
+
+
 def _write_tt_model_yaml(
     path: Path,
     *,
@@ -202,6 +324,9 @@ def _write_tt_model_yaml(
             _sa = _md.get("serve_args")
             if isinstance(_sa, list):
                 serve_extra_args = [str(x) for x in _sa]
+            serve_additional = _with_declared_device_sampling(
+                serve_additional, Path(checkout), _bm.parent, _md.get("main_class")
+            )
     except Exception:
         pass
     arch = arch or a
@@ -1890,8 +2015,20 @@ def _time_served_decode(base_url: str, model: str, users: int, osl: int = 128, t
     }
 
 
-def _serve_gate_problems(optimized, one_user: dict, many: dict | None, eager_lines: list, min_ratio: float) -> list:
-    """Why the built package must not be uploaded; empty when it serves at its optimized speed."""
+def _serve_gate_problems(
+    optimized,
+    one_user: dict,
+    many: dict | None,
+    eager_lines: list,
+    min_ratio: float,
+    optimized_batch: int | None = None,
+) -> list:
+    """Why the built package must not be uploaded; empty when it serves at its optimized speed.
+
+    `optimized_batch` is the batch the optimized tok/s/user was measured at. When the concurrent
+    timing ran that many users, their per-user speed is held to the same bar as the 1-user one: a
+    package sampling every decode step on the host served 1 user near its optimized speed and 32 at
+    about half of it, and the 1-user check alone passed it."""
     problems = []
     if eager_lines:
         problems.append("the server decodes without its trace (%s)" % eager_lines[0][:240])
@@ -1907,6 +2044,19 @@ def _serve_gate_problems(optimized, one_user: dict, many: dict | None, eager_lin
             "only %d of %d concurrent requests completed (%s)"
             % (many.get("completed", 0), many["users"], (many.get("errors") or [many.get("error")])[0])
         )
+    elif (
+        many
+        and many.get("per_user")
+        and optimized
+        and optimized_batch
+        and int(optimized_batch) == int(many["users"])
+        and many["per_user"] < min_ratio * optimized
+    ):
+        problems.append(
+            "%d users at once decode at %.1f tok/s/user, under %d%% of the %.1f tok/s/user the model was "
+            "optimized to at batch %d"
+            % (many["users"], many["per_user"], round(100 * min_ratio), optimized, optimized_batch)
+        )
     return problems
 
 
@@ -1914,7 +2064,8 @@ def _served_speed_gate(args, state: dict, staged) -> tuple:
     """Serve the BUILT package the way a customer will (``tt-model serve`` on its manifest) BEFORE it
     is uploaded, and time real requests: 1 user, then max_num_seqs users at once. (ok, served): not ok
     when the server cannot serve, decodes without its trace, drops concurrent requests, or decodes 1
-    user under --serve-gate-min (default 70%) of the optimized tok/s/user. A clean startup proves
+    user -- or, when the model was optimized at max_num_seqs users, that many users -- under
+    --serve-gate-min (default 70%) of the optimized tok/s/user. A clean startup proves
     nothing about speed: kolibri_1's package started cleanly and served a quarter of its traced speed."""
     import datetime as _dt
     import socket
@@ -2015,7 +2166,9 @@ def _served_speed_gate(args, state: dict, staged) -> tuple:
             )
     if optimized:
         print(f"  [publish-hf] serve gate: optimized on-device decode: {optimized:.1f} tok/s/user")
-    problems = _serve_gate_problems(optimized, one, many, _eager_serve_lines(log), min_ratio)
+    problems = _serve_gate_problems(
+        optimized, one, many, _eager_serve_lines(log), min_ratio, optimized_batch=state.get("batch")
+    )
     if problems:
         for p in problems:
             print("  [publish-hf] serve gate: FAIL -> " + p)
@@ -2475,6 +2628,14 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             else "stock generator — servable as-is"
         )
         print(f"  [publish-hf] vLLM bundle {'created' if created else 'exists'}: {bpath}  ({state_note})")
+        _own_pipeline = _demo_pipeline_module(checkout, slug) if not is_stub else None
+        if _own_pipeline:
+            print(
+                f"  [publish-hf] NOTE: this package serves the stock "
+                f"{_pick_base_generator(_arch_for_bundle, mtype)[0]} from {_GEN_MOD}, not this demo's own "
+                f"optimized pipeline ({_own_pipeline}); what customers get is the served speed, not the "
+                "optimized run's number."
+            )
 
     # A novel-arch pipeline adapter must serve out of the box: build the image from the MATCHED
     # local vLLM+plugin (no version skew) and give that plugin novel-arch support. Stock arches are

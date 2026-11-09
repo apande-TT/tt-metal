@@ -483,13 +483,69 @@ def _stated_count(pipeline, stage: str, seam: str) -> int:
         return 0
 
 
+def _accepts_keyword(fn, name: str) -> bool:
+    """Does `fn` name a parameter `name` it can take by keyword? A bare **kwargs does not count: a
+    wrapper forwarding to a zero-arg hook would accept the keyword and then raise on it."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params)
+
+
+def _is_token_tensor(t) -> bool:
+    """An integer torch tensor with a sequence axis: token ids, positions, an integer mask. Floats,
+    flags (1-byte dtypes) and device tensors are not."""
+    dt, shape = getattr(t, "dtype", None), getattr(t, "shape", None)
+    if dt is None or shape is None or len(shape) < 2:
+        return False
+    if getattr(dt, "is_floating_point", True) or getattr(dt, "is_complex", True):
+        return False
+    return int(getattr(dt, "itemsize", 0) or 0) > 1
+
+
+def request_tokens(inputs) -> int:
+    """The prompt length a stage's own inputs carry: the last axis of their integer sequence tensors,
+    when those all agree. 0 when they hold none or disagree -- unknown, never a guess."""
+    try:
+        from .stage_marks import _leaves
+
+        lengths = {int(t.shape[-1]) for t in _leaves(inputs) if _is_token_tensor(t)}
+    except Exception:  # noqa: BLE001 -- an input this cannot read says nothing about its length
+        return 0
+    return lengths.pop() if len(lengths) == 1 else 0
+
+
 class _Stage:
     """One profilable unit emit-e2e emitted: a name and a host-op-free traceable step."""
 
-    __slots__ = ("name", "step", "self_traced", "trace_path", "items", "recurring", "split", "seq_split", "repeats")
+    __slots__ = (
+        "name",
+        "step",
+        "self_traced",
+        "trace_path",
+        "items",
+        "recurring",
+        "split",
+        "seq_split",
+        "repeats",
+        "prompt_tokens",
+    )
 
     def __init__(
-        self, name, step, self_traced=False, trace_path=None, items=0, recurring=None, split=0, seq_split=0, repeats=0
+        self,
+        name,
+        step,
+        self_traced=False,
+        trace_path=None,
+        items=0,
+        recurring=None,
+        split=0,
+        seq_split=0,
+        repeats=0,
+        prompt_tokens=0,
     ):
         self.name = name
         self.step = step
@@ -517,6 +573,8 @@ class _Stage:
         # AND HOW MANY TIMES ONE REQUEST RUNS THIS STEP (stage_seams.REPEATS). 0 is "not stated", read
         # as 1 -- the step is the stage's whole work for a request.
         self.repeats = max(0, int(repeats or 0))
+        # THE PROMPT LENGTH ITS INPUTS CARRIED (stage_seams.PROMPT_TOKENS_MARK). 0 is "unknown".
+        self.prompt_tokens = max(0, int(prompt_tokens or 0))
 
 
 class PipelineStageAdapter:
@@ -567,6 +625,13 @@ class PipelineStageAdapter:
         ids = torch.tensor([int(x) for x in self._prompt], dtype=torch.long).reshape(-1)
         return {"input_ids": ids.unsqueeze(0).expand(self.batch, ids.numel()).contiguous()}
 
+    def _declared_prompt(self):
+        """The declared prompt as the [batch, ISL] ids a stage is offered, or None when there is none."""
+        try:
+            return (self._inputs_dict() or {}).get("input_ids")
+        except Exception:  # noqa: BLE001 -- a prompt this cannot shape is simply not offered
+            return None
+
     def _call_with_inputs(self, fn, primary):
         try:
             return fn(primary)
@@ -615,6 +680,7 @@ class PipelineStageAdapter:
                 )
                 self.unmeasured[name] = "%s is missing" % _seams.hook(name, _seams.STEP)
                 continue
+            _tokens, _offered = 0, None
             setup = getattr(p, _seams.hook(name, _seams.SETUP), None)
             if callable(setup):
                 # Standard emit-e2e hook: <stage>_trace_inputs() returns exactly the args this stage's
@@ -632,7 +698,12 @@ class PipelineStageAdapter:
                 # three, and the roofline shared one math-fidelity peak across every stack.
                 try:
                     if callable(_tin):
-                        setup(_tin())
+                        _offered = self._declared_prompt() if _accepts_keyword(_tin, _seams.INPUTS_PROMPT_ARG) else None
+                        _inputs = _tin() if _offered is None else _tin(**{_seams.INPUTS_PROMPT_ARG: _offered})
+                        setup(_inputs)
+                        # What the inputs carry beats what was offered: a hook may take the keyword
+                        # and still build its captured request.
+                        _tokens = request_tokens(_inputs) or (int(_offered.shape[-1]) if _offered is not None else 0)
                     else:
                         self._call_with_inputs(setup, None)
                 except Exception as exc:  # noqa: BLE001
@@ -647,6 +718,23 @@ class PipelineStageAdapter:
                         _seams.unmeasured_why(exc),
                     )
                     continue
+                _declared = self._declared_prompt()
+                if _tokens and _declared is not None and _tokens != int(_declared.shape[-1]):
+                    print(
+                        "  [perf-adapter] stage %r is measured on its own %d-token request, not the run's "
+                        "%d-token prompt (%s %s %s); its time is reported at %d tokens"
+                        % (
+                            name,
+                            _tokens,
+                            int(_declared.shape[-1]),
+                            _seams.hook(name, _seams.INPUTS),
+                            "ignores the offered" if _offered is not None else "takes no",
+                            _seams.INPUTS_PROMPT_ARG,
+                            _tokens,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
             # Propagate self_traced: a pipeline that OWNS its capture must be timed natively, never
             # wrapped in a second begin_trace_capture. The decode fallback below already does this;
             # omitting it here meant declaring PIPELINE_STAGES turned a working self-traced pipeline
@@ -668,6 +756,7 @@ class PipelineStageAdapter:
                     split=_stated_count(p, name, _seams.SPLIT),
                     seq_split=_stated_count(p, name, _seams.SEQ_SPLIT),
                     repeats=_stated_count(p, name, _seams.REPEATS),
+                    prompt_tokens=_tokens,
                 )
             )
         if stages:

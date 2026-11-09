@@ -875,7 +875,11 @@ def measure_adapter(adapter, device) -> float:
     # re-run from a cool board, and a stage already measured is replayed from its own lines rather than
     # measured again -- otherwise every attempt re-heats the board on the same stages and is stopped at
     # the same place.
-    from .stage_seams import unmeasured_line as _unmeasured_line, unmeasured_why as _unmeasured_why
+    from .stage_seams import (
+        prompt_tokens_line as _prompt_tokens_line,
+        unmeasured_line as _unmeasured_line,
+        unmeasured_why as _unmeasured_why,
+    )
 
     _node = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
     try:
@@ -946,6 +950,10 @@ def measure_adapter(adapter, device) -> float:
             _rp = int(getattr(st, "repeats", 0) or 0)
             if _rp > 1:
                 print("TRACE_STAGE_REPEATS[%s]=%d" % (st.name, _rp), flush=True)
+            # AND THE PROMPT LENGTH ITS INPUTS CARRIED (stage_seams.PROMPT_TOKENS_MARK). Silent when unknown.
+            _pt = int(getattr(st, "prompt_tokens", 0) or 0)
+            if _pt > 0:
+                print(_prompt_tokens_line(st.name, _pt), flush=True)
         if keep_stage is not None:
             keep_stage(
                 _node,

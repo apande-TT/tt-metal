@@ -43,6 +43,7 @@ from agent.layer_depth import set_depth as _set_depth  # noqa: E402
 from agent.marker_vocab import BLOCK as _SIGNPOST_PREFIX  # noqa: E402
 from agent.marker_vocab import is_control as _is_control  # noqa: E402
 from agent.stage_seams import parse_unmeasured as _parse_unmeasured  # noqa: E402
+from agent.stage_seams import PROMPT_TOKENS_MARK as _PROMPT_TOKENS_MARK  # noqa: E402
 
 _DEPTH_GUARD = "models.experimental.perf_automation.agent.depth_guard_plugin"
 from agent.handlers import remeasure as _rm  # noqa: E402
@@ -3396,6 +3397,34 @@ def read_stage_bytes(state_dir_path=None, model="", task="") -> dict:
 _LEGACY_PROMPT_KEY = "prefill"
 
 
+def _measured_prompt_tokens(per_stage: dict, declared: int) -> int:
+    """The prompt length the run's numbers describe: the one every stage that stated one was measured
+    on (stage_seams.PROMPT_TOKENS_MARK), else the declared one. A stage timed on its own captured
+    request ran at that request's context, so the report and the KV term of its ceiling must be
+    priced there, not at the ISL the run asked for. Stages that disagree keep the declared length."""
+    lengths = {int(v) for v in (per_stage or {}).values() if int(v or 0) > 0}
+    declared = int(declared or 0)
+    if len(lengths) > 1:
+        print(
+            "  [perf-mcp] WARNING: stages were measured on different prompt lengths %s; reporting the "
+            "declared %d" % (dict(sorted(per_stage.items())), declared),
+            file=sys.stderr,
+            flush=True,
+        )
+        return declared
+    if not lengths:
+        return declared
+    measured = lengths.pop()
+    if declared and measured != declared:
+        print(
+            "  [perf-mcp] WARNING: the stages ran on a %d-token prompt, not the declared %d; numbers and "
+            "ceilings are reported at %d" % (measured, declared, measured),
+            file=sys.stderr,
+            flush=True,
+        )
+    return measured
+
+
 def read_stage_isl(state_dir_path=None, model="", task="") -> int:
     """The prompt length the run ACTUALLY profiled, or 0.
 
@@ -3642,6 +3671,7 @@ def _run_full_pipeline_ms():
     stage_split: dict = {}  # {stage: data-parallel groups sharing its items}, from TRACE_STAGE_SPLIT
     stage_seq_split: dict = {}  # {stage: chip groups splitting one request's tokens}, from TRACE_STAGE_SEQ_SPLIT
     stage_repeats: dict = {}  # {stage: times one request runs its step}, from TRACE_STAGE_REPEATS
+    stage_prompt_tokens: dict = {}  # {stage: prompt length its inputs carried}, from _PROMPT_TOKENS_MARK
     # {stage: items PER REQUEST}, the legacy marker's unit. Kept apart from stage_isl, which holds
     # the TOTAL a stage states for one call.
     stage_isl_per_request = {}
@@ -3842,6 +3872,7 @@ def _run_full_pipeline_ms():
                 ("TRACE_STAGE_SPLIT[", stage_split),
                 ("TRACE_STAGE_SEQ_SPLIT[", stage_seq_split),
                 ("TRACE_STAGE_REPEATS[", stage_repeats),
+                (_PROMPT_TOKENS_MARK + "[", stage_prompt_tokens),
             ):
                 if _marker in line:
                     try:
@@ -3935,6 +3966,7 @@ def _run_full_pipeline_ms():
                     prefill_path = line.split("TRACE_PREFILL_PATH=", 1)[1].split()[0]
                 except Exception:  # noqa: BLE001
                     pass
+    prompt_tokens_seen = _measured_prompt_tokens(stage_prompt_tokens, prompt_tokens_seen)
     # BEFORE any number is derived, including the eager fallback. A run whose decode stood still has
     # no valid reading to offer: the trace refused, and the wall time that would stand in for it
     # prices the same non-advancing step. Failing the measurement is the honest outcome -- the gate
@@ -3963,7 +3995,8 @@ def _run_full_pipeline_ms():
     dec = statistics.median(per_tokens) if per_tokens else None
     pf = statistics.median(prefills) if prefills else None
     if dec is not None or pf is not None:
-        isl = env.get("TT_PERF_SEQ_LEN", os.environ.get("TT_PERF_SEQ_LEN", "128"))
+        # THE LENGTH THE STAGES RAN ON, when the run observed one; the declared knob only otherwise.
+        isl = prompt_tokens_seen or env.get("TT_PERF_SEQ_LEN", os.environ.get("TT_PERF_SEQ_LEN", "128"))
         osl = env.get("TT_PERF_OSL_TOKENS") or os.environ.get("TT_PERF_OSL_TOKENS", "128")
         tsu = (1000.0 / dec) if dec else 0.0
         # mesh/TP/DP/shard come solely from the run's marker; when it is absent they stay None and we
