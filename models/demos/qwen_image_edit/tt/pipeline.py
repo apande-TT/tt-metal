@@ -383,6 +383,8 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "SOFTMAX_FUSED_EXP", True),
             # (and its division by the row sum applied to the [.., Sq, D] P @ V output instead of the scores)
             (_dit_precise, "SOFTMAX_DEFER_DIV", True),
+            # (and that exp in the SFPU's fast approximate mode)
+            (_dit_precise, "SOFTMAX_EXP_APPROX", True),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:
