@@ -309,7 +309,11 @@ class TtQwenJointAttention:
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
         mx = ttnn.max(s, dim=-1, keepdim=True)
         if _precise.SOFTMAX_FUSED_EXP:  # exp(s - max) in the subtract's own pass: one score-sized write, not two
-            e = ttnn.subtract(s, mx, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 0.0)])
+            e = ttnn.subtract(
+                s,
+                mx,
+                activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, 1.0 if _precise.SOFTMAX_EXP_APPROX else 0.0)],
+            )
         else:
             e = ttnn.exp(ttnn.subtract(s, mx))
         if _precise.ENABLED and _precise.SOFTMAX_DEFER_DIV:

@@ -189,6 +189,8 @@ SCORE_ROW_ALIGN = TILE
 B_SIDE_REUSE = False
 # The joint attention's softmax exp(s - max) as the subtract's post-activation (one pass over the scores, not two).
 SOFTMAX_FUSED_EXP = False
+# With it: that exp in the SFPU's fast approximate mode (the eltwise op's fidelity knob).
+SOFTMAX_EXP_APPROX = False
 # The softmax's division moved past P @ V: (e @ v) / rowsum(e), a [.., Sq, D] pass instead of a score-sized one.
 SOFTMAX_DEFER_DIV = False
 
