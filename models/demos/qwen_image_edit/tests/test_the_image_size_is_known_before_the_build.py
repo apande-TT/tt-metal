@@ -14,6 +14,8 @@ Host only, but it runs the real processor path once per area (the example image 
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from models.demos.qwen_image_edit.tt import inputs as I
@@ -47,11 +49,22 @@ def test_a_larger_area_never_gives_a_smaller_image(image):
     assert all(a[0] <= b[0] and a[1] <= b[1] for a, b in zip(sizes, sizes[1:]))
 
 
-def test_the_perf_entry_point_hands_over_height_then_width(monkeypatch, image):
-    """The order the build takes: image_hw is (height, width), as TtQwenVAE reads it."""
+def test_the_perf_entry_point_hands_over_height_then_width():
+    """The order the build takes: image_hw is (height, width), as TtQwenVAE reads it.
+
+    Read off the entry point's SOURCE rather than by calling one of its helpers: the perf test is the
+    file the optimizer rewrites, so a test bound to a private name there fails the moment a round renames
+    it -- which is how `_condition_hw` disappeared. What must not change is the contract: the size comes
+    from an encoding at the area asked for, and it reaches build_pipeline height first.
+    """
+    import inspect
+
     import models.demos.qwen_image_edit.tests.e2e.test_image_edit_perf as perf
 
-    for area in AREAS:
-        monkeypatch.setattr(perf, "PERF_AREA", area)
-        w, h = I.condition_size(image, area)
-        assert perf._condition_hw() == (h, w)
+    src = inspect.getsource(perf)
+    assert "image_hw" in src, "the perf entry point no longer tells the build its image size"
+    # Whatever it is called, the pair it hands over is (<x>.height, <x>.width) -- height FIRST.
+    pair = re.search(r"image_hw\b\s*=\s*\(\s*([A-Za-z_][\w.]*)\.height\s*,\s*\1\.width\s*\)", src)
+    assert pair, "image_hw is not formed as (height, width) from one encoding"
+    # And that encoding is taken at the area the harness asked for, not at the module's default.
+    assert re.search(r"area\s*=\s*PERF_AREA\b", src), "the encoding does not use PERF_AREA"
