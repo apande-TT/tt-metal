@@ -36,6 +36,10 @@ BATCH_GATHER_TILED = False
 # the single-frame tiled [B, C, 1, H, W] input to BTHWC by two native tile transposes ([B, C, H, W] -> [B, H, C, W] ->
 # [B, H, W, C]) instead of the generic 5-D tiled permute (4.9 ms on the 3-channel image); data movement only
 INPUT_BY_TRANSPOSE = False
+# with INPUT_BY_TRANSPOSE: the input split over the mesh (batch / H / W partitions) while still tiled BCTHW, before the
+# transposes, channel pad and untilize, so those run on each chip's part only, not the whole replicated input (needs
+# H, W to split into tile-aligned parts); the same per-chip tensor
+INPUT_PARTITION_FIRST = False
 
 
 class TtQwenImageEncoder3d:
@@ -98,25 +102,45 @@ class TtQwenImageEncoder3d:
         assert T == 1 or not self.single_frame, f"single_frame encoder got T={T}"
         pc = self.parallel_config
 
-        if INPUT_BY_TRANSPOSE and T == 1 and x.layout == ttnn.TILE_LAYOUT and H % 32 == 0 and W % 32 == 0:
-            x = ttnn.transpose(ttnn.reshape(x, (B, C, H, W)), 1, 2)  # [B, H, C, W]
-            x = ttnn.reshape(ttnn.transpose(x, -2, -1), (B, 1, H, W, C))  # BTHWC
+        hf, wf = pc.height_parallel.factor, pc.width_parallel.factor
+        by_transpose = INPUT_BY_TRANSPOSE and T == 1 and x.layout == ttnn.TILE_LAYOUT and H % 32 == 0 and W % 32 == 0
+        split_first = (
+            by_transpose
+            and INPUT_PARTITION_FIRST
+            and H % (32 * hf) == 0
+            and W % (32 * wf) == 0
+            and (self.batch_axis is None or B % self.batch_factor == 0)
+        )
+        if split_first:  # each chip's part of the tiled BCTHW input (no H / W padding needed: both split evenly)
+            if self.batch_axis is not None:
+                x = ttnn.mesh_partition(x, dim=0, cluster_axis=self.batch_axis)
+            if hf > 1:
+                x = ttnn.mesh_partition(x, dim=3, cluster_axis=pc.height_parallel.mesh_axis)
+            if wf > 1:
+                x = ttnn.mesh_partition(x, dim=4, cluster_axis=pc.width_parallel.mesh_axis)
+        b, _, _, h, w = x.shape
+        if by_transpose:
+            x = ttnn.transpose(ttnn.reshape(x, (b, C, h, w)), 1, 2)  # [b, h, C, w]
+            x = ttnn.reshape(ttnn.transpose(x, -2, -1), (b, 1, h, w, C))  # BTHWC
         else:
             x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
         c_pad = aligned_channels(C) - C
         if c_pad:
             x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-        if self.batch_axis is not None:
-            assert B % self.batch_factor == 0, f"batch {B} must divide the {self.batch_factor}-way batch axis"
-            x = ttnn.mesh_partition(x, dim=0, cluster_axis=self.batch_axis)
-        # zero-pad H/W up to the grid; the Wan body masks the padding via logical_h / logical_w
-        x, Hp = pad_to_multiple(x, 2, pc.height_parallel.factor)[0], H + (-H) % pc.height_parallel.factor
-        x, Wp = pad_to_multiple(x, 3, pc.width_parallel.factor)[0], W + (-W) % pc.width_parallel.factor
-        if pc.height_parallel.factor > 1:
-            x = ttnn.mesh_partition(x, dim=2, cluster_axis=pc.height_parallel.mesh_axis)
-        if pc.width_parallel.factor > 1:
-            x = ttnn.mesh_partition(x, dim=3, cluster_axis=pc.width_parallel.mesh_axis)
+        if split_first:
+            Hp, Wp = H, W
+        else:
+            if self.batch_axis is not None:
+                assert B % self.batch_factor == 0, f"batch {B} must divide the {self.batch_factor}-way batch axis"
+                x = ttnn.mesh_partition(x, dim=0, cluster_axis=self.batch_axis)
+            # zero-pad H/W up to the grid; the Wan body masks the padding via logical_h / logical_w
+            x, Hp = pad_to_multiple(x, 2, hf)[0], H + (-H) % hf
+            x, Wp = pad_to_multiple(x, 3, wf)[0], W + (-W) % wf
+            if hf > 1:
+                x = ttnn.mesh_partition(x, dim=2, cluster_axis=pc.height_parallel.mesh_axis)
+            if wf > 1:
+                x = ttnn.mesh_partition(x, dim=3, cluster_axis=pc.width_parallel.mesh_axis)
 
         # Fresh causal-conv cache, exactly as the reference's first (and only) chunk sees it.
         tt_feat_cache = [None] * self.num_convs
