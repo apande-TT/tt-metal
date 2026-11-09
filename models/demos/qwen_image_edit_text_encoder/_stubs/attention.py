@@ -443,9 +443,25 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     [.., M, 1] norm, so no output-sized pass is spent on any of them."""
     if GUARD_TAIL_NORMS is not None and rest_fn is not None and rest2_fn is None:
         # tol = (a_norm * slack) * b_norm formed tile by tile inside the tail: no output-sized tol written and read
-        a_s = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12)
-        y = GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm, rest_fn)
+        b_l1 = None
+        try:  # (both norms read from L1 when the free L1 holds them: the per-tile row reads are 64 B NoC reads)
+            a_s = ttnn.multiply(
+                a_norm, GUARD_SLACK * 2.0**-12, memory_config=ttnn.L1_MEMORY_CONFIG if NORMS_L1 else None
+            )
+        except RuntimeError as e:
+            if "Out of Memory" not in str(e):
+                raise
+            a_s = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12)
+        if NORMS_L1:
+            try:
+                b_l1 = ttnn.to_memory_config(b_norm, ttnn.L1_MEMORY_CONFIG)
+            except RuntimeError as e:
+                if "Out of Memory" not in str(e):
+                    raise
+        y = GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm if b_l1 is None else b_l1, rest_fn)
         ttnn.deallocate(a_s)
+        if b_l1 is not None:
+            ttnn.deallocate(b_l1)
         if y is not None:
             return y
     if NORMS_L1:  # the outer product re-reads a broadcast operand tile per output tile: from L1, not DRAM
