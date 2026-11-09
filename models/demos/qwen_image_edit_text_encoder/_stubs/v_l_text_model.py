@@ -25,6 +25,9 @@ from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtToken
 
 # row-stage hand-off gathers only one 1/stage_rows piece per row (False: every row's full copy)
 SPLIT_HANDOFF = False
+# optional fn(x, n_blocks) -> on mesh row r, block r mod n_blocks of the replicated x along dim 0 (what mesh_partition
+# of [x] * (rows / n_blocks) hands row r), or None where it does not apply; None: concat + mesh_partition
+ROW_BLOCK_FN = None
 # the rows of each pipeline stage split the batch (row r runs sequences of block r mod stage_rows) instead of
 # every row of the stage running the whole batch on the same weights (False: each row runs every sequence)
 ROW_DP = False
@@ -97,9 +100,11 @@ class TtTextModel:
         rows = self.stage_rows * (2 if self.row_stages else 1)
         if SPLIT_HANDOFF and self.row_stages and b % self.stage_rows == 0:
             stages = rows // self.stage_rows
-            xs = ttnn.concat([x] * stages, dim=0)
-            p = ttnn.mesh_partition(xs, dim=0, cluster_axis=0)
-            ttnn.deallocate(xs)
+            p = ROW_BLOCK_FN(x, self.stage_rows) if ROW_BLOCK_FN is not None else None
+            if p is None:
+                xs = ttnn.concat([x] * stages, dim=0)
+                p = ttnn.mesh_partition(xs, dim=0, cluster_axis=0)
+                ttnn.deallocate(xs)
             g = ttnn.all_gather(p, dim=0, cluster_axis=0, num_links=1, topology=ttnn.Topology.Linear)
             ttnn.deallocate(p)
             s0 = (row // self.stage_rows) * b
@@ -114,6 +119,10 @@ class TtTextModel:
         """Replicated t [B, ...] -> on row r its block r mod stage_rows of B / stage_rows sequences: [t] * stages
         split over the rows hands row r exactly that block."""
         stages = 2 if self.row_stages else 1
+        if stages > 1 and ROW_BLOCK_FN is not None:
+            p = ROW_BLOCK_FN(t, mesh_shape(t.device())[0] // stages)
+            if p is not None:
+                return p
         ts = ttnn.concat([t] * stages, dim=0) if stages > 1 else t
         p = ttnn.mesh_partition(ts, dim=0, cluster_axis=0)
         if stages > 1:

@@ -257,3 +257,62 @@ def fused_block_sum_gated(g, n, part, mem, bias_rows, gate, residual, split_dim,
         mesh_prog[ttnn.MeshCoordinateRange(lo, hi)] = program(k)
     io = [g] + ([bias_rows] if has_bias else []) + [residual] + ([gate] if has_gate else []) + [out]
     return ttnn.generic_op(io, mesh_prog)
+
+
+def mesh_row_block(x, n_blocks, cluster_axis=0):
+    """Replicated TILE x [B, ...] -> on the devices at position k of `cluster_axis`, x's block k mod n_blocks along dim 0
+    ([B / n_blocks, ...]): the same tensor as ttnn.mesh_partition(ttnn.concat([x] * (n / n_blocks), dim=0), dim=0,
+    cluster_axis) for an axis of n devices, as one page copy per device (kernels/copy_pages.cpp) without building the
+    concat. None when the shapes do not fit."""
+    device = x.device()
+    rows, cols = (int(v) for v in tuple(device.shape))
+    n = rows if cluster_axis == 0 else cols
+    shape = [int(d) for d in x.shape]
+    if x.layout != ttnn.TILE_LAYOUT or x.is_sharded() or n % n_blocks or shape[0] % n_blocks:
+        return None
+    if [int(d) for d in x.padded_shape] != shape:
+        return None
+    b = shape[0] // n_blocks
+    out = ttnn.allocate_tensor_on_device(ttnn.Shape([b] + shape[1:]), x.dtype, ttnn.TILE_LAYOUT, device, x.memory_config())
+    page = 4096 if x.dtype == ttnn.float32 else 2048
+    n_pages = _tiles(out)
+    grid = device.compute_with_storage_grid_size()
+    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, n_pages)
+    fmt = ttnn.float32 if x.dtype == ttnn.float32 else ttnn.bfloat16
+    cbs = [
+        ttnn.CBDescriptor(
+            total_size=page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=0, data_format=fmt, page_size=page)],
+        )
+    ]
+    ct = list(ttnn.TensorAccessorArgs(x).get_compile_time_args()) + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
+
+    def program(k):
+        rt = ttnn.RuntimeArgs()
+        start = 0
+        for group, per in ((group1, per1), (group2, per2)):
+            for r in group.ranges():
+                for cx in range(r.start.x, r.end.x + 1):
+                    for cy in range(r.start.y, r.end.y + 1):
+                        rt[cx][cy] = [x.buffer_address(), out.buffer_address(), (k % n_blocks) * n_pages, per, start]
+                        start += per
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=os.path.join(_KERNELS, "copy_pages.cpp"),
+                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                core_ranges=cores,
+                compile_time_args=ct,
+                runtime_args=rt,
+                config=ttnn.ReaderConfigDescriptor(),
+            )
+        ]
+        return ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+
+    mesh_prog = ttnn.MeshProgramDescriptor()
+    for k in range(n):
+        lo = ttnn.MeshCoordinate(k, 0) if cluster_axis == 0 else ttnn.MeshCoordinate(0, k)
+        hi = ttnn.MeshCoordinate(k, cols - 1) if cluster_axis == 0 else ttnn.MeshCoordinate(rows - 1, k)
+        mesh_prog[ttnn.MeshCoordinateRange(lo, hi)] = program(k)
+    return ttnn.generic_op([x, out], mesh_prog)

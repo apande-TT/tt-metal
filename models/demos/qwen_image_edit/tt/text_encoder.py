@@ -28,7 +28,7 @@ from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads, fused_
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.limb_split import fused_split_merge_heads
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated, mesh_row_block
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_heads, fused_rope_rows
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
@@ -130,6 +130,8 @@ class TtQwenTextEncoder:
         _te_attention.A2A_FOLD_L1_BYTES = 24 * 1024 * 1024  # and its received partials (22 MB) in L1
         # the row-stage hand-off moves one piece per row instead of every row's full copy
         v_l_text_model.SPLIT_HANDOFF = True
+        # its row-stage hand-off / row split take each row's block straight from the replicated tensor (no [x] * stages)
+        v_l_text_model.ROW_BLOCK_FN = mesh_row_block
         # and the rows of each LM pipeline stage split the batch (B / 4 sequences per row) instead of all four rows
         # running every sequence on the same weights
         v_l_text_model.ROW_DP = True
