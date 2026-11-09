@@ -327,9 +327,31 @@ def test_a_block_that_dispatches_nothing_is_not_a_stack():
 def test_instrumentation_hooks_the_class_because_python_ignores_an_instance_dunder():
     """obj() resolves __call__ on the TYPE. A wrapper installed on the instance is silently dead and
     every stack then reads as never having run -- which looks exactly like a model with no stacks."""
+    from agent.caller_stacks import instrument
+
     src = (_PA / "agent" / "caller_stacks.py").read_text()
-    assert "cls.__call__ = wrapped" in src, "the hook is not installed on the class"
     assert "TAG THE INSTANCE, WRAP THE CLASS" in src
+
+    class Leaf:
+        def __call__(self, x):
+            return x
+
+    class Layer:
+        def __init__(self):
+            self.leaf = Leaf()
+
+        def __call__(self, x):
+            return self.leaf(x)
+
+    orig = Layer.__dict__["__call__"]
+    p = type("Pipe", (), {})()
+    p.layers = [Layer(), Layer()]
+    seq = []
+    instrument(p, seq.append)
+    assert Layer.__dict__["__call__"] is not orig, "the hook is not installed on the class"
+    assert "__call__" not in vars(p.layers[0]), "the hook was installed on the instance, where obj() ignores it"
+    p.layers[0](0)
+    assert seq, "calling an instrumented element emitted no marker"
 
 
 def test_broad_instrumentation_is_flagged_as_probe_only():

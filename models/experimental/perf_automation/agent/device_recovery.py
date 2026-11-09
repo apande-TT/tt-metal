@@ -591,6 +591,17 @@ def board_needs_reset() -> bool:
 DEVICE_NODE_DIR = "/dev/tenstorrent"
 
 
+def device_node_dir() -> str:
+    """DEVICE_NODE_DIR, unless TT_RECOVERY_DEVICE_DIR points elsewhere. Read at CALL time.
+
+    The override exists so a test can never find -- and the reaper below never SIGKILL -- a real
+    process using the board. The tool's own suite runs recover() for real in five files, and only
+    some stubbed the reaper: 2026-11-09 it killed a live GLM-5.3-Flash coverage probe mid-run, which
+    left the Galaxy hung (NOC0). tests/conftest.py points this at an empty directory for every test.
+    """
+    return os.environ.get("TT_RECOVERY_DEVICE_DIR") or DEVICE_NODE_DIR
+
+
 def device_holders() -> set:
     """Pids holding /dev/tenstorrent open, except this process and its ancestors. Best-effort: no
     `fuser` or an unreadable node yields fewer holders, never an exception. The one scan both the
@@ -599,7 +610,7 @@ def device_holders() -> set:
     import subprocess as _sp
 
     holders = set()
-    for node in _glob.glob(DEVICE_NODE_DIR + "/*"):
+    for node in _glob.glob(device_node_dir() + "/*"):
         try:
             r = _sp.run(["fuser", node], capture_output=True, text=True, timeout=30)
             holders.update(int(t) for t in (r.stdout + " " + r.stderr).split() if t.strip().isdigit())

@@ -39,11 +39,15 @@ def test_the_old_head_slice_loses_them():
     assert _blocks_ran(seq[:8]) == 0
 
 
-def test_the_op_budget_is_unchanged():
-    """The head is the same slice it was, so the work signal is the same number."""
-    seq = ["ttnn.op(%d)" % i for i in range(50)]
+def test_the_work_signal_is_the_true_total_not_the_cut():
+    """The head is the same slice it was, but the work signal no longer saturates at it: the repeats
+    elided past the cut are counted back in. A full-depth run and a capped one used to read the same
+    number once both passed the cut (GLM-5.3-Flash: 49478 vs 49912), declaring a working knob INERT."""
+    seq = ["ttnn.op(%d)" % (i % 3) for i in range(50)]
     seq += ["%sstack3:%d" % (P._SIGNPOST_PREFIX, i) for i in range(4)]
-    assert _work_signal(P._printable_seq(seq, cap=8)) == _work_signal(seq[:8])
+    out = P._printable_seq(seq, cap=8)
+    assert out[:8] == seq[:8], "the head is unchanged"
+    assert _work_signal(out) == _work_signal(seq) == 50
 
 
 def test_order_is_preserved_because_it_only_deletes():
@@ -75,4 +79,47 @@ def test_the_print_no_longer_carries_a_head_slice():
 def test_the_cut_keeps_what_the_readers_call_structure_and_nothing_else():
     """The filter is the readers' own predicate, so a marker invented later survives the cut too."""
     assert P._printable_seq(["op", "%sx" % V.CALLER], cap=1) == ["op", "%sx" % V.CALLER]
-    assert P._printable_seq(["op", "another_op"], cap=1) == ["op"], "ops past the cut are still cut"
+    # past the cut an op's repeats are cut and counted; only its first appearance in a segment stays
+    assert P._printable_seq(["op", "x", "x", "x"], cap=1) == ["op", "x", "%s2" % V.ELIDED]
+
+
+def test_a_first_appearance_past_the_cut_still_sizes_the_window():
+    """GLM-5.3-Flash 2026-11-09: three identical layers filled the budget, and layer 3 -- the first
+    with a new kind of op -- signposted with nothing in it, so coverage sized the stack at 2."""
+    from cc_optimize.run import _first_block_map
+
+    seq = []
+    for i in range(6):
+        seq.append("%sstack3:%d" % (P._SIGNPOST_PREFIX, i))
+        seq += ["ttnn.common"] * 10 + (["ttnn.deep_kind"] if i >= 3 else [])
+        seq.append("%sstack3:%d" % (P._SIGNPOST_END_PREFIX, i))
+    out = P._printable_seq(seq, cap=25)  # the cut lands inside block 2
+    fb, _ = _first_block_map(out)
+    assert fb["stack3"]["ttnn.deep_kind"] == 3
+    assert _work_signal(out) == _work_signal(seq)
+    assert len(out) < len(seq)
+
+
+def test_each_segment_keeps_its_own_first_appearance():
+    """Per segment, not per sequence: a block past the cut still shows every op it ran once, which is
+    what the per-block readers (first appearance, lever coverage) need."""
+    seq = ["h"] + ["%sstack0:%d" % (P._SIGNPOST_PREFIX, i) if j == 0 else "op" for i in range(3) for j in range(3)]
+    out = P._printable_seq(seq, cap=1)
+    assert out == [
+        "h",
+        "%sstack0:0" % P._SIGNPOST_PREFIX,
+        "op",
+        "%s1" % V.ELIDED,
+        "%sstack0:1" % P._SIGNPOST_PREFIX,
+        "op",
+        "%s1" % V.ELIDED,
+        "%sstack0:2" % P._SIGNPOST_PREFIX,
+        "op",
+        "%s1" % V.ELIDED,
+    ]
+
+
+def test_an_elided_count_is_structure_that_carries_work():
+    tok = "%s7" % V.ELIDED
+    assert _is_control(tok) and V.elided(tok) == 7
+    assert V.elided("ttnn.op") == 0 and V.elided("%sjunk" % V.ELIDED) == 0

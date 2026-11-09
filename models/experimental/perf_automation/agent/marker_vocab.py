@@ -50,11 +50,24 @@ STAGE = "PERF_STAGE_SIGNPOST:"
 # op: on a 32-layer stack it is 64 entries that no device ever ran. caller_stacks imports this name
 # as its MARK, so the string is written once and the module that writes it still owns its meaning.
 CALLER = "PERF_CALLER:"
+# Stands in for N repeats of ops the printed sequence dropped past its size cut (see the probe's
+# _printable_seq). Structure, not work: it carries the COUNT of work so the work signal stays exact.
+ELIDED = "PERF_OP_ELIDED:"
 
 
 def control_prefixes() -> tuple:
     """Every prefix that marks structure rather than work, in the order a reader would try them."""
-    return (BLOCK, BLOCK_END, STAGE, CALLER)
+    return (BLOCK, BLOCK_END, STAGE, CALLER, ELIDED)
+
+
+def elided(tok) -> int:
+    """How many op invocations an ELIDED token stands for; 0 for any other entry."""
+    if isinstance(tok, str) and tok.startswith(ELIDED):
+        try:
+            return max(0, int(tok[len(ELIDED) :]))
+        except ValueError:
+            return 0
+    return 0
 
 
 def is_control(tok) -> bool:

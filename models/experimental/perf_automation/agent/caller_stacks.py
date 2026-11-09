@@ -31,6 +31,9 @@ exceeded tracy's 32K source-location limit and left a pytest process that never 
 
 from __future__ import annotations
 
+import functools as _functools
+import types as _types
+
 from .marker_vocab import CALLER as MARK  # the token this module emits; marker_vocab spells it
 
 _MAX_SEQ_SCAN = 512
@@ -165,25 +168,100 @@ def instrument(root, emit) -> int:
 
 def _wrap_class(cls, emit) -> bool:
     """Install the bracket on a class, once, driven entirely by the per-instance tags."""
+
+    def _in(self):
+        path = getattr(self, PATH_TAG, None)
+        if path is not None:
+            emit(marker(path, getattr(self, IDX_TAG, 0), "in"))
+
+    def _out(self):
+        path = getattr(self, PATH_TAG, None)
+        if path is not None:
+            emit(marker(path, getattr(self, IDX_TAG, 0), "out"))
+
+    return bracket_entry_points(cls, _in, _out, _WRAPPED)
+
+
+def entry_points(cls) -> list:
+    """The methods a caller can run a block through -- read off the class, never assumed by name.
+
+    `__call__` IS NOT THE ONLY DOOR. A container that runs its blocks as `blk(x)` goes through
+    __call__, but one that runs them as `blk.forward(x, step)` -- or any other method -- skips it, and a
+    bracket on __call__ alone leaves that whole stack silent: tagged, never announced. GLM-5.3-Flash,
+    2026-11-09: its 45 text layers are driven by `layer.forward(X, step)`, so only the 24-block vision
+    tower signposted, the text stack was never sized, and the vision tower's depth (2) was applied to it
+    -- missing the sparse-attention and MoE layers that first appear at layer 3.
+
+    So every public method the class (or a model-side base) defines is an entry point, plus __call__
+    when one is defined. Nothing here knows a method name. torch.nn.Module subclasses keep __call__
+    only: torch routes every invocation through it by contract, and their public surface (to,
+    parameters, state_dict, ...) is framework API, not a way of running the block.
+    """
     try:
-        if cls.__dict__.get(_WRAPPED):
+        import torch as _t
+
+        _torch_mod = _t.nn.Module
+    except Exception:  # noqa: BLE001
+        _torch_mod = None
+    is_torch = _torch_mod is not None and isinstance(cls, type) and issubclass(cls, _torch_mod)
+    names = []
+    if callable(getattr(cls, "__call__", None)) and any(
+        "__call__" in vars(k) for k in getattr(cls, "__mro__", (cls,)) if k is not object and k is not type
+    ):
+        names.append("__call__")
+    if is_torch:
+        return names
+    for klass in getattr(cls, "__mro__", (cls,)):
+        if klass is object:
+            continue
+        for name, val in vars(klass).items():
+            if name not in names and not name.startswith("_") and isinstance(val, _types.FunctionType):
+                names.append(name)
+    return names
+
+
+def bracket_entry_points(cls, on_enter, on_exit, key: str) -> bool:
+    """Bracket every entry point of `cls` with on_enter(self) / on_exit(self). Once per class per key.
+
+    ONE BRACKET PER OUTERMOST ENTRY. Entry points call each other (__call__ -> forward, forward ->
+    a public helper), and each nested entry would otherwise open a second frame for the same block.
+    A per-instance depth counter, kept under `key`, lets only the outermost call emit. The counter is
+    per key, so two independent brackets on one class (the caller witness and the block signposts)
+    never suppress each other. on_exit runs even when the block raises, or an unclosed frame would
+    swallow the rest of the run.
+    """
+    try:
+        if cls.__dict__.get(key):
             return False
-        inner = cls.__call__
+        depth_attr = key + "_depth"
+        wrapped_any = False
+        for name in entry_points(cls):
+            inner = getattr(cls, name, None)
+            if inner is None:
+                continue
 
-        def wrapped(self, *a, **k):
-            path = getattr(self, PATH_TAG, None)
-            if path is None:
-                return inner(self, *a, **k)
-            idx = getattr(self, IDX_TAG, 0)
-            emit(marker(path, idx, "in"))
-            try:
-                return inner(self, *a, **k)
-            finally:
-                emit(marker(path, idx, "out"))
+            def wrapped(self, *a, __inner=inner, **k):
+                if getattr(self, depth_attr, 0):
+                    return __inner(self, *a, **k)
+                try:
+                    setattr(self, depth_attr, 1)
+                except Exception:  # noqa: BLE001 -- not settable: bracket without the guard
+                    pass
+                on_enter(self)
+                try:
+                    return __inner(self, *a, **k)
+                finally:
+                    on_exit(self)
+                    try:
+                        setattr(self, depth_attr, 0)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-        cls.__call__ = wrapped
-        setattr(cls, _WRAPPED, True)
-        return True
+            _functools.update_wrapper(wrapped, inner)
+            setattr(cls, name, wrapped)
+            wrapped_any = True
+        setattr(cls, key, True)
+        return wrapped_any
     except Exception:  # noqa: BLE001 -- a class that cannot be patched is simply not observed
         return False
 
