@@ -16,6 +16,7 @@ import contextlib
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit.tt.latent_pack import latent_pack_rows
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import mlp as vae_pointwise
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import qwen_image_decoder3d, qwen_image_encoder3d
 from models.tt_dit.utils.conv3d import get_conv3d_config
@@ -106,6 +107,9 @@ def _encoder_blocking(in_channels, out_channels, kernel):
 
 # pack / unpack the latents' 2x2 patches in row major (the TILE permute pads their size-2 dims to whole tiles)
 PACK_ROW_MAJOR = True
+# and the row-major pack / unpack itself by one C++ kernel (latent_pack.latent_pack_rows: whole rows in, words
+# rearranged in L1, whole rows out) instead of the 6-D permute that moves 8-byte rows
+PACK_KERNEL = True
 
 
 def pack_latents(z, B, C, H, W):
@@ -113,9 +117,13 @@ def pack_latents(z, B, C, H, W):
     tiled = PACK_ROW_MAJOR and z.layout == ttnn.TILE_LAYOUT
     if tiled:  # a 6-D TILE permute pads its size-2 last dim to a whole tile (16x the work); row major moves elements
         z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
-    z = ttnn.reshape(z, (B, C, H // 2, 2, W // 2, 2))
-    z = ttnn.permute(z, (0, 2, 4, 1, 3, 5))
-    z = ttnn.reshape(z, (B, (H // 2) * (W // 2), C * 4))
+    packed = latent_pack_rows(z, B, C, H, W) if PACK_KERNEL else None
+    if packed is not None:
+        z = packed
+    else:
+        z = ttnn.reshape(z, (B, C, H // 2, 2, W // 2, 2))
+        z = ttnn.permute(z, (0, 2, 4, 1, 3, 5))
+        z = ttnn.reshape(z, (B, (H // 2) * (W // 2), C * 4))
     return ttnn.to_layout(z, ttnn.TILE_LAYOUT) if tiled else z
 
 
@@ -124,9 +132,13 @@ def unpack_latents(x, B, C, H, W):
     tiled = PACK_ROW_MAJOR and x.layout == ttnn.TILE_LAYOUT
     if tiled:
         x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
-    x = ttnn.reshape(x, (B, H // 2, W // 2, C, 2, 2))
-    x = ttnn.permute(x, (0, 3, 1, 4, 2, 5))
-    x = ttnn.reshape(x, (B, C, H, W))
+    unpacked = latent_pack_rows(x, B, C, H, W, unpack=True) if PACK_KERNEL else None
+    if unpacked is not None:
+        x = unpacked
+    else:
+        x = ttnn.reshape(x, (B, H // 2, W // 2, C, 2, 2))
+        x = ttnn.permute(x, (0, 3, 1, 4, 2, 5))
+        x = ttnn.reshape(x, (B, C, H, W))
     return ttnn.to_layout(x, ttnn.TILE_LAYOUT) if tiled else x
 
 
