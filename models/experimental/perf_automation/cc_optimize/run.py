@@ -1584,7 +1584,10 @@ def _is_control(tok) -> bool:
 
 
 def _work_signal(seq) -> int:
-    return sum(1 for t in seq or [] if isinstance(t, str) and not _is_control(t))
+    """Op invocations in the probe's sequence: the ops it carries plus the repeats it elided past its
+    size cut. Without the elided count the signal saturated at the cut, and a full-depth run and a
+    capped one read the same -- a working depth knob declared INERT."""
+    return sum(_marker_vocab.elided(t) if _is_control(t) else 1 for t in seq or [] if isinstance(t, str))
 
 
 def _op_block_count(seq) -> int:
@@ -3343,7 +3346,7 @@ def _coverage_layers(
         # Cache stores the maximum depth across stacks (an int); the full per-stack dict is
         # reconstructed on the live path and not preserved in the on-disk cache.
         _cache_val = max(_cov_dict.values()) if isinstance(_cov_repr, dict) else _cov_repr
-        _coverage_cache_put(repo_root, node, case, _cache_val, ops_per_step=len(seq))
+        _coverage_cache_put(repo_root, node, case, _cache_val, ops_per_step=_work_signal(seq))
         return _cov_dict, facts
     k, n_kinds = _config_layer_kinds(config_ref or model_name)
     if k is None:

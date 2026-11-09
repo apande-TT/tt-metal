@@ -60,6 +60,9 @@ def _private_temp_state(tmp_path_factory, monkeypatch):
     box = tmp_path_factory.mktemp("tmpstate")
     monkeypatch.setenv("PERF_MCP_STATE_DIR", str(box))
     monkeypatch.setenv("PERF_MCP_LEDGER_DIR", str(box))
+    # Nor may a test see -- and the recovery reaper SIGKILL -- a real process using the board: recover()
+    # runs for real in several tests, and one killed a live device run. An empty directory has no holders.
+    monkeypatch.setenv("TT_RECOVERY_DEVICE_DIR", str(box / "no_device_nodes"))
     # The BOARD dir too. It holds facts about the machine rather than the run -- the learned clamp
     # threshold -- so in production it sits one level above the per-model state dir, shared by every
     # model on the host. Unpinned here, that `.parent` walks straight out of this box and into the

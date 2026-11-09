@@ -136,11 +136,25 @@ def test_a_stack_entered_twice_still_reports_layer_indices():
 
 def test_the_probe_closes_the_block_even_when_it_raises():
     """An unclosed window swallows the rest of the run exactly as the missing marker did."""
+    # The probe brackets blocks through the shared helper, handing it the end-marker emit...
     src = (_PA / "cc_optimize" / "_op_sig_probe.py").read_text()
-    i = src.index("def _wrapped(self, *a, __orig=orig, **k):")
-    body = src[i : i + 420]
-    assert "finally:" in body, "a block that raises never emits its end marker"
-    assert "_emit(self, end=True)" in body
+    i = src.index("bracket_entry_points(cls, ")
+    assert "_emit(self, end=True)" in src[i : i + 200], "the probe no longer emits an end marker"
+    # ...and the helper emits it even when the block raises (checked by behaviour, not by text).
+    from agent.caller_stacks import bracket_entry_points
+
+    events = []
+
+    class Block:
+        def __call__(self):
+            raise RuntimeError("boom")
+
+    bracket_entry_points(Block, lambda s: events.append("in"), lambda s: events.append("out"), "_t")
+    try:
+        Block()()
+    except RuntimeError:
+        pass
+    assert events == ["in", "out"], "a block that raises never emits its end marker"
 
 
 def test_the_end_marker_is_never_counted_as_device_work():

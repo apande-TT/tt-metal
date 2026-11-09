@@ -21,9 +21,11 @@ from __future__ import annotations
 try:
     from ..agent import marker_vocab as _vocab
     from ..agent import stage_seams as _seams
+    from ..agent.caller_stacks import bracket_entry_points
 except ImportError:  # perf_automation itself is the sys.path root
     from agent import marker_vocab as _vocab
     from agent import stage_seams as _seams
+    from agent.caller_stacks import bracket_entry_points
 
 import json
 import sys
@@ -798,27 +800,12 @@ def _install_block_signposts():
         for st in stacks:
             for blk in getattr(st, "stack", None) or []:
                 cls = type(blk)
-                if cls in seen or getattr(cls, "_perf_emit_wrapped", False):
+                if cls in seen:
                     continue
                 seen.add(cls)
-                orig = getattr(cls, "__call__", None)
-                if orig is None:
-                    continue
-
-                def _wrapped(self, *a, __orig=orig, **k):
-                    _emit(self)
-                    try:
-                        return __orig(self, *a, **k)
-                    finally:
-                        # CLOSE THE BLOCK even if it raises: an unclosed window would swallow the
-                        # rest of the run exactly as the missing marker did.
-                        _emit(self, end=True)
-
-                try:
-                    cls.__call__ = _wrapped
-                    cls._perf_emit_wrapped = True
-                except Exception:  # noqa: BLE001 -- a C type or slotted class cannot be patched
-                    pass
+                # EVERY ENTRY POINT, not just __call__: a stack driven as `blk.forward(x)` (or any other
+                # method) never passes through __call__ and was tagged-but-silent. See entry_points.
+                bracket_entry_points(cls, _emit, lambda self: _emit(self, end=True), "_perf_emit_wrapped")
 
     globals()["tag_built_model"] = tag_built_model
     # ALSO ON builtins, because the probe runs as `python -m ..._op_sig_probe` and is therefore
@@ -893,7 +880,7 @@ _SEQ_PRINT_OPS = 50000
 
 
 def _printable_seq(seq, cap: int = _SEQ_PRINT_OPS) -> list:
-    """The head of `seq`, PLUS every control token that falls past it, in original order.
+    """The head of `seq`, PLUS every control token and each op's first appearance per segment past it.
 
     THE CUT MUST NOT EAT THE STRUCTURE. A head slice keeps the first ops and drops every marker
     emitted later -- and the markers are the only record of which block ran inside which stage.
@@ -907,11 +894,35 @@ def _printable_seq(seq, cap: int = _SEQ_PRINT_OPS) -> list:
     died after 10.6 h having overflowed the device profiler's buffer. One head slice, two nights.
 
     Deletion only, never reordering, so the surviving tokens keep the order they ran in: everything
-    before the cut holds its place and the later markers follow, which is where they were. The head
-    is the same slice as before, so _work_signal -- which ignores control tokens -- is unchanged.
+    before the cut holds its place and the later markers follow, which is where they were.
+
+    PAST THE CUT, EACH OP'S FIRST APPEARANCE IN EACH SEGMENT IS KEPT TOO, and the repeats are
+    replaced by one ELIDED count. Markers alone were not enough: coverage sizes a stack by the block
+    an op FIRST appears in, and an op whose first appearance fell past the cut was simply absent.
+    GLM-5.3-Flash 2026-11-09: three linear-attention text layers filled the 50000 ops at ~16k each,
+    so layer 3 -- the first sparse-attention and MoE layer -- signposted with no ops in it, and the
+    text window came out 2. The work signal saturated at the cut the same way (49478 at full depth,
+    49912 capped), so a working depth knob read as INERT. A segment is the run of ops between two
+    control tokens, so one new op per block per segment is enough for every first-appearance reader,
+    and ELIDED carries the dropped count so the work signal is the true total. Within the head
+    nothing changes.
     """
     head = list((seq or [])[:cap])
-    tail = [t for t in (seq or [])[cap:] if _vocab.is_control(t)]
+    tail, seen, dropped = [], set(), 0
+    for t in (seq or [])[cap:]:
+        if _vocab.is_control(t):
+            if dropped:
+                tail.append("%s%d" % (_vocab.ELIDED, dropped))
+                dropped = 0
+            tail.append(t)
+            seen = set()
+        elif t in seen:
+            dropped += 1
+        else:
+            seen.add(t)
+            tail.append(t)
+    if dropped:
+        tail.append("%s%d" % (_vocab.ELIDED, dropped))
     return head + tail
 
 
