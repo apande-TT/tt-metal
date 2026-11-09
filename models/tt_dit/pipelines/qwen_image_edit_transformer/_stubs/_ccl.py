@@ -23,6 +23,10 @@ _CHUNK_BYTES = 48 * 1024 * 1024  # per-partial bytes gathered at once
 # Optional fused kernel for the gathered partials' sum: SUM_PARTS(g, n) -> the left-to-right float32 sum of the n
 # slabs of g = [n, ...] (bit-identical to the slice + add chain below), or None for a g it does not take.
 SUM_PARTS = None
+# Optional exact reduce-scatter + all-gather for an axis of >= 4 devices: each device receives every partial's 1/n
+# column slice (all_to_all), sums its slice in the same device order (SUM_PARTS), and the summed slices are gathered
+# back -- 2 (n - 1) / n of the tensor over the links instead of the gather's (n - 1), and a 1/n-sized sum.
+A2A_REDUCE = False
 
 
 def mesh_axes(device):
@@ -51,10 +55,37 @@ def _gather_sum_once(y, ax, n):
     return ttnn.reshape(out, shape)
 
 
+def _a2a_sum(y, ax, n):
+    """The reduce as all_to_all (each device: every partial's slice of its 1/n columns) + sum + all_gather of the
+    sums, or None for a y it does not take."""
+    shape = list(y.shape)
+    if SUM_PARTS is None or n < 4 or len(shape) < 2 or shape[-1] % (32 * n) or y.layout != ttnn.TILE_LAYOUT:
+        return None
+    g = ttnn.experimental.all_to_all_async_generic(
+        ttnn.reshape(y, [1] + shape),
+        in_dim=0,
+        out_dim=len(shape),
+        num_links=1,
+        topology=ttnn.Topology.Linear,
+        cluster_axis=ax,
+    )
+    part = SUM_PARTS(g, n)
+    ttnn.deallocate(g)
+    if part is None:
+        return None
+    out = ttnn.all_gather(part, dim=len(shape) - 1, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
+    ttnn.deallocate(part)
+    return out
+
+
 def _gather_sum(y, device, ax):
     """Exact float32 reduce over mesh axis `ax`: gather every partial on a new leading dim, then add."""
     n = tuple(device.shape)[ax]
     shape = list(y.shape)
+    if A2A_REDUCE:
+        out = _a2a_sum(y, ax, n)
+        if out is not None:
+            return out
     nbytes = 4 if y.dtype == ttnn.float32 else 2
     for s in shape:
         nbytes *= s
