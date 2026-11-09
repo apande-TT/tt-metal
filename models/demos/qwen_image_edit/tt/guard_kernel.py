@@ -163,6 +163,109 @@ def guard_tail(ex, dn, nn, tol, lo_fn, lo2_fn=None):
     return y
 
 
+_NORMS_READER = f"{_DIR}/guard_norms_reader.cpp"
+_NORMS_COMPUTE = f"{_DIR}/guard_norms_compute.cpp"
+
+
+def _batch(t):
+    v = 1
+    for d in list(t.padded_shape)[:-2]:
+        v *= d
+    return v
+
+
+def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
+    """guard_tail(ex, dn, nn, a_s * b_norm, lo_fn) with the tolerance's outer product formed tile by tile inside the
+    kernel (a_s: the slack-scaled [.., M, 1] row norms, b_norm the [.., 1, N] column norms; each batch-matched to ex
+    or a single batch broadcast over it): no output-sized tol tensor written and read back. Consumes ex, dn, nn and
+    lo_fn()'s product, not a_s / b_norm. Returns None (lo_fn not called) for a shape it does not take."""
+    s = list(ex.shape)
+    if len(s) < 2 or not all(_plain(t, s) for t in (ex, dn, nn)):
+        return None
+    for t in (a_s, b_norm):
+        if t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
+            return None
+    ps = list(ex.padded_shape)
+    mt, nt = ps[-2] // TILE, ps[-1] // TILE
+    pa, pb = list(a_s.padded_shape), list(b_norm.padded_shape)
+    if list(a_s.shape)[-2:] != [s[-2], 1] or list(b_norm.shape)[-2:] != [1, s[-1]]:
+        return None
+    if pa[-2] // TILE != mt or pa[-1] != TILE or pb[-1] // TILE != nt or pb[-2] != TILE:
+        return None
+    nb = _batch(ex)
+    if _batch(a_s) not in (1, nb) or _batch(b_norm) not in (1, nb):
+        return None
+    a_bstride = mt if _batch(a_s) == nb and nb > 1 else 0
+    b_bstride = nt if _batch(b_norm) == nb and nb > 1 else 0
+    lo = lo_fn()
+    if not _plain(lo, s):
+        ttnn.deallocate(lo)
+        return None
+    n_tiles = nb * mt * nt
+    y = ttnn.empty_like(ex)
+    grid = y.device().compute_with_storage_grid_size()
+    work = _cores(grid, n_tiles)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb_desc(cb):
+        return ttnn.CBDescriptor(
+            total_size=2 * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=cb, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+
+    cbs = [cb_desc(cb) for cb in (0, 1, 2, 3, 4, 5, _OUT_CB)]
+    ins = [ex, dn, nn, lo, a_s, b_norm]
+    reader_cta = []
+    for t in ins:
+        reader_cta.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    addrs = [t.buffer_address() for t in ins]
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = addrs + [count, start, mt, nt, a_bstride, b_bstride]
+        compute_rt[c.x][c.y] = [count, start, nt]
+        writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
+    )
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    for cb in _IN_CBS:
+        unpack[cb] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_NORMS_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=reader_cta,
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_NORMS_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op(ins + [y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    for t in (ex, dn, nn, lo):
+        ttnn.deallocate(t)
+    return y
+
+
 def vote_tail(acc, bn, f0, e_neg, tol):
     """where(|e_x - e_neg| <= tol, e_x, median(e_x, f0, e_neg)), e_x = acc - bn: precise_affine's exact-mode
     vote tail (models/tt_dit/pipelines/qwen_image_edit_vae/_stubs/_resident.py, VOTE_TAIL), ~8 float32 ttnn

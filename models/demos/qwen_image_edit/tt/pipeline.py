@@ -29,6 +29,7 @@ from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
     guard_tail,
+    guard_tail_norms,
     head_split,
     lane_cols_sum,
     masked_lane_linear,
@@ -385,6 +386,8 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "SOFTMAX_DEFER_DIV", True),
             # (and that exp in the SFPU's fast approximate mode)
             (_dit_precise, "SOFTMAX_EXP_APPROX", True),
+            # (the guarded tail's tolerance a_norm x b_norm formed inside the C++ tail: no output-sized tol pass)
+            (_te_attention, "GUARD_TAIL_NORMS", guard_tail_norms if self.fused_tail else None),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:

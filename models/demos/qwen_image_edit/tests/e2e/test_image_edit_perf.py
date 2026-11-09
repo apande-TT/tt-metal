@@ -1,178 +1,190 @@
-import gc
 import inspect
 import os
 import time
 
-import torch
-
+import pytest
 import ttnn
+
 from models.demos.qwen_image_edit.tt import inputs as I
 
+# ONE VARIABLE FOR ONE THING. PERF_OSL_TOKENS is the single declared output unit; nothing below
+# re-declares it under a second name.
 PERF_FLUSH_EVERY = int(os.environ.get("TT_PERF_FLUSH_EVERY", "32"))
+# ISL / OSL -- THE MEASUREMENT CONDITIONS (tool's choice, env-overridable, echoed into the log).
 PERF_ISL_TOKENS = int(os.environ.get("TT_PERF_ISL_TOKENS", "128"))
 PERF_OSL_TOKENS = int(os.environ.get("TT_PERF_OSL_TOKENS", "128"))
-# EAGER-PATH BOUND. Diffusion has no decode loop; the eager path runs ONE bounded forward.
+# EAGER-PATH BOUND (profiler host-memory): the eager pass runs at most this many denoising steps.
 _EAGER_OSL_TOKENS = min(PERF_OSL_TOKENS, int(os.environ.get("TT_PERF_EAGER_OSL_TOKENS", "8")))
-# BATCH BELONGS TO THE MODEL. 0 means "ask the pipeline".
+# BATCH BELONGS TO THE MODEL. 0 means "ask the pipeline"; a positive value overrides.
 PERF_BATCH = int(os.environ.get("TT_PERF_BATCH", "0"))
+
+# DEPTH, PER STAGE. Absent == all layers (None); a positive value caps that stage's block stack.
 _pl = (os.environ.get("TT_PERF_LAYERS") or "").strip()
 PERF_LAYERS = int(_pl) if (_pl.isdigit() and int(_pl) > 0) else None
+_pl_vision_encode = (os.environ.get("TT_PERF_VISION_ENCODE_LAYERS") or "").strip()
+PERF_VISION_ENCODE_LAYERS = (
+    int(_pl_vision_encode) if (_pl_vision_encode.isdigit() and int(_pl_vision_encode) > 0) else None
+)
+_pl_text_encode = (os.environ.get("TT_PERF_TEXT_ENCODE_LAYERS") or "").strip()
+PERF_TEXT_ENCODE_LAYERS = int(_pl_text_encode) if (_pl_text_encode.isdigit() and int(_pl_text_encode) > 0) else None
+_pl_vae_encode = (os.environ.get("TT_PERF_VAE_ENCODE_LAYERS") or "").strip()
+PERF_VAE_ENCODE_LAYERS = int(_pl_vae_encode) if (_pl_vae_encode.isdigit() and int(_pl_vae_encode) > 0) else None
+_pl_denoise = (os.environ.get("TT_PERF_DENOISE_LAYERS") or "").strip()
+PERF_DENOISE_LAYERS = int(_pl_denoise) if (_pl_denoise.isdigit() and int(_pl_denoise) > 0) else None
+_pl_vae_decode = (os.environ.get("TT_PERF_VAE_DECODE_LAYERS") or "").strip()
+PERF_VAE_DECODE_LAYERS = int(_pl_vae_decode) if (_pl_vae_decode.isdigit() and int(_pl_vae_decode) > 0) else None
 
-# HEAVY AXIS for diffusion = TIMESTEPS. The demo runs the full 50-step schedule; a perf profile only
-# needs a representative dispatch-dense pass, so the raw input (num_inference_steps) is trimmed here.
-PERF_DENOISE_STEPS = max(1, int(os.environ.get("TT_PERF_DENOISE_STEPS", "2")))
-# Condition-image side; defaults to the demo's own area (the pipeline's VAE/halo path is built for it).
-PERF_AREA = int(os.environ.get("TT_PERF_AREA", str(I.DEFAULT_AREA)))
+# HEAVY AXES FOR A DIFFUSION EDIT: timesteps and pixels. The demo runs 50 steps at a 1024 condition
+# side -- correctness/production sizes. The profiled pass uses a SHORT schedule and a SMALL area
+# (the size the e2e gate runs), both env-overridable. The step count never exceeds the declared OSL.
+PERF_STEPS = max(1, min(PERF_OSL_TOKENS, int(os.environ.get("TT_PERF_STEPS", "2"))))
+PERF_AREA = int(os.environ.get("TT_PERF_AREA", "256"))
+# Samples one program carries (the demo's --max-batch); unset == one program, as the demo defaults.
+_mb = (os.environ.get("TT_PERF_MAX_BATCH") or "").strip()
+PERF_MAX_BATCH = int(_mb) if (_mb.isdigit() and int(_mb) > 0) else None
 
-from models.experimental.perf_automation.agent.perf_adapter import (  # noqa: E402,F401
+# TOPOLOGY. The demo self-opens a 2x4 mesh via demo/mesh.open_mesh.
+from models.experimental.perf_automation.agent.perf_adapter import (  # noqa: E402
     resolve_batch,
     resolve_mesh_shape,
     resolve_trace_region,
 )
 
-# The demo opens a 2x4 mesh via demo/mesh.open_mesh().
-_SRC_MESH = (2, 4)
-_MESH_SHAPE = resolve_mesh_shape(default_rows=_SRC_MESH[0], default_cols=_SRC_MESH[1])
+_SRC_ROWS, _SRC_COLS = 2, 4
+_MESH_SHAPE = resolve_mesh_shape(default_rows=_SRC_ROWS, default_cols=_SRC_COLS)
 
 _PERF_TRACE = os.environ.get("TT_PERF_TRACE", "1") == "1"
 
 
-def _condition_hw():
-    """(height, width) the condition image is encoded at for PERF_AREA. The pipeline needs it at BUILD
-    time, before any input exists: the VAE lays its stacks out for the image size, and above the default
-    area a whole image per chip stops fitting, so a build that was not told the size partitions nothing
-    and aborts in the encoder. The demo passes the same from its own encoding."""
-    w, h = I.condition_size(I.load_example_image(), PERF_AREA)
-    return h, w
-
-
-def _open_device():
-    """Open the mesh exactly as the demo does (demo.mesh.open_mesh), honouring the resolved shape and
-    passing the trace region through when the open function accepts it."""
-    from models.demos.qwen_image_edit.demo.mesh import close_mesh, open_mesh
-
-    rows, cols = _MESH_SHAPE
+def _open_mesh_kwargs(open_mesh):
+    """kwargs for the source's own open_mesh: planned mesh shape + (under TT_PERF_TRACE) trace params."""
     try:
         params = inspect.signature(open_mesh).parameters
     except (TypeError, ValueError):
         params = {}
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    # THE REGION THIS MODEL RESERVES FOR ITS OWN TRACES, read off the open it is declared on rather
-    # than copied here. resolve_trace_region takes the larger of that and what the tool asks for, so
-    # TT_PERF_TRACE_REGION can give a capture more room and can never hand this open less than the
-    # demo sized: at 40 MiB every stage dies in mesh_trace.cpp's region assertion and the test still
-    # passes (an untimed stage costs only its own row), leaving a reading that is missing the stage
-    # holding three quarters of the pipeline.
-    _declared = params["trace_region_size"].default if "trace_region_size" in params else None
-    _trace_region = resolve_trace_region(_declared if isinstance(_declared, int) else 0)
     kw = {}
-    if _PERF_TRACE:
-        if "trace_region_size" in params or has_var_kw:
-            kw["trace_region_size"] = _trace_region
-        if "num_command_queues" in params or has_var_kw:
-            kw["num_command_queues"] = 1
-    shape_given = False
-    if "mesh_shape" in params:
-        kw["mesh_shape"] = ttnn.MeshShape(rows, cols)
-        shape_given = True
-    elif "rows" in params and "cols" in params:
+    rows, cols = _MESH_SHAPE
+    if "rows" in params and "cols" in params:
         kw["rows"], kw["cols"] = rows, cols
-        shape_given = True
-    elif "shape" in params:
-        kw["shape"] = (rows, cols)
-        shape_given = True
-
-    if shape_given or (rows, cols) == _SRC_MESH:
-        return open_mesh(**kw), close_mesh
-
-    # The planned topology differs from the demo's and open_mesh cannot take a shape: open the
-    # resolved MeshShape directly with the same knobs.
-    dev_kw = {"l1_small_size": 24576}
+    else:
+        for name in ("mesh_shape", "shape"):
+            if name in params:
+                default = params[name].default
+                if isinstance(default, (tuple, list)):
+                    kw[name] = (rows, cols)
+                else:
+                    kw[name] = ttnn.MeshShape(rows, cols)
+                break
+        else:
+            if (rows, cols) != (_SRC_ROWS, _SRC_COLS):
+                print(
+                    "MESH_SHAPE_WARNING=open_mesh takes no shape argument; requested %dx%d" % (rows, cols),
+                    flush=True,
+                )
     if _PERF_TRACE:
-        dev_kw["trace_region_size"] = _trace_region
-        dev_kw["num_command_queues"] = 1
-    if rows * cols > 1:
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-    dev = ttnn.open_mesh_device(ttnn.MeshShape(rows, cols), **dev_kw)
-
-    def _close(d):
-        ttnn.close_mesh_device(d)
-        if rows * cols > 1:
-            ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
-
-    return dev, _close
+        src_region = 0
+        if "trace_region_size" in params:
+            d = params["trace_region_size"].default
+            if isinstance(d, int) and d is not inspect.Parameter.empty:
+                src_region = d
+            kw["trace_region_size"] = resolve_trace_region(src_region)
+        if "num_command_queues" in params:
+            kw["num_command_queues"] = 1
+    return kw
 
 
 def _load_tokenizer():
+    """The Qwen2.5-VL tokenizer the pipeline's text encoder consumes."""
+    for name in ("load_tokenizer", "get_tokenizer", "tokenizer"):
+        fn = getattr(I, name, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001
+                pass
     from transformers import AutoTokenizer
 
-    repo = os.environ.get("TT_PERF_TOKENIZER", "Qwen/Qwen-Image-Edit")
+    model_id = None
+    for name in ("MODEL_ID", "HF_MODEL_ID", "MODEL_NAME", "REPO_ID"):
+        model_id = getattr(I, name, None)
+        if isinstance(model_id, str):
+            break
+        model_id = None
+    model_id = model_id or os.environ.get("HF_MODEL", "Qwen/Qwen-Image-Edit")
     try:
-        return AutoTokenizer.from_pretrained(repo, subfolder="tokenizer")
+        return AutoTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     except Exception:  # noqa: BLE001
-        return AutoTokenizer.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        return AutoTokenizer.from_pretrained(model_id)
 
 
-def _isl_prompt():
-    """Prompt of EXACTLY PERF_ISL_TOKENS tokens (ids + decoded text for the pipeline's string input)."""
-    from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
+def _build_kwargs(image_hw):
+    return dict(
+        image_hw=image_hw,
+        layers=PERF_LAYERS,
+        vision_encode_layers=PERF_VISION_ENCODE_LAYERS,
+        text_encode_layers=PERF_TEXT_ENCODE_LAYERS,
+        vae_encode_layers=PERF_VAE_ENCODE_LAYERS,
+        denoise_layers=PERF_DENOISE_LAYERS,
+        vae_decode_layers=PERF_VAE_DECODE_LAYERS,
+    )
 
-    tok = _load_tokenizer()
-    ids = prompt_ids_for_isl(tok, PERF_ISL_TOKENS)
-    flat = ids.reshape(-1).tolist() if hasattr(ids, "reshape") else list(ids)
-    return ids, tok.decode(flat, skip_special_tokens=True)
 
-
-def _pipeline_batch(pipe):
+def _model_batch(pipe):
+    """Batch from the model: explicit positive TT_PERF_BATCH, else what the pipeline declares."""
     if PERF_BATCH > 0:
         return PERF_BATCH
+    try:
+        b = resolve_batch(pipe, PERF_BATCH)
+        if isinstance(b, int) and b > 0:
+            return b
+    except Exception:  # noqa: BLE001
+        pass
     for name in ("max_batch_size", "batch_size", "batch"):
-        v = getattr(pipe, name, None)
-        if isinstance(v, int) and v > 0:
-            return v
-    b = I.batch_size_from_env()
-    return b if b and b > 0 else 1
+        b = getattr(pipe, name, None)
+        if isinstance(b, int) and b > 0:
+            return b
+    try:
+        b = I.batch_size_from_env()
+        if isinstance(b, int) and b > 0:
+            return b
+    except Exception:  # noqa: BLE001
+        pass
+    return 1
 
 
 def test_image_edit_perf():
-    device, _close = _open_device()
+    from models.demos.qwen_image_edit.demo.mesh import close_mesh, open_mesh
+    from models.demos.qwen_image_edit.tt.pipeline import build_pipeline, run_image_edit, to_host
+    from models.experimental.perf_automation.agent.perf_test_gen import prompt_ids_for_isl
+
+    # ISL: the instruction prompt is EXACTLY PERF_ISL_TOKENS tokens of the text encoder's tokenizer.
+    tokenizer = _load_tokenizer()
+    _prompt_ids = prompt_ids_for_isl(tokenizer, PERF_ISL_TOKENS)
+    _flat_ids = _prompt_ids.reshape(-1).tolist() if hasattr(_prompt_ids, "reshape") else list(_prompt_ids)
+    perf_prompt = tokenizer.decode(_flat_ids, skip_special_tokens=True)
+    print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
+    print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
+    print("PERF_STEPS=%d PERF_AREA=%d" % (PERF_STEPS, PERF_AREA), flush=True)
+
+    def _encode(B, steps):
+        return I.encode_inputs(
+            B,
+            area=PERF_AREA,
+            prompt=perf_prompt,
+            image=None,
+            base_seed=I.EXAMPLE_SEED,
+            num_inference_steps=steps,
+        )
+
+    # The pipeline is sized for the condition image's resolution; that comes from the input encoding.
+    _enc_probe = _encode(1, PERF_STEPS)
+    _image_hw = (_enc_probe.height, _enc_probe.width)
+
+    device = open_mesh(**_open_mesh_kwargs(open_mesh))
     try:
-        _prompt_ids, _prompt_text = _isl_prompt()
-        if not torch.is_tensor(_prompt_ids):
-            _prompt_ids = torch.tensor(_prompt_ids, dtype=torch.long).reshape(1, -1)
-        print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
-        print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
-        print("PERF_DENOISE_STEPS=%d" % PERF_DENOISE_STEPS, flush=True)
 
         def _eager_forward():
-            from models.demos.qwen_image_edit.tt.pipeline import build_pipeline, run_image_edit
-
-            pipe = build_pipeline(device, layers=PERF_LAYERS, image_hw=_condition_hw())
-            # --- per-stage marks (injected) ---------------------------------------------------
-            # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
-            # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
-            # profiling branch and raised NameError, since the generator had defined them inside another
-            # function. Handed locals() rather than a name, so nothing depends on how the test spells things.
-            print("STAGE_MARKS_ENTER", flush=True)
-            try:
-                from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
-
-                print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals()), flush=True)
-            except Exception as _tt_e2:  # noqa: BLE001
-                print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
-            B = _pipeline_batch(pipe)
-            enc = I.encode_inputs(
-                B,
-                area=PERF_AREA,
-                prompt=_prompt_text,
-                image=None,
-                base_seed=I.EXAMPLE_SEED,
-                num_inference_steps=PERF_DENOISE_STEPS,
-            )
-            print(
-                f"[perf] {B} sample(s), {enc.width}x{enc.height}, {len(enc.timesteps)} steps",
-                flush=True,
-            )
+            import torch
 
             counter = [0]
             _orig = []
@@ -194,13 +206,42 @@ def test_image_edit_perf():
             for _mod in [_m for _m in _mods if _m is not None]:
                 for _n in dir(_mod):
                     _op = getattr(_mod, _n, None)
-                    if type(_op).__name__ == "FastOperation":
+                    if type(_op).__name__ == "FastOperation":  # every dispatched ttnn op, by type
                         _orig.append((_mod, _n, _op))
                         setattr(_mod, _n, _draining(_op))
-            _fw0 = time.monotonic()
+            out = None
             try:
-                out = run_image_edit(pipe, enc, use_trace=False)
-                ttnn.synchronize_device(device)
+                t0 = time.time()
+                pipe = build_pipeline(device, **_build_kwargs(_image_hw))
+                # --- per-stage marks (injected) ---------------------------------------------------
+                # Runs HERE, at the end of the function that built the pipeline, because that object is a LOCAL of
+                # this scope: an earlier version copied the test's own PipelineStageAdapter(...) arguments into the
+                # profiling branch and raised NameError, since the generator had defined them inside another
+                # function. Handed locals() rather than a name, so nothing depends on how the test spells things.
+                print("STAGE_MARKS_ENTER", flush=True)
+                try:
+                    from models.experimental.perf_automation.agent import stage_marks as _tt_sm2
+
+                    print("STAGE_MARKS_RESULT=%d" % _tt_sm2.mark_stages_in_scope(locals()), flush=True)
+                except Exception as _tt_e2:  # noqa: BLE001
+                    print("STAGE_MARKS_SKIPPED=%r" % (_tt_e2,), flush=True)
+                print(f"[perf] pipeline built in {time.time() - t0:.0f} s", flush=True)
+                B = _model_batch(pipe)
+                steps = max(1, min(PERF_STEPS, _EAGER_OSL_TOKENS))
+                enc = _encode(B, steps)
+                print(
+                    f"[perf] {B} sample(s), {enc.width}x{enc.height}, {len(enc.timesteps)} steps",
+                    flush=True,
+                )
+                _fw0 = time.monotonic()
+                groups = I.sample_groups(B, PERF_MAX_BATCH)
+                parts = []
+                for g in groups:
+                    r = run_image_edit(pipe, enc.subset(g) if len(groups) > 1 else enc, use_trace=False)
+                    ttnn.synchronize_device(device)
+                    parts.append(to_host(r["image"], device).float())
+                    del r
+                out = torch.cat(parts) if len(parts) > 1 else parts[0]
                 try:
                     ttnn.ReadDeviceProfiler(device)
                 except Exception:
@@ -209,19 +250,20 @@ def test_image_edit_perf():
                 for _mod, _n, _f in _orig:
                     setattr(_mod, _n, _f)
             print("FORWARD_WALL_MS=%.4f" % ((time.monotonic() - _fw0) * 1000.0))
-            assert out is not None and out.get("image") is not None  # perf only — NO PCC
-            del out, pipe
-            gc.collect()
+            assert out is not None  # perf only — NO PCC
+            del pipe
 
         def _traced_forward():
-            from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
             from models.experimental.perf_automation.agent.trace_replay import measure_adapter
+            from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter
 
             def _build_for_perf(dev):
-                from models.demos.qwen_image_edit.tt.pipeline import build_pipeline
+                from models.demos.qwen_image_edit.tt.pipeline import build_pipeline as _bp
 
-                return build_pipeline(dev, layers=PERF_LAYERS, image_hw=_condition_hw())
+                return _bp(dev, **_build_kwargs(_image_hw))
 
+            print("PERF_ISL_TOKENS=%d" % _prompt_ids.shape[-1], flush=True)
+            print("PERF_OSL_TOKENS=%d" % PERF_OSL_TOKENS, flush=True)
             measure_adapter(PipelineStageAdapter(_build_for_perf, _prompt_ids, batch=PERF_BATCH), device)
 
         def _try_traced():
@@ -245,6 +287,7 @@ def test_image_edit_perf():
             # a generated test simply omitted this, which is why five earlier attempts measured nothing.
             try:
                 from models.experimental.perf_automation.agent import stage_marks as _tt_sm
+                from models.experimental.perf_automation.agent.perf_adapter import PipelineStageAdapter as _TtPSA
             except Exception:  # noqa: BLE001
                 _tt_sm = None
             if _tt_sm is not None:
@@ -259,4 +302,4 @@ def test_image_edit_perf():
             if _PERF_TRACE:
                 _try_traced()
     finally:
-        _close(device)
+        close_mesh(device)
