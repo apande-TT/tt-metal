@@ -384,6 +384,10 @@ def _col_norms(w, transpose_b=False, cache=True):
 # shape it does not take -- then without calling rest_fn, so the ttnn spelling below keeps its own order (the
 # trailing product formed after the guard: the denoiser has no room to hold it through the guard).
 GUARD_TAIL = None
+# Optional fused kernel for the same tail with its tolerance formed inside it: GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm,
+# rest_fn) with a_s the slack-scaled [.., M, 1] row norms -- the same value, no output-sized tol tensor -- consuming
+# ex, dn, nn and rest_fn()'s product (not a_s / b_norm), or None (rest_fn not called) for a shape it does not take.
+GUARD_TAIL_NORMS = None
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -437,6 +441,13 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     limb terms' first product) when given; nn = mm(-x), the negated-input product before its sign is restored.
     The negation and the |ex - dn| are fused into the binary ops that consume them and the slack scales the
     [.., M, 1] norm, so no output-sized pass is spent on any of them."""
+    if GUARD_TAIL_NORMS is not None and rest_fn is not None and rest2_fn is None:
+        # tol = (a_norm * slack) * b_norm formed tile by tile inside the tail: no output-sized tol written and read
+        a_s = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12)
+        y = GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm, rest_fn)
+        ttnn.deallocate(a_s)
+        if y is not None:
+            return y
     if NORMS_L1:  # the outer product re-reads a broadcast operand tile per output tile: from L1, not DRAM
         a_norm = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12, memory_config=ttnn.L1_MEMORY_CONFIG)
         b_norm = ttnn.to_memory_config(b_norm, ttnn.L1_MEMORY_CONFIG)
