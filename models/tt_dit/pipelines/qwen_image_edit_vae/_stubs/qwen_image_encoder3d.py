@@ -33,6 +33,9 @@ _W_AXIS = 1
 
 # the batch-parallel output gather on the tiled latent (the tilize that follows it moved before it)
 BATCH_GATHER_TILED = False
+# the single-frame tiled [B, C, 1, H, W] input to BTHWC by two native tile transposes ([B, C, H, W] -> [B, H, C, W] ->
+# [B, H, W, C]) instead of the generic 5-D tiled permute (4.9 ms on the 3-channel image); data movement only
+INPUT_BY_TRANSPOSE = False
 
 
 class TtQwenImageEncoder3d:
@@ -95,7 +98,11 @@ class TtQwenImageEncoder3d:
         assert T == 1 or not self.single_frame, f"single_frame encoder got T={T}"
         pc = self.parallel_config
 
-        x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
+        if INPUT_BY_TRANSPOSE and T == 1 and x.layout == ttnn.TILE_LAYOUT and H % 32 == 0 and W % 32 == 0:
+            x = ttnn.transpose(ttnn.reshape(x, (B, C, H, W)), 1, 2)  # [B, H, C, W]
+            x = ttnn.reshape(ttnn.transpose(x, -2, -1), (B, 1, H, W, C))  # BTHWC
+        else:
+            x = ttnn.permute(x, (0, 2, 3, 4, 1))  # BTHWC
         c_pad = aligned_channels(C) - C
         if c_pad:
             x = ttnn.pad(x, [(0, 0), (0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
