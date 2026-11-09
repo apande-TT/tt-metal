@@ -152,6 +152,7 @@ class TtQwenVAE:
             # tap, so neither their T front pad nor its zero frames' MACs run
             qwen_image_encoder3d.BATCH_GATHER_TILED = True  # its batch gather on the tiled latent
             qwen_image_encoder3d.INPUT_BY_TRANSPOSE = True  # and its input BTHWC by two tile transposes
+            qwen_image_encoder3d.INPUT_PARTITION_FIRST = True  # on each chip's part of the input only
             self.encoder = qwen_image_encoder3d.build(
                 device, hf_vae.encoder, batch_parallel=True, single_frame=True, blocking=_encoder_blocking, ccl_links=4
             )
