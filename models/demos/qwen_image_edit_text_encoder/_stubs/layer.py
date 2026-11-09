@@ -89,6 +89,9 @@ ROPE_FN = None
 # optional fn(qkv, lo, n, head_dim, cos, sin) -> ROPE_FN of heads [lo, lo + n) read straight from the fused qkv
 # projection (no per-head slices + concat first), or None where it does not apply
 ROPE_HEADS_FN = None
+# with ROPE_HEADS_FN: q's / k's RoPE output in L1 (read by the QK^T product, freed after it) when q takes at most this
+# many bytes (0: DRAM)
+ROPE_L1_BYTES = 0
 
 
 def _t(lin):
@@ -263,21 +266,31 @@ class TtTextAttention:
                 return y
             return ttnn.add(ttnn.multiply(t, cos), ttnn.multiply(rotate_half(t), sin))
 
+        rope_l1 = 0 < b * hl * s_pad * D * 4 <= ROPE_L1_BYTES
+
         def _rope_heads(lo, n):
             """RoPE of heads [lo, lo + n): read straight from qkv by ROPE_HEADS_FN where it applies."""
-            y = ROPE_HEADS_FN(qkv, lo, n, D, cos, sin) if ROPE_HEADS_FN is not None else None
+            mem = ttnn.L1_MEMORY_CONFIG if rope_l1 else None
+            y = ROPE_HEADS_FN(qkv, lo, n, D, cos, sin, mem) if ROPE_HEADS_FN is not None else None
             return y if y is not None else _rope(_heads(lo, n))
 
         q, k, v = _rope_heads(0, hl), _rope_heads(hl, kvl), _heads(hl + kvl, kvl)
         if kv is not None:
             mode, cache, key, P = kv
             if mode == "store":
-                cache[key] = (ttnn.slice(k, [0, 0, 0, 0], [b, kvl, P, D]), ttnn.slice(v, [0, 0, 0, 0], [b, kvl, P, D]))
+                dram = {"memory_config": ttnn.DRAM_MEMORY_CONFIG}  # (k may be in L1: ROPE_L1_BYTES)
+                cache[key] = (
+                    ttnn.slice(k, [0, 0, 0, 0], [b, kvl, P, D], **dram),
+                    ttnn.slice(v, [0, 0, 0, 0], [b, kvl, P, D], **dram),
+                )
             else:
                 kp, vp = cache[key]
                 k, v = ttnn.concat([kp, k], dim=2), ttnn.concat([vp, v], dim=2)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
         scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
+        for t in (q, k):
+            if t.memory_config().buffer_type == ttnn.BufferType.L1:
+                ttnn.deallocate(t)
         nbytes = scores.volume() * (4 if scores.dtype == ttnn.float32 else 2)
         sm = ttnn.L1_MEMORY_CONFIG if SOFTMAX_L1_BYTES and nbytes <= SOFTMAX_L1_BYTES else None
         io = sm if SOFTMAX_IO_L1 else None
