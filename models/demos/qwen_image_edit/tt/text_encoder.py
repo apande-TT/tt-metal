@@ -205,6 +205,7 @@ class TtQwenTextEncoder:
         _te_layer.SOFTMAX_IO_L1 = True  # and the masked scores and the probabilities in L1 as well
         _te_layer.ROPE_FN = fused_rope  # and its float32 RoPE as one C++ kernel (no float32 intermediates)
         _te_layer.ROPE_HEADS_FN = fused_rope_heads  # reading q's / k's heads straight from the fused qkv
+        _te_layer.ROPE_L1_BYTES = 8 * 1024 * 1024  # into L1 (q: 5.4 MB), freed after the QK^T product
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         _te_attention.VISION_ROPE_L1_BYTES = 4 * 1024 * 1024  # its RoPE intermediates (q / k: 2.2 MB) in L1
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
