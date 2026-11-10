@@ -117,3 +117,25 @@ def all_gather(y, device, dim=-1):
     for ax in mesh_axes(device):
         y = ttnn.all_gather(y, dim=dim, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
     return y
+
+
+def all_gather_col_major(y, device, dim=-1):
+    """all_gather over the mesh axes in the OTHER order (axis 0 first, on the 1/C-wide shards): device (r, c)'s
+    block lands at position c * R + r instead of r * C + c. The callers lay their weights out for that order."""
+    dim = dim % len(y.shape)
+    for ax in reversed(mesh_axes(device)):
+        y = ttnn.all_gather(y, dim=dim, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
+    return y
+
+
+def col_major_order(device):
+    """[d(p) for gathered position p] under all_gather_col_major: the row-major device index whose block lands at
+    position p (p = c * R + r -> d = r * C + c), or None when the mesh is not 2D."""
+    try:
+        shape = tuple(device.shape)
+    except (AttributeError, TypeError):
+        return None
+    if len(shape) != 2 or shape[0] < 2 or shape[1] < 2:
+        return None
+    rows, cols = shape
+    return [(p % rows) * cols + p // rows for p in range(rows * cols)]
