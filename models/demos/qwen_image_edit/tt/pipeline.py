@@ -323,6 +323,11 @@ class TtQwenImageEditPipeline:
         in one C++ pass (row_sumsq) and the weight-side lanes as one K-stacked product (repeat_k)."""
         with self._hook(_te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None), self._hook(
             _te_attention, "LANE_STACK", repeat_k if self.weight_lane_split else None
+        ), self._hook(
+            # (and the attention products' 8 exact lanes as ONE K-stacked product, as the denoiser's QK^T)
+            _te_attention,
+            "LANE_KSTACK",
+            lanes_ttl.lanes8_stacked if self.lane_split else None,
         ):
             yield
 

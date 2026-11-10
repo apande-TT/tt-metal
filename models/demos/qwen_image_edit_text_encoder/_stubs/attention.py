@@ -1155,7 +1155,13 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         neg0 = None
     else:
         stacked = None
-        if LANE_KSTACK is not None and LANE_STACK is not None and transpose_b and b_rep == 1:
+        # (a repeated b -- b_rep > 1 -- takes the K-stack too when its product goes through mm, which repeats b once)
+        if (
+            LANE_KSTACK is not None
+            and LANE_STACK is not None
+            and transpose_b
+            and (b_rep == 1 or QK_STACK_FIDELITY == ttnn.MathFidelity.HiFi4)
+        ):
             stacked = LANE_KSTACK(pa0)
         if (
             stacked is not None
