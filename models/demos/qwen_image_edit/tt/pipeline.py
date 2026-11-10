@@ -352,6 +352,7 @@ class TtQwenImageEditPipeline:
 
     def text_encode(self, up, image_embeds):
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
+        # (and its MLP's gate / up as ONE column-parallel exact linear: _stubs/layer.py MLP_GATE_UP_FOLD)
         with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_text(up.te, image_embeds)
 
