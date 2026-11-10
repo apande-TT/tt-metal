@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Serving hooks over the optimized MiniCPM5Pipeline: one device row per request, for the vLLM generator publish-hf
-renders into vllm_bundle/ from build_serving_pipeline, SERVING_ROWS, SERVING_KV_CAPACITY and SERVING_DEVICE_PARAMS.
+renders into vllm_bundle/ from build_serving_pipeline, SERVING_ROWS, SERVING_KV_CAPACITY, SERVING_DEVICE_PARAMS and
+SERVING_SERVE_ARGS.
 
 The pipeline's own run is one 32-row batch of equal-length prompts in lockstep. Serving needs each request in its
 own device row: ServingPipeline keeps the optimized decode step and sampler kernels as they are and adds
@@ -35,18 +36,55 @@ from models.demos.minicpm5_2b.tt import pipeline as _pipeline
 SERVING_ROWS = 32
 SERVING_KV_CAPACITY = 3072
 SERVING_DEVICE_PARAMS = {"l1_small_size": 24576, "trace_region_size": 209715200}  # as tests/e2e open the device
+# With chunked prefill off, vLLM's TT platform caps a prefill step at max_model_len (3072) tokens: a burst of
+# SERVING_ROWS prompts of PREFILL_PAD tokens then takes two steps, the second stalling the rows already decoding.
+SERVING_SERVE_ARGS = ["--max-num-batched-tokens", "4096"]
 PREFILL_PAD = 128
 PREFILL_TOKENS = 4096
+# A serving prefill pass costs about _PASS_MS whatever it holds (its ~1,400 ops dispatched one by one) plus _ROW_MS per
+# prompt per PREFILL_PAD padded tokens (measured on p150 / Blackhole).
+_PASS_MS, _ROW_MS = 22.0, 7.3
 NOISE_TABLE_ROWS = 1 << 18
 NOISE_WIDTH = 64
 _SDPA_CHUNK = 128
+# Serving prefill on the bring-up prefill's matmul programs (False: plain ttnn linears); a switch so the two can be
+# compared on one pipeline.
+SERVE_PREFILL_FAST = {"mm": True}
+# L1 the 2-D multicast matmul's circular buffers may take beside the prefill's L1 tensors (its in0 / in1 blocks
+# double-buffered, the bf16 output and the fp32 partials); a deeper K block is used only while they fit.
+_MM_CB_BYTES = 960 * 1024
+
+
+def _grid_linear(device, x, w, compute_cfg, memory_config):
+    """x [.., M, K] @ w [K, N] on the full-grid 2-D multicast matmul (the bring-up prefill projections' program)."""
+    if not SERVE_PREFILL_FAST["mm"]:
+        return ttnn.linear(x, w, compute_kernel_config=compute_cfg, memory_config=memory_config)
+    grid = device.compute_with_storage_grid_size()
+    m_t, k_t, n_t = x.padded_shape[-2] // 32, w.padded_shape[-2] // 32, w.padded_shape[-1] // 32
+    per_m, per_n = -(-m_t // grid.y), -(-n_t // grid.x)
+    tile = 2048
+    k_blk = next(
+        (k for k in (8, 4, 2) if k_t % k == 0 and (2 * k * (per_m + per_n) + 3 * per_m * per_n) * tile <= _MM_CB_BYTES),
+        1,
+    )
+    cfg = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(grid.x, grid.y),
+        in0_block_w=k_blk,
+        out_subblock_h=1,
+        out_subblock_w=next(s for s in (4, 3, 2, 1) if per_n % s == 0),
+        per_core_M=per_m,
+        per_core_N=per_n,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+    return ttnn.linear(x, w, compute_kernel_config=compute_cfg, memory_config=memory_config, program_config=cfg)
 
 
 def _serve_prefill_attention(att, x, kv_cache, ctx, b, seq):
     """[b, S, hidden] -> [b, S, hidden]: QKV, rope, K / V into the cache rows ctx.rows, causal flash SDPA, o_proj."""
     dram = ttnn.DRAM_MEMORY_CONFIG
     x2 = ttnn.reshape(x, (1, b * seq, x.shape[-1]))
-    qkv = ttnn.linear(x2, att.wqkv, compute_kernel_config=att.compute_cfg, memory_config=dram)
+    qkv = _grid_linear(att.device, x2, att.wqkv, att.compute_cfg, dram)
     q, k, v = ttnn.experimental.nlp_create_qkv_heads(
         ttnn.reshape(qkv, (b, 1, seq, qkv.shape[-1])),
         num_heads=att.n_heads,
@@ -82,7 +120,7 @@ def _serve_prefill_attention(att, x, kv_cache, ctx, b, seq):
         ttnn.deallocate(t)
     attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=dram)
     attn = ttnn.reshape(attn, (1, b * seq, att.n_heads * att.head_dim))
-    out = ttnn.linear(attn, att.wo, compute_kernel_config=att.compute_cfg, memory_config=dram)
+    out = _grid_linear(att.device, attn, att.wo, att.compute_cfg, dram)
     ttnn.deallocate(attn)
     return ttnn.reshape(out, (b, seq, out.shape[-1]))
 
@@ -99,7 +137,7 @@ def _cached(self, x, cos, sin, kv_cache, ctx, b, seq):
 attention_stub.TtAttention._cached = _cached
 
 # The MLPs' many-row path runs kernels sized for the 32 x 128 benchmark prefill (mm_swiglu hangs at 2 x 128 rows), so
-# the serving prefill takes their bf16 weights through plain ttnn linears instead; decode keeps the optimized path.
+# the serving prefill takes their bf16 weights through general matmul programs instead; decode keeps the optimized path.
 _SERVE_PREFILL = {"on": False}
 
 
@@ -113,12 +151,19 @@ def _plain_mlp_call(optimized_call):
             x = prenorm(x, memory_config=dram)
         shape = tuple(x.shape)
         x = ttnn.reshape(x, (1, 1, -1, shape[-1]))
-        gate = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg, memory_config=dram)
-        up = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg, memory_config=dram)
-        h = ttnn.multiply(ttnn.silu(gate), up, memory_config=dram)
+        if SERVE_PREFILL_FAST["mm"]:
+            # gate / up on the bring-up prefill's minimal_matmul (small streaming CBs, any row count: the 2-D
+            # multicast's per-core output block for N = 6144 does not fit L1 at 32 x 128 rows), SiLU inside the multiply.
+            gate = self._mm(x, self.w_gate)
+            up = self._mm(x, self.w_up)
+            h = self._silu_mul(gate, up)
+        else:
+            gate = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg, memory_config=dram)
+            up = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg, memory_config=dram)
+            h = ttnn.multiply(ttnn.silu(gate), up, memory_config=dram)
         ttnn.deallocate(gate)
         ttnn.deallocate(up)
-        out = ttnn.linear(h, self.w_down, compute_kernel_config=self.compute_cfg, memory_config=dram)
+        out = _grid_linear(self.device, h, self.w_down, self.compute_cfg, dram)
         ttnn.deallocate(h)
         return ttnn.reshape(out, shape)
 
@@ -171,16 +216,25 @@ class ServingPipeline(_pipeline.MiniCPM5Pipeline):
 
     @classmethod
     def prefill_groups(cls, lens):
-        """Prompt indices in prefill passes: sorted by length, each a power-of-two count of prompts of at most
-        PREFILL_TOKENS padded tokens (the 32 x 128 the layers' L1 intermediates were sized for)."""
+        """Prompt indices in prefill passes, the cheapest plan by the pass cost model: sorted by length, each pass
+        padded to a power-of-two count of prompts (the shapes warm-up compiles) of at most PREFILL_TOKENS padded
+        tokens (the 32 x 128 the layers' L1 intermediates were sized for)."""
         order = sorted(range(len(lens)), key=lambda i: lens[i])
-        groups = []
-        while order:
-            g = 1 << (len(order).bit_length() - 1)
-            while g > 1 and g * cls.padded_len(lens[order[g - 1]]) > PREFILL_TOKENS:
-                g //= 2
-            groups.append(order[:g])
-            order = order[g:]
+        n = len(order)
+        best = [(0.0, n)] * (n + 1)  # best[i]: (cost of the passes over order[i:], end of the first of them)
+        for i in range(n - 1, -1, -1):
+            best[i] = (float("inf"), n)
+            for j in range(i + 1, n + 1):
+                rows, S = 1 << (j - i - 1).bit_length(), cls.padded_len(lens[order[j - 1]])
+                if rows * S > PREFILL_TOKENS and j > i + 1:
+                    break
+                cost = _PASS_MS + _ROW_MS * rows * S / PREFILL_PAD + best[j][0]
+                if cost < best[i][0]:
+                    best[i] = (cost, j)
+        groups, i = [], 0
+        while i < n:
+            groups.append(order[i : best[i][1]])
+            i = best[i][1]
         return groups
 
     def prefill_rows(self, prompts, rows):
@@ -197,19 +251,22 @@ class ServingPipeline(_pipeline.MiniCPM5Pipeline):
         return torch.stack(out)
 
     def _prefill_pass(self, prompts, rows):
+        """One pass over `prompts`, padded with pad-token prompts to a power-of-two count; only the real prompts'
+        K / V reach the cache (ctx.rows lists their rows alone)."""
         n = len(prompts)
         lens = [len(p) for p in prompts]
         S = self.padded_len(max(lens))
         if S > self.capacity:
             raise ValueError(f"prompt of {max(lens)} tokens exceeds the KV capacity {self.capacity}")
-        ids = torch.full((n, S), self.pad_id, dtype=torch.int32)
+        g = 1 << (n - 1).bit_length()
+        ids = torch.full((g, S), self.pad_id, dtype=torch.int32)
         for i, p in enumerate(prompts):
             ids[i, : lens[i]] = torch.as_tensor(p, dtype=torch.int32)
         H, D = self.hidden, self.head_dim
         x = self.token_embed(self._tt(ids, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT))
-        pos = self._tt(torch.arange(S, dtype=torch.float32).repeat(n, 1), ttnn.float32)
+        pos = self._tt(torch.arange(S, dtype=torch.float32).repeat(g, 1), ttnn.float32)
         cos_sin = self.rotary_embedding(x, position_ids=pos)
-        cos, sin = (ttnn.reshape(t, (n, 1, t.shape[-2], D)) for t in cos_sin)
+        cos, sin = (ttnn.reshape(t, (g, 1, t.shape[-2], D)) for t in cos_sin)
         ctx = attention_stub.AttnContext("serve_prefill", None, rope=(cos, ttnn.multiply(sin, self.rot_sign)))
         ctx.rows = [int(r) for r in rows]
         _SERVE_PREFILL["on"] = True
@@ -218,9 +275,11 @@ class ServingPipeline(_pipeline.MiniCPM5Pipeline):
         finally:
             _SERVE_PREFILL["on"] = False
         h = self.final_norm(h)
-        last = [ttnn.slice(h, (i, lens[i] - 1, 0), (i + 1, lens[i], H)) for i in range(n)]
-        if n < self.batch:
-            last.append(self._tt(torch.zeros(self.batch - n, 1, H), ttnn.bfloat16))
+        # every row of the pass (the padding rows at their last position), so the gather's shapes depend on g alone
+        ends = lens + [S] * (g - n)
+        last = [ttnn.slice(h, (i, ends[i] - 1, 0), (i + 1, ends[i], H)) for i in range(g)]
+        if g < self.batch:
+            last.append(self._tt(torch.zeros(self.batch - g, 1, H), ttnn.bfloat16))
         last = ttnn.reshape(ttnn.concat(last, dim=0), (1, self.batch, H))
         logits = self.decoder_head(last)
         out = ttnn.to_torch(logits).reshape(self.batch, -1)[:n, : self.vocab].float()

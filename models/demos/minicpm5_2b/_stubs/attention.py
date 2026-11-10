@@ -75,6 +75,12 @@ _PREFILL_CAUSAL_SKIP = False
 # Decode o_proj with the layer's residual add on helper cores of the same program (DramMatmul residual_add).
 _USE_DRAM_MM_RES = True
 _ATTN_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused")
+# The serving layout's fused decode attention (q_rows, inline_kv, the mask table): kernels/attn_fused's tiles and
+# arithmetic, its reads batched and reordered, the exp over the query rows' faces, the values streamed per key tile.
+_ATTN_FUSED_V3_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "attn_fused_v3")
+ATTN_FUSED_V3 = {"on": True}
+# Value key tiles per reader push, and the value ring in key tiles (a multiple of it).
+_ATTN_V_BLOCK, _ATTN_V_KEYS = 4, 16
 # Prefill score bmm + scale/mask + softmax + probs.V + head merge as ONE generic_op (kernels/attn_prefill): the
 # attn_fused arithmetic per query tile row, the (batch, KV head) block's K / V resident in L1 across its rows.
 _USE_FUSED_PREFILL_ATTN = True
@@ -855,6 +861,8 @@ class TtAttention:
         # inline_kv (with kv_write and q_rows): each row block's core does its own KV-cache write (reader + compute,
         # fp32 DEST, the kv_write arithmetic -- e2e bit-identical) instead of separate cores behind semaphores.
         inline_kv = inline_kv and kv_write is not None and q_rows is not None
+        v3 = ATTN_FUSED_V3["on"] and inline_kv and bool(ctx.mask_table) and g + 1 <= 16
+        kdir = _ATTN_FUSED_V3_DIR if v3 else _ATTN_FUSED_DIR
         qkv_t = kv_write[0] if kv_write is not None else None
         if kv_write is not None and not inline_kv:
             qkv, k_row = kv_write
@@ -899,7 +907,7 @@ class TtAttention:
             (cb_sm_in, c_t, bf),
             (cb_mx, 1, bf),
             (cb_sm, 1, f32),
-            (cb_v, 2 * c_t, bf),
+            (cb_v, _ATTN_V_KEYS * d_t if v3 else 2 * c_t, bf),
             (cb_probs, c_t, bf),
             (cb_out, 2, bf),
             (cb_max, 1, f32),
@@ -933,7 +941,7 @@ class TtAttention:
         for t in tensors:
             accessor_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
         reader = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_ATTN_FUSED_DIR, "reader_attn_fused.cpp"),
+            kernel_source=os.path.join(kdir, "reader_attn_fused.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[
@@ -956,7 +964,8 @@ class TtAttention:
             + [int(inline_kv), cb_kv_old, cb_kv_new, cb_kv_scr, cb_kv_out]
             + [(self.n_heads + self.n_kv_heads) * d_t, (qkv_t.padded_shape[-1] // 32) if inline_kv else 0, kv_flag]
             + list(ttnn.TensorAccessorArgs(qkv_t if inline_kv else qk).get_compile_time_args())
-            + [int(ctx.mask_table)],  # R: the table's per-core replicas (0: no table)
+            + [int(ctx.mask_table)]  # R: the table's per-core replicas (0: no table)
+            + ([_ATTN_V_BLOCK] if v3 else []),
             runtime_args=rd_rt,
             common_runtime_args=[t.buffer_address() for t in tensors] + [(qkv_t if inline_kv else qk).buffer_address()],
             config=ttnn.ReaderConfigDescriptor(),
@@ -964,7 +973,7 @@ class TtAttention:
         if inline_kv:
             # The head merge, plus storing this step's staged position tiles once the reader has spliced them.
             writer = ttnn.KernelDescriptor(
-                kernel_source=os.path.join(_ATTN_FUSED_DIR, "writer_attn_fused.cpp"),
+                kernel_source=os.path.join(kdir, "writer_attn_fused.cpp"),
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=cores,
                 compile_time_args=[cb_out, n_kv, g, d_t, c_t, cb_kv_old, cb_wpos, kv_flag]
@@ -1006,7 +1015,7 @@ class TtAttention:
             modes[idx] = ttnn.UnpackToDestMode.UnpackToDestFp32
         compute_cfg.unpack_to_dest_mode = modes
         compute = ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_ATTN_FUSED_DIR, "compute_attn_fused.cpp"),
+            kernel_source=os.path.join(kdir, "compute_attn_fused.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[
@@ -1033,7 +1042,8 @@ class TtAttention:
                 cb_kv_new,
                 cb_kv_diff,
                 cb_kv_out,
-            ],
+            ]
+            + ([_ATTN_V_BLOCK] if v3 else []),
             runtime_args=ttnn.RuntimeArgs(),
             config=compute_cfg,
         )

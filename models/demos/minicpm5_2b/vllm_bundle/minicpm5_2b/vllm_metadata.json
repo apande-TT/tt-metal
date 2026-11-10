@@ -2,7 +2,7 @@
   "arch": "LlamaForCausalLM",
   "main_class": "adapter:TTLlamaForCausalLM",
   "weights": "openbmb/MiniCPM5-2B",
-  "note": "Generator over the demo's serving pipeline (models.demos.minicpm5_2b.tt.serving), one device row per request; serve with --max-num-seqs 32 --max-model-len 3072.",
+  "note": "Generator over the demo's serving pipeline (models.demos.minicpm5_2b.tt.serving), one device row per request; serve with --max-num-seqs 32 --max-model-len 3072 --max-num-batched-tokens 4096.",
   "max_num_seqs": 32,
   "max_model_len": 3072,
   "additional_config": {
@@ -10,5 +10,9 @@
       "l1_small_size": 24576,
       "trace_region_size": 209715200
     }
-  }
+  },
+  "serve_args": [
+    "--max-num-batched-tokens",
+    "4096"
+  ]
 }
