@@ -7,6 +7,9 @@
 //   cb 0, once per unit (R rows' worth of entries): row r0 + j of both a limbs (ah[kt] at 2 * j * Kt + kt,
 //         al[kt] at (2 * j + 1) * Kt + kt), one barrier;
 //   cb 1, per output column nt: column nt of both b limbs (bh[kt] at kt, bl[kt] at Kt + kt), one barrier.
+// Runtime arg 6 (k_tiles): when nonzero, args 7 + i * R + j hold the K tiles row j of this core's i-th unit uses
+// (a's K tiles past them are zero: limb_bmm.cpp skips them): only those of a's row, and of b the most any row of
+// the unit uses, are read (the rest of the cb entries are left unread and unused).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -39,6 +42,8 @@ void kernel_main() {
     const auto bh = TensorAccessor(bh_args, bh_addr);
     const auto bl = TensorAccessor(bl_args, bl_addr);
 
+    const bool k_tiles = get_arg_val<uint32_t>(6) != 0;
+
     Noc noc;
     DataflowBuffer da(cb_a);
     DataflowBuffer db(cb_b);
@@ -47,10 +52,13 @@ void kernel_main() {
         const uint32_t r0 = (u % blocks) * R;
         const uint32_t nr = (r0 + R < Mt ? r0 + R : Mt) - r0;
 
+        uint32_t kb = 0;  // the most K tiles any row of the unit uses
         da.reserve_back(2 * Kt * R);
         for (uint32_t j = 0; j < nr; ++j) {
             const uint32_t base = (bt * Mt + r0 + j) * Kt;
-            for (uint32_t kt = 0; kt < Kt; ++kt) {
+            const uint32_t kj = k_tiles ? get_arg_val<uint32_t>(7 + (u - start_unit) * R + j) : Kt;
+            kb = kj > kb ? kj : kb;
+            for (uint32_t kt = 0; kt < kj; ++kt) {
                 noc.async_read(ah, da, page, {.page_id = base + kt}, {.offset_bytes = (2 * j * Kt + kt) * page});
                 noc.async_read(al, da, page, {.page_id = base + kt}, {.offset_bytes = ((2 * j + 1) * Kt + kt) * page});
             }
@@ -60,7 +68,7 @@ void kernel_main() {
 
         for (uint32_t nt = 0; nt < Nt; ++nt) {
             db.reserve_back(2 * Kt);
-            for (uint32_t kt = 0; kt < Kt; ++kt) {
+            for (uint32_t kt = 0; kt < kb; ++kt) {
                 const uint32_t id = (bt * Kt + kt) * Nt + nt;
                 noc.async_read(bh, db, page, {.page_id = id}, {.offset_bytes = kt * page});
                 noc.async_read(bl, db, page, {.page_id = id}, {.offset_bytes = (Kt + kt) * page});

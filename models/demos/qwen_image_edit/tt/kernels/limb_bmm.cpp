@@ -13,6 +13,9 @@
 // reload_tf32 (compile time) instead mirrors MatmulMultiCoreReuseOptimized with in0_block_w = 1: after every
 // K tile but the last the three partials are packed to cb 2 (float32) and reloaded through SrcA (that factory's
 // intermed buffer is UnpackToSrc: a TF32 reload) before the next K tile accumulates.
+// Runtime arg 2 (k_tiles): when nonzero, args 3 + i * R + j hold the K tiles row j of this core's i-th unit
+// accumulates: a's K tiles past them are exactly zero (e.g. probabilities under a causal mask), and a zero product
+// added to a float32 DEST accumulator leaves it unchanged, so skipping them gives the same bits (full-K path only).
 // All packs go to float32 buffers and all matmul operands are bf16: no per-tile format reconfiguration except
 // the reload_tf32 SrcA switch, made exactly as the stock reload makes it.
 
@@ -50,6 +53,7 @@ void kernel_main() {
     CircularBuffer out(cb_out);
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_a, cb_b, cb_out);
+    const bool k_tiles = get_arg_val<uint32_t>(2) != 0;
 
     for (uint32_t u = start_unit; u < start_unit + num_units; ++u) {
         const uint32_t r0 = (u % blocks) * R;
@@ -61,6 +65,7 @@ void kernel_main() {
                 const uint32_t ah = 2 * j * Kt;
                 const uint32_t al = ah + Kt;
                 if constexpr (!reload_tf32) {
+                    const uint32_t kj = k_tiles ? get_arg_val<uint32_t>(3 + (u - start_unit) * R + j) : Kt;
                     out.reserve_back(1);
                     tile_regs_acquire();
                     fill_tile_init();
@@ -68,7 +73,7 @@ void kernel_main() {
                     fill_tile(1, 0.0f);
                     fill_tile(2, 0.0f);
                     matmul_init(cb_a, cb_b, 0);
-                    for (uint32_t kt = 0; kt < Kt; ++kt) {
+                    for (uint32_t kt = 0; kt < kj; ++kt) {
                         matmul_tiles(cb_a, cb_b, ah + kt, kt, 0);       // ah @ bh
                         matmul_tiles(cb_a, cb_b, ah + kt, Kt + kt, 1);  // ah @ bl
                         matmul_tiles(cb_a, cb_b, al + kt, kt, 2);       // al @ bh

@@ -46,7 +46,13 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
 from models.demos.qwen_image_edit_text_encoder._stubs import token_embed as _te_embed_mod
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import MASK_NEG, pad_to_tile
-from models.demos.qwen_image_edit_text_encoder._stubs.layer import text_attention_mask
+from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
+from models.demos.qwen_image_edit_text_encoder._stubs.layer import mask_k_tiles, text_attention_mask
+
+# the LM attention's P @ V skips, per tile row, the key tiles the causal + padding mask zeroes (bit-identical:
+# those probabilities are exactly 0; one table for every chip's sequences: per tile row the most any sequence needs);
+# False: every P @ V accumulates all key tiles
+PV_K_TILES = True
 
 
 def _replicated(device, t, dtype, layout=ttnn.TILE_LAYOUT):
@@ -144,7 +150,9 @@ class TtQwenTextEncoder:
         # as one product over the limbs concatenated along K ([ah | ah | al] @ [bh ; bl ; bh]), not three + two adds
         _te_attention.BMM_CONCAT_K = True
         # and P @ V rather as one C++ limb_bmm program (limb_bmm.fused_limb_bmm, full grid) where it fits
-        _te_attention.LIMB_BMM_FN = lambda ah, al, bh, bl: fused_limb_bmm(ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG)
+        _te_attention.LIMB_BMM_FN = lambda ah, al, bh, bl, k_tiles=None: fused_limb_bmm(
+            ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG, k_tiles=k_tiles
+        )
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
         # with their weight and activation limbs (vision qkv / proj / MLP: <= 4 MB per chip) staged in L1 once
@@ -352,6 +360,8 @@ class TtQwenTextEncoder:
         # causal + key-padding additive mask (GQA row packing), per sequence
         mask = text_attention_mask(am, 2 * B, s_pad, s_pad, self.group)
         p.mask = _replicated(d, torch.from_numpy(mask), ttnn.float32)
+        # per (sequence, P tile row): the key tiles the LM P @ V accumulates (past them the mask zeroes P)
+        p.pv_k_tiles = mask_k_tiles(mask) if PV_K_TILES else None
         # HF passes position_ids=None -> arange on all three mRoPE axes
         posn = torch.arange(s_pad, dtype=torch.float32).reshape(1, 1, s_pad, 1).expand(3, 1, s_pad, 1)
         p.positions = _replicated(d, posn, ttnn.float32)
@@ -382,6 +392,7 @@ class TtQwenTextEncoder:
                 m = np.tile(m, (1, 1, self.group, 1))
                 p.prefix = (P, su)
                 p.mask_suffix = _replicated(d, torch.from_numpy(m), ttnn.float32)
+                p.pv_k_tiles_suffix = mask_k_tiles(m) if PV_K_TILES else None
         # QwenImageEditPipeline.encode_prompt: an all-ones mask is dropped (None)
         p.mask_cond = None if bool(mc.all()) else mc
         p.mask_uncond = None if bool(mu.all()) else mu
@@ -451,7 +462,9 @@ class TtQwenTextEncoder:
                 xs = ttnn.slice(x, [0, 0, P, 0], [B, 1, P + su, C])
                 rows = lambda r: ttnn.slice(r, [0, 0, P, 0], list(r.shape)[:2] + [P + su, r.shape[-1]])  # noqa: E731
                 kv["mode"] = "use"
+                _te_layer.PV_K_TILES = getattr(p, "pv_k_tiles_suffix", None)
                 hs = self.text_model.forward_padded(xs, rows(cos), rows(sin), p.mask_suffix, kv=kv)
+                _te_layer.PV_K_TILES = None
                 h = ttnn.concat(
                     [ttnn.slice(h_cond, [0, 0, drop, 0], [B, 1, P, C]), ttnn.slice(hs, [0, 0, 0, 0], [B, 1, drop + L - P, C])],
                     dim=2,
@@ -459,7 +472,10 @@ class TtQwenTextEncoder:
                 kv["cache"].clear()
             else:
                 mask = ttnn.slice(p.mask, [lo, 0, 0, 0], [lo + B] + list(p.mask.shape)[1:])
+                kt = getattr(p, "pv_k_tiles", None)
+                _te_layer.PV_K_TILES = None if kt is None else kt[lo : lo + B]
                 h_full = self.text_model.forward_padded(x, cos, sin, mask, kv=kv)  # [B, 1, s_pad, C] replicated
+                _te_layer.PV_K_TILES = None
                 h_cond = h_full if prefix else None
                 h = ttnn.slice(h_full, [0, 0, drop, 0], [B, 1, drop + L, C])
             outs.append(ttnn.multiply(ttnn.reshape(h, (B, L, C)), keep))

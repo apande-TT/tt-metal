@@ -51,9 +51,12 @@ def _pick_rows(total_rows, m_t, k_t, cores):
     return None
 
 
-def fused_limb_bmm(ah, al, bh, bl, mem):
+def fused_limb_bmm(ah, al, bh, bl, mem, k_tiles=None):
     """ah, al [..., M, K], bh, bl [..., K, N]: bf16 TILE interleaved limbs, same batch dims -> float32
-    (ah @ bh + ah @ bl) + al @ bh [..., M, N] in `mem`, or None when the operands do not fit the kernel."""
+    (ah @ bh + ah @ bl) + al @ bh [..., M, N] in `mem`, or None when the operands do not fit the kernel.
+    k_tiles: optional int array [batch, M / 32]: the K tiles output tile row r of batch item bt accumulates, a's K tiles
+    past it being exactly zero (e.g. causal-masked probabilities): those products are skipped and not read, the same
+    bits (a zero product leaves the float32 DEST accumulator unchanged)."""
     ts = (ah, al, bh, bl)
     if any(t.dtype != ttnn.bfloat16 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded() for t in ts):
         return None
@@ -71,6 +74,8 @@ def fused_limb_bmm(ah, al, bh, bl, mem):
         return None
     rows, b_cols = pick
     blocks = -(-m_t // rows)
+    if k_tiles is not None and (RELOAD_TF32 or tuple(k_tiles.shape) != (batch, m_t)):
+        k_tiles = None
     out_shape = list(ah.shape)[:-1] + [int(bh.shape[-1])]
     out = ttnn.allocate_tensor_on_device(ttnn.Shape(out_shape), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)
 
@@ -98,9 +103,15 @@ def fused_limb_bmm(ah, al, bh, bl, mem):
         for r in group.ranges():
             for cx in range(r.start.x, r.end.x + 1):
                 for cy in range(r.start.y, r.end.y + 1):
-                    rd_rt[cx][cy] = addrs + [start, per]
+                    kt_args = [0]
+                    if k_tiles is not None:  # per unit of this core, its R rows' K tiles (0 past the last row)
+                        kt_args = [1]
+                        for u in range(start, start + per):
+                            bt, r0 = u // blocks, (u % blocks) * rows
+                            kt_args += [int(k_tiles[bt, r]) if r < m_t else 0 for r in range(r0, r0 + rows)]
+                    rd_rt[cx][cy] = addrs + [start, per] + kt_args
                     wr_rt[cx][cy] = [out.buffer_address(), start, per]
-                    cp_rt[cx][cy] = [start, per]
+                    cp_rt[cx][cy] = [start, per] + kt_args
                     start += per
     ct = [m_t, k_t, n_t, blocks, rows, int(RELOAD_TF32)]
     # as precise_config: HiFi4, float32 DEST, no packer L1 accumulation; every buffer at its default unpack (the
