@@ -32,7 +32,14 @@ def fused_rope_heads(qkv, lo, n, D, cos, sin, mem=None):
     return fused_rope(qkv, cos, sin, mem, heads=(B, n, S, D, W // 32, lo * D // 32))
 
 
-def fused_rope(x, cos, sin, mem=None, heads=None):
+def fused_rope_split(x, cos, sin, mem=None):
+    """(hi, lo) bf16 limbs of fused_rope(x, cos, sin) in one program (kernels/rope_split_bf16.cpp: the RoPE's float32
+    output split in DEST as split_bf16 splits it, never written) -- the same limbs as fused_rope + fused_split_bf16;
+    None when the shapes do not fit."""
+    return fused_rope(x, cos, sin, mem, split=True)
+
+
+def fused_rope(x, cos, sin, mem=None, heads=None, split=False):
     """x [B, H, S, D] float32 TILE (interleaved), cos / sin [1 or B, 1, S, D] float32 TILE -> x * cos +
     rotate_half(x) * sin, bit-identical to the ttnn chain; None when the shapes do not fit (D / 2 not tile
     aligned, padding, other layouts) so the caller runs the chain. heads (fused_rope_heads): (B, H, S, D, Wt, col0),
@@ -53,9 +60,13 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
         return None
     Dt, St = D // 32, S // 32
     device = x.device()
-    out = ttnn.allocate_tensor_on_device(
-        ttnn.Shape([B, H, S, D]), ttnn.float32, ttnn.TILE_LAYOUT, device, mem or ttnn.DRAM_MEMORY_CONFIG
-    )
+    mem = mem or ttnn.DRAM_MEMORY_CONFIG
+    if split:  # split: the bf16 limbs (hi, lo) of the RoPE output instead of the float32 output
+        outs = [ttnn.allocate_tensor_on_device(ttnn.Shape([B, H, S, D]), ttnn.bfloat16, ttnn.TILE_LAYOUT, device, mem)
+                for _ in range(2)]
+    else:
+        outs = [ttnn.allocate_tensor_on_device(ttnn.Shape([B, H, S, D]), ttnn.float32, ttnn.TILE_LAYOUT, device, mem)]
+    out = outs[0]
     n_tiles = B * H * St * Dt
     reader_ct = [Dt, St, H, 1 if cb > 1 else 0, wt, col0]
     for t in (x, cos, sin):
@@ -72,7 +83,16 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=page)],
         )
         for i, pages in ((0, 8), (16, 2))  # the four input tiles of an output tile double-buffered
+        if not (split and i == 16)
     ]
+    if split:  # the limbs (bf16 hi / lo, and hi's bf16 scratch) and the float32 RoPE output's scratch
+        for i, dtype, pg in ((16, ttnn.bfloat16, 2048), (17, ttnn.bfloat16, 2048), (24, ttnn.bfloat16, 2048),
+                             (25, ttnn.float32, 4096)):
+            cbs.append(ttnn.CBDescriptor(
+                total_size=2 * pg,
+                core_ranges=cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=dtype, page_size=pg)],
+            ))
     rd_rt, wr_rt, cp_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [x.buffer_address(), cos.buffer_address(), sin.buffer_address()]
     start = 0
@@ -81,7 +101,10 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
             for cx in range(r.start.x, r.end.x + 1):
                 for cy in range(r.start.y, r.end.y + 1):
                     rd_rt[cx][cy] = addrs + [per, start]
-                    wr_rt[cx][cy] = [out.buffer_address(), per, start]
+                    if split:
+                        wr_rt[cx][cy] = [outs[0].buffer_address(), outs[1].buffer_address(), per, start, 0]
+                    else:
+                        wr_rt[cx][cy] = [out.buffer_address(), per, start]
                     cp_rt[cx][cy] = [per, start]
                     start += per
     # as binary_ng / unary on float32: inputs unpacked to DEST as float32, float32 DEST, precise SFPU
@@ -91,7 +114,16 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
     cfg.math_approx_mode = False
     modes = [ttnn.UnpackToDestMode.Default] * 32
     modes[0] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    if split:
+        modes[25] = ttnn.UnpackToDestMode.UnpackToDestFp32
     cfg.unpack_to_dest_mode = modes
+    if split:
+        writer, writer_ct = os.path.join(_KERNELS, "writer_two_outputs.cpp"), []
+        for t in outs:
+            writer_ct += list(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    else:
+        writer = os.path.join(_TT_METAL, _WRITER)
+        writer_ct = [16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args())
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=os.path.join(_KERNELS, "reader_rope.cpp"),
@@ -102,15 +134,15 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_TT_METAL, _WRITER),
+            kernel_source=writer,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[16] + list(ttnn.TensorAccessorArgs(out).get_compile_time_args()),
+            compile_time_args=writer_ct,
             runtime_args=wr_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=os.path.join(_KERNELS, "rope_swap.cpp"),
+            kernel_source=os.path.join(_KERNELS, "rope_split_bf16.cpp" if split else "rope_swap.cpp"),
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
             compile_time_args=[Dt, 1],
@@ -118,7 +150,11 @@ def fused_rope(x, cos, sin, mem=None, heads=None):
             config=cfg,
         ),
     ]
-    return ttnn.generic_op([x, cos, sin, out], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+    if split:
+        ttnn.generic_op([x, cos, sin, *outs], program)
+        return tuple(outs)
+    return ttnn.generic_op([x, cos, sin, out], program)
 
 
 _SIN_SIGNED = {}  # id(sin) -> (sin, [-sin | sin] over the head's two halves)

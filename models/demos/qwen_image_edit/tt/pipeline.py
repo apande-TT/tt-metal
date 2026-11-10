@@ -55,7 +55,7 @@ from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16, fused_split_merge_heads
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt import rms_rows as _rms_rows
-from models.demos.qwen_image_edit.tt.rope_rows import fused_rope
+from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_split
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.tracker import InvocationTracker
@@ -276,6 +276,10 @@ class QwenImageEditTT:
         _tr_attention.JOINT_HEADS = True
         _tr_attention.ROPE_SWAP = True  # rope as x * [cos | cos] + swap(x) * [-sin | sin] on cached tables
         _tr_attention.ROPE_FN = fused_rope  # as one C++ kernel (no halves, swap or products written)
+        # and q / k (only ever split into bf16 limbs by the exact QK^T) roped straight into those limbs: no float32
+        # roped q / k written and no split program (rope_rows.fused_rope_split)
+        _tr_attention.ROPE_SPLIT_FN = fused_rope_split
+        _tr_precise.PRESPLIT_ANY_MEM = True
         _tr_attention.RMS_FN = _qk_rms  # and the q / k RMSNorm as the two rms_rows C++ programs
         _rms_rows.RS_MEMORY_CONFIG = ttnn.L1_MEMORY_CONFIG  # with its row scale in L1 between them
         _tr_attention.NLP_SPLIT = True  # the joint q/k/v heads split by one nlp_create_qkv_heads tile copy
