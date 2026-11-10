@@ -55,7 +55,7 @@ def _gather_sum_once(y, ax, n):
     return ttnn.reshape(out, shape)
 
 
-def _a2a_sum(y, ax, n):
+def _a2a_sum(y, ax, n, scatter_only=False):
     """The reduce as all_to_all (each device: every partial's slice of its 1/n columns) + sum + all_gather of the
     sums, or None for a y it does not take."""
     shape = list(y.shape)
@@ -73,6 +73,8 @@ def _a2a_sum(y, ax, n):
     ttnn.deallocate(g)
     if part is None:
         return None
+    if scatter_only:
+        return part
     out = ttnn.all_gather(part, dim=len(shape) - 1, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
     ttnn.deallocate(part)
     return out
@@ -107,7 +109,21 @@ def _gather_sum(y, device, ax):
 
 def all_reduce(y, device):
     """Sum of the partials over every device of the mesh (exact float32, see module docstring)."""
-    for ax in mesh_axes(device):
+    axes = mesh_axes(device)
+    if A2A_REDUCE and len(axes) == 2:
+        # hierarchical: the first axis's all_to_all + slice sum, the second axis's exact reduce on that 1/n slice,
+        # then ONE all_gather of the slices -- the same sums in the same order, the second axis carrying 1/n of it
+        part = _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], scatter_only=True)
+        if part is not None:
+            part2 = _gather_sum(part, device, axes[1])
+            if part2 is not part:
+                ttnn.deallocate(part)
+            out = ttnn.all_gather(
+                part2, dim=len(part2.shape) - 1, cluster_axis=axes[0], num_links=1, topology=ttnn.Topology.Linear
+            )
+            ttnn.deallocate(part2)
+            return out
+    for ax in axes:
         y = _gather_sum(y, device, ax)
     return y
 

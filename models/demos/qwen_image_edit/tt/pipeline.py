@@ -411,6 +411,7 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
             # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
+            # (and the 2-device axis reduced on that 1/4 slice before the one all_gather back)
             (_dit_ccl, "A2A_REDUCE", bool(self.sum_parts)),
         )
         with contextlib.ExitStack() as stack:
