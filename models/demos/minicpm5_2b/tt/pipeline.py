@@ -313,7 +313,9 @@ class MiniCPM5Pipeline:
         rank = ttnn.argmax(ttnn.untilize(perturbed), dim=-1, keepdim=True)  # [1, 1, B, 1] uint32
         rank = ttnn.to_layout(rank, ttnn.TILE_LAYOUT)
         tok = ttnn.gather(top_idx, -1, ttnn.typecast(rank, top_idx.dtype) if rank.dtype != top_idx.dtype else rank)
-        return ttnn.to_layout(ttnn.typecast(tok, ttnn.uint32) if tok.dtype != ttnn.uint32 else tok, ttnn.ROW_MAJOR_LAYOUT)
+        return ttnn.to_layout(
+            ttnn.typecast(tok, ttnn.uint32) if tok.dtype != ttnn.uint32 else tok, ttnn.ROW_MAJOR_LAYOUT
+        )
 
     def _topk_segmented(self, logits, k):
         """top-k over segmented logits [1, S, B, W]: each segment's top-_SEG_K by ttnn.topk (k <= _SEG_K, so every
@@ -323,8 +325,12 @@ class MiniCPM5Pipeline:
         S, B, W = logits.shape[1], logits.shape[2], logits.shape[3]
         vals, ids = ttnn.topk(logits, k=_SEG_K, dim=-1)  # [1, S, B, _SEG_K], descending, in-segment ids
         l1 = ttnn.L1_MEMORY_CONFIG
-        top_vals = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, B, k]), ttnn.float32, ttnn.TILE_LAYOUT, self.device, l1)
-        top_idx = ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, B, k]), ttnn.uint32, ttnn.TILE_LAYOUT, self.device, l1)
+        top_vals = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, B, k]), ttnn.float32, ttnn.TILE_LAYOUT, self.device, l1
+        )
+        top_idx = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, B, k]), ttnn.uint32, ttnn.TILE_LAYOUT, self.device, l1
+        )
         k_tiles = top_vals.padded_shape[-1] // 32
         grid = self.device.compute_with_storage_grid_size()
         full_rows, rem = divmod(B, grid.x)
@@ -760,11 +766,16 @@ class MiniCPM5Pipeline:
         }
 
     # ------------------------------------------------------------------ trace contract
-    def _stored_request(self):
-        return tt_inputs.stored_request(self.batch)
+    def _stored_request(self, prompt_ids=None):
+        """(input_ids [B, S], seeds [B]) of the e2e golden's request; `prompt_ids` (the measured run's declared
+        prompt, [B, S]) replaces its tokens, the seeds stay the golden's."""
+        ids, seeds = tt_inputs.stored_request(self.batch)
+        if prompt_ids is not None:
+            ids = torch.as_tensor(prompt_ids).reshape(self.batch, -1)
+        return ids, seeds
 
-    def prefill_trace_inputs(self):
-        ids, seeds = self._stored_request()
+    def prefill_trace_inputs(self, prompt_ids=None):
+        ids, seeds = self._stored_request(prompt_ids)
         return {"input_ids": ids, "noise": tt_inputs.gumbel_noise(seeds, 1, self.vocab)}
 
     def prefill_trace_setup(self, inputs):
@@ -776,8 +787,8 @@ class MiniCPM5Pipeline:
     def prefill_trace_items(self):
         return self.batch * self.prefill_len
 
-    def decode_trace_inputs(self):
-        ids, seeds = self._stored_request()
+    def decode_trace_inputs(self, prompt_ids=None):
+        ids, seeds = self._stored_request(prompt_ids)
         return {"input_ids": ids, "noise": tt_inputs.gumbel_noise(seeds, 2, self.vocab)}
 
     def decode_trace_setup(self, inputs):

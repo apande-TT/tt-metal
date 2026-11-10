@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import os
 
-import ttl
+try:
+    import ttl  # tt-lang: only ttl_rope_qkv runs it; the served path is cpp_rope_qkv (_USE_CPP_TWIN)
+except ImportError:
+    ttl = None
 
 import ttnn
 
@@ -23,6 +26,8 @@ _TWIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", 
 
 
 def _build(d_t):
+    if ttl is None:
+        raise ImportError("ttl_rope_qkv needs tt-lang (import ttl failed); cpp_rope_qkv is the same rope without it")
     gx = _GRID[0]
     half = d_t // 2
 
