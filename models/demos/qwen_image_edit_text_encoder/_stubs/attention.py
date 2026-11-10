@@ -395,6 +395,10 @@ GUARD_NO_NN = False
 # exact lanes ([lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T), so no dense lead product, no separate
 # trailing product and no guard tail are formed (the exact lanes' rare glitches are not voted out).
 QK_NO_GUARD = False
+# The b-side exact lanes (B_LANE_SPLIT: the vision P @ V's lanes on V's rows) as ONE K-stacked product:
+# [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
+# the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
+B_LANE_KSTACK = False
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -1149,9 +1153,18 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
     if b_lanes is not None:
         # the exact lanes on the smaller operand's K rows (the vision P @ V: V is 3.7x smaller than the probs):
         # lane r = a @ (b with only lane r's K rows) -- the same nonzero terms in every tile product
-        for lane in b_lanes:
-            acc.push(mm(pa0, lane))
-            ttnn.deallocate(lane)
+        ar = LANE_STACK(pa0, len(b_lanes)) if B_LANE_KSTACK and LANE_STACK is not None else None
+        if ar is not None:
+            bl = ttnn.concat(b_lanes, dim=-2)
+            for lane in b_lanes:
+                ttnn.deallocate(lane)
+            acc.push(mm(ar, bl))
+            ttnn.deallocate(ar)
+            ttnn.deallocate(bl)
+        else:
+            for lane in b_lanes:
+                acc.push(mm(pa0, lane))
+                ttnn.deallocate(lane)
         neg0 = None
     else:
         stacked = None
