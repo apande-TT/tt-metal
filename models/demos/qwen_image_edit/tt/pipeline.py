@@ -28,6 +28,7 @@ from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
+    exp_split,
     guard_tail,
     guard_tail_norms,
     head_split,
@@ -397,6 +398,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_NO_NN", True),
             # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
+            # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
+            (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
             (_dit_ccl, "A2A_REDUCE", bool(self.sum_parts)),
         )

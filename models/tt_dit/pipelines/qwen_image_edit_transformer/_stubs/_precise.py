@@ -372,6 +372,30 @@ def _matmul3(a, b):
     return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
 
 
+# Optional fused kernel: EXP_SPLIT(s, m, approx) -> (exp(s - m), bf16 hi, bf16 lo of it) in one pass, or None.
+EXP_SPLIT = None
+_V_SPLIT = [None]  # (b, bh, bl): the last P @ V's value limbs, shared by every query-row chunk of one attention
+
+
+def matmul_presplit(ah, al, b):
+    """_matmul3(a, b) for an a already split into (ah, al); b's limbs formed once per b (the query chunks of one
+    attention share v) and kept until the next b."""
+    ent = _V_SPLIT[0]
+    if ent is None or ent[0] is not b:
+        if ent is not None:
+            ttnn.deallocate(ent[1])
+            ttnn.deallocate(ent[2])
+        bh, bl = split_bf16(b)
+        ent = (b, bh, bl)
+        _V_SPLIT[0] = ent
+    _, bh, bl = ent
+    cfg = precise_config()
+    mm = lambda p, q: ttnn.matmul(  # noqa: E731
+        p, q, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=_bmm_config(p, q)
+    )
+    return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
+
+
 def matmul(a, b):
     """float32 a @ float32 b -> float32 as the 3-term bf16 split (dense accumulation). Not voted: its
     operands (attention probabilities ~1e-3) are too small for a fixed dither (see VOTE above)."""

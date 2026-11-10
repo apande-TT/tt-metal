@@ -268,6 +268,84 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
     return y
 
 
+_ES_READER = f"{_DIR}/exp_split_reader.cpp"
+_ES_COMPUTE = f"{_DIR}/exp_split_compute.cpp"
+
+
+def exp_split(s, m, approx=True):
+    """(e, hi, lo) = (exp(s - m), bf16(e), bf16(e - hi)) in one pass for a float32 interleaved tile tensor s [.., M, N]
+    and its row maxima m [.., M, 1] (batch-matched): the softmax's fused subtract + EXP post-activation and the P @ V
+    limb split, without writing e and reading it back for the split. None for a shape it does not take."""
+    sh = list(s.shape)
+    if not _plain(s, sh) or len(sh) < 2:
+        return None
+    if m.dtype != ttnn.float32 or m.layout != ttnn.TILE_LAYOUT or m.is_sharded() or list(m.shape) != sh[:-1] + [1]:
+        return None
+    ps = list(s.padded_shape)
+    nt = ps[-1] // TILE
+    rows = 1
+    for d in ps[:-1]:
+        rows *= d
+    n_tiles = (rows // TILE) * nt
+    dev = s.device()
+    e = ttnn.empty_like(s)
+    hi, lo = (ttnn.empty(sh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev) for _ in range(2))
+    work = _cores(dev.compute_with_storage_grid_size(), n_tiles)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb_desc(cb, dtype):
+        page = _FP32_TILE_BYTES if dtype == ttnn.float32 else _FP32_TILE_BYTES // 2
+        return ttnn.CBDescriptor(
+            total_size=2 * page,
+            core_ranges=cores,
+            format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=cb, data_format=dtype, page_size=page)],
+        )
+
+    cbs = [cb_desc(0, ttnn.float32), cb_desc(1, ttnn.float32), cb_desc(16, ttnn.float32)]
+    cbs += [cb_desc(17, ttnn.bfloat16), cb_desc(18, ttnn.bfloat16)]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [s.buffer_address(), m.buffer_address(), count, start, nt]
+        compute_rt[c.x][c.y] = [count, start, nt]
+        writer_rt[c.x][c.y] = [e.buffer_address(), hi.buffer_address(), lo.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
+    )
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    for cb in (0, 1):
+        unpack[cb] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_ES_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[a for t in (s, m) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_ES_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[int(bool(approx))],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_TWO_OUT_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[3]
+            + [a for t in (e, hi, lo) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    ttnn.generic_op([s, m, e, hi, lo], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    return e, hi, lo
+
+
 def vote_tail(acc, bn, f0, e_neg, tol):
     """where(|e_x - e_neg| <= tol, e_x, median(e_x, f0, e_neg)), e_x = acc - bn: precise_affine's exact-mode
     vote tail (models/tt_dit/pipelines/qwen_image_edit_vae/_stubs/_resident.py, VOTE_TAIL), ~8 float32 ttnn

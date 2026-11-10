@@ -308,6 +308,28 @@ class TtQwenJointAttention:
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
         mx = ttnn.max(s, dim=-1, keepdim=True)
+        if (
+            _precise.ENABLED
+            and _precise.EXP_SPLIT is not None
+            and _precise.SOFTMAX_FUSED_EXP
+            and _precise.SOFTMAX_DEFER_DIV
+            and not _precise.EXACT_PV
+        ):
+            # exp(s - max) and its P @ V limbs in one pass: e is written once and only read back by the row sum
+            res = _precise.EXP_SPLIT(s, mx, _precise.SOFTMAX_EXP_APPROX)
+            if res is not None:
+                ttnn.deallocate(s)
+                ttnn.deallocate(mx)
+                e, eh, el = res
+                sm = ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+                ttnn.deallocate(e)
+                o = _precise.matmul_presplit(eh, el, v)
+                ttnn.deallocate(eh)
+                ttnn.deallocate(el)
+                o2 = ttnn.divide(o, sm)
+                ttnn.deallocate(o)
+                ttnn.deallocate(sm)
+                return o2
         if _precise.SOFTMAX_FUSED_EXP:  # exp(s - max) in the subtract's own pass: one score-sized write, not two
             e = ttnn.subtract(
                 s,
