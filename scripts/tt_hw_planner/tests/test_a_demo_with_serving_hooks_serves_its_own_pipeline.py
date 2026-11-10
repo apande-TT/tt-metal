@@ -6,7 +6,9 @@ checks every demo module the served adapter imports, and the card's speed is wha
 MiniCPM5-2B, 2026-11: a stock Llama arch, so publish-hf scaffolded the plugin's stock generator; the package served
 that, not the optimized pipeline the run measured, and the card still showed the pipeline's 99.3 tok/s/user. Its
 tt-model.yaml verify only imported the demo package, so an import the pipeline needed (tt-lang's `ttl`, absent from
-the image) passed the build.
+the image) passed the build. Later the bundle, re-rendered from the hooks on every publish, dropped the prefill token
+budget its speed was measured with (--max-num-batched-tokens 4096: 32 prompts of 128 tokens in one step), and 32
+users at once served 84 tok/s/user against 92.
 
 No device: the rendered adapter runs against a stand-in pipeline and ttnn.
 """
@@ -83,7 +85,7 @@ def test_a_stock_arch_demo_with_serving_hooks_ships_its_own_pipeline(tmp_path):
     compile(src, "adapter.py", "exec")
     meta = json.loads((bundle / "vllm_metadata.json").read_text())
     assert meta["main_class"] == "adapter:TT" + _STOCK and "serve_hf_override_arch" not in meta
-    assert (meta["max_num_seqs"], meta["max_model_len"]) == (4, 64)
+    assert (meta["max_num_seqs"], meta["max_model_len"]) == (4, 64) and "serve_args" not in meta
 
     m = _yaml(tmp_path, extra)
     assert (m["serve"]["max_num_seqs"], m["serve"]["max_model_len"]) == (4, 64)
@@ -102,12 +104,24 @@ def test_a_novel_arch_with_hooks_is_servable_and_names_its_class(tmp_path):
     assert json.loads(args[args.index("--hf-overrides") + 1]) == {"architectures": ["TTNewForCausalLM"]}
 
 
+def test_the_serve_args_the_hooks_declare_reach_the_served_command(tmp_path):
+    flags = ["--max-num-batched-tokens", "4096"]
+    _demo(tmp_path, files={"serving.py": _HOOKS + "\n%s = %r\n" % (ph._SERVING_SERVE_ARGS, flags)})
+    extra, _stub, bundle = _scaffold(tmp_path)
+    meta = json.loads((bundle / "vllm_metadata.json").read_text())
+    assert meta["serve_args"] == flags and "--max-model-len 64 --max-num-batched-tokens 4096." in meta["note"]
+    assert _yaml(tmp_path, extra)["serve"]["args"][-2:] == flags
+    _scaffold(tmp_path)
+    assert json.loads((bundle / "vllm_metadata.json").read_text())["serve_args"] == flags, "a republish keeps them"
+
+
 @pytest.mark.parametrize(
     "files, problem",
     [
         ({"serving.py": _HOOKS.replace("%s = 4" % ph._SERVING_ROWS, "")}, ph._SERVING_ROWS),
         ({"serving.py": _HOOKS.replace("%s = 64" % ph._SERVING_KV, "%s = 2 * 32" % ph._SERVING_KV)}, ph._SERVING_KV),
         ({"serving.py": _HOOKS.replace("{'l1_small_size': 24576}", "dict(a=1)")}, ph._SERVING_DEVICE_PARAMS),
+        ({"serving.py": _HOOKS + "%s = ['--x', 1]\n" % ph._SERVING_SERVE_ARGS}, ph._SERVING_SERVE_ARGS),
         ({"serving.py": _HOOKS, "other.py": _HOOKS}, "other"),
     ],
 )

@@ -1543,6 +1543,9 @@ _SERVING_BUILDER = "build_serving_pipeline"
 _SERVING_ROWS = "SERVING_ROWS"
 _SERVING_KV = "SERVING_KV_CAPACITY"
 _SERVING_DEVICE_PARAMS = "SERVING_DEVICE_PARAMS"
+# Extra `vllm serve` flags the pipeline's measured speed depends on (e.g. a prefill token budget that fits
+# SERVING_ROWS prompts in one step), rendered into the bundle's serve_args.
+_SERVING_SERVE_ARGS = "SERVING_SERVE_ARGS"
 # The rendered adapter's first docstring line: a bundle adapter carrying it is the tool's rendering, re-rendered on
 # every publish so it follows the template and the demo's current hooks.
 _ROWS_ADAPTER_MARK = "Rendered by tt_hw_planner publish-hf from the demo's serving hooks"
@@ -1575,9 +1578,10 @@ def _demo_serving_hooks(checkout, slug):
     """The demo's row-per-request serving hooks, read from source (never imported), or None when no module of its
     tt/ package defines a top-level build_serving_pipeline.
 
-    Returns {"module", "rows", "kv", "device_params"}, or {"module", "problem"} when the hooks are incomplete: the
-    module must also assign SERVING_ROWS and SERVING_KV_CAPACITY positive int literals; SERVING_DEVICE_PARAMS, when
-    present, is a literal dict of the device-open settings the pipeline needs (the plugin's tt config keys)."""
+    Returns {"module", "rows", "kv", "device_params", "serve_args"}, or {"module", "problem"} when the hooks are
+    incomplete: the module must also assign SERVING_ROWS and SERVING_KV_CAPACITY positive int literals;
+    SERVING_DEVICE_PARAMS, when present, is a literal dict of the device-open settings the pipeline needs (the plugin's
+    tt config keys); SERVING_SERVE_ARGS, when present, a literal list of extra `vllm serve` arguments."""
     import ast
 
     tt_dir = _demo_tt_dir(checkout, slug)
@@ -1600,7 +1604,13 @@ def _demo_serving_hooks(checkout, slug):
             return {"module": module, "problem": "%s is not a positive int literal (got %r)" % (name, value)}
     if not (isinstance(params, dict) and all(isinstance(k, str) for k in params)):
         return {"module": module, "problem": "%s is not a literal dict (got %r)" % (_SERVING_DEVICE_PARAMS, params)}
-    return {"module": module, "rows": rows, "kv": kv, "device_params": params}
+    serve_args = consts.get(_SERVING_SERVE_ARGS, [])
+    if not (isinstance(serve_args, (list, tuple)) and all(isinstance(a, str) for a in serve_args)):
+        return {
+            "module": module,
+            "problem": "%s is not a literal list of strings (got %r)" % (_SERVING_SERVE_ARGS, serve_args),
+        }
+    return {"module": module, "rows": rows, "kv": kv, "device_params": params, "serve_args": list(serve_args)}
 
 
 def _rendered_rows_adapter(bundle_dir) -> bool:
@@ -2121,17 +2131,21 @@ def _scaffold_vllm_bundle(
     if hooks and hooks.get("problem"):
         print(f"  [publish-hf] serving hooks in {hooks['module']} not used: {hooks['problem']}")
     elif hooks:
+        serve_args = hooks.get("serve_args") or []
         rows_meta = {
             "arch": arch,
             "main_class": "adapter:" + tt_arch,
             "weights": weights or "REPLACE/with-base-weights-repo",
             "note": "Generator over the demo's serving pipeline (%s), one device row per request; serve with "
-            "--max-num-seqs %d --max-model-len %d." % (hooks["module"], hooks["rows"], hooks["kv"]),
+            "--max-num-seqs %d --max-model-len %d%s."
+            % (hooks["module"], hooks["rows"], hooks["kv"], "".join(" " + a for a in serve_args)),
             "max_num_seqs": hooks["rows"],
             "max_model_len": hooks["kv"],
         }
         if hooks["device_params"]:
             rows_meta["additional_config"] = {_PLUGIN_CONFIG_KEY: dict(hooks["device_params"])}
+        if serve_args:
+            rows_meta["serve_args"] = list(serve_args)
         if is_stub:  # not a plugin built-in: the engine must be told which registered class serves it
             rows_meta["serve_hf_override_arch"] = tt_arch
         meta.write_text(json.dumps(rows_meta, indent=2) + "\n")
