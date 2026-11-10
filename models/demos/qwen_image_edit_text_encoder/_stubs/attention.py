@@ -388,6 +388,20 @@ GUARD_TAIL = None
 # rest_fn) with a_s the slack-scaled [.., M, 1] row norms -- the same value, no output-sized tol tensor -- consuming
 # ex, dn, nn and rest_fn()'s product (not a_s / b_norm), or None (rest_fn not called) for a shape it does not take.
 GUARD_TAIL_NORMS = None
+# With GUARD_TAIL_NORMS: no negated-input product nn for the guard's vote -- where the guard trips (a glitch), the
+# tail takes the dense product dn instead of median(ex, dn, -nn), so nn's product, write and read are skipped.
+GUARD_NO_NN = False
+# The K-stacked exact QK^T (REST_KCAT) as ONE product with no guard: its trailing limb terms appended along K to the
+# exact lanes ([lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T), so no dense lead product, no separate
+# trailing product and no guard tail are formed (the exact lanes' rare glitches are not voted out).
+QK_NO_GUARD = False
+# The b-side exact lanes (B_LANE_SPLIT: the vision P @ V's lanes on V's rows) as ONE K-stacked product:
+# [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
+# the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
+B_LANE_KSTACK = False
+# Optional fused kernel for a non-transposed batched a @ b's 8 exact a-side lanes and their sum in one pass:
+# LANE_MASKED_BMM(a_lead, b_lead, b_rep) -> float32 [E, 1, M, N], or None for a shape it does not take.
+LANE_MASKED_BMM = None
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -443,9 +457,25 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
     [.., M, 1] norm, so no output-sized pass is spent on any of them."""
     if GUARD_TAIL_NORMS is not None and rest_fn is not None and rest2_fn is None:
         # tol = (a_norm * slack) * b_norm formed tile by tile inside the tail: no output-sized tol written and read
-        a_s = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12)
-        y = GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm, rest_fn)
+        b_l1 = None
+        try:  # (both norms read from L1 when the free L1 holds them: the per-tile row reads are 64 B NoC reads)
+            a_s = ttnn.multiply(
+                a_norm, GUARD_SLACK * 2.0**-12, memory_config=ttnn.L1_MEMORY_CONFIG if NORMS_L1 else None
+            )
+        except RuntimeError as e:
+            if "Out of Memory" not in str(e):
+                raise
+            a_s = ttnn.multiply(a_norm, GUARD_SLACK * 2.0**-12)
+        if NORMS_L1:
+            try:
+                b_l1 = ttnn.to_memory_config(b_norm, ttnn.L1_MEMORY_CONFIG)
+            except RuntimeError as e:
+                if "Out of Memory" not in str(e):
+                    raise
+        y = GUARD_TAIL_NORMS(ex, dn, nn, a_s, b_norm if b_l1 is None else b_l1, rest_fn)
         ttnn.deallocate(a_s)
+        if b_l1 is not None:
+            ttnn.deallocate(b_l1)
         if y is not None:
             return y
     if NORMS_L1:  # the outer product re-reads a broadcast operand tile per output tile: from L1, not DRAM
@@ -461,6 +491,11 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
         if y is not None:
             return y
     near = ttnn.le(ttnn.subtract(ex, dn, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.ABS)]), tol)
+    if nn is None:  # (GUARD_NO_NN: dn where the guard trips)
+        y = ttnn.where(near, ex, dn)
+        if rest_fn is not None:
+            y = ttnn.add(y, rest_fn())
+        return y if rest2_fn is None else ttnn.add(y, rest2_fn())
     lo, hi = ttnn.minimum(ex, dn), ttnn.maximum(ex, dn)
     neg = [ttnn.UnaryWithParam(ttnn.UnaryOpType.NEG)]
     med = ttnn.maximum(lo, ttnn.minimum(hi, nn, input_tensor_b_activations=neg))  # median(ex, dn, -nn)
@@ -513,6 +548,9 @@ LANE_NSTACK = None
 # Optional in place of the K-stacked product: LANE_MASKED_MM(x, w, fidelity) -> sum_r lane_r(x) @ w in float32 with no
 # 8x copy of x (each core masks its x tiles into their lanes in L1), or None for a product it does not take.
 LANE_MASKED_MM = None
+# Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
+# pass over x, or None: weights sharing an input taken in pairs.
+LANE_MASKED_MM2 = None
 _ROW_LANE_MASKS = {}
 
 
@@ -545,6 +583,10 @@ def _weight_lane_sums(lead, ws):
         n_all = sum(w.shape[-1] for w in ws)
         if not LANE_STACK_MAX_K_PER_N or lead.shape[-1] <= LANE_STACK_MAX_K_PER_N * n_all:
             outs = []
+            if LANE_MASKED_MM2 is not None and len(ws) == 2:
+                pair = LANE_MASKED_MM2(lead, ws[0], ws[1], LANE_STACK_FIDELITY)
+                if pair is not None:
+                    return list(pair)
             for w in ws:
                 y = LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
                 if y is None:
@@ -953,6 +995,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
 
+    reps = {}  # (each b operand's entries repeated once per call, not once per product: the lanes share one b limb)
+
     def mm(p, q):
         y = None
         if BMM_KERNEL is not None:
@@ -960,7 +1004,11 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
         if y is not None:
             return y
         if b_rep > 1:
-            q = _repeat_entries(q, b_rep)
+            ent = reps.get(id(q))
+            if ent is None or ent[0] is not q:
+                ent = (q, _repeat_entries(q, b_rep))
+                reps[id(q)] = ent
+            q = ent[1]
         return ttnn.matmul(
             p,
             q,
@@ -1055,6 +1103,37 @@ def free_b_side(cache):
     cache.clear()
 
 
+def _unguarded_qk(stacked, pa0, pb0, rest, keep):
+    """QK_NO_GUARD: [lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T as one float32 product (transpose_b,
+    single-entry b: the K-stacked path's shapes); the b side is cached across query chunks."""
+    xs, _ = stacked
+    n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
+    rest_b = [pb for _, pb in rest]
+
+    def _kr_fold():
+        kr = LANE_STACK(pb0, n_lanes)
+        y = ttnn.concat([kr] + rest_b, dim=-1)
+        ttnn.deallocate(kr)
+        return y
+
+    kr2, kr2_kept = _b_side(keep, "kr_fold", [pb0] + rest_b, _kr_fold)
+    xs2 = ttnn.concat([xs] + [pa for pa, _ in rest], dim=-1)
+    ttnn.deallocate(xs)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=False):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
@@ -1084,14 +1163,37 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
     if b_lanes is not None:
         # the exact lanes on the smaller operand's K rows (the vision P @ V: V is 3.7x smaller than the probs):
         # lane r = a @ (b with only lane r's K rows) -- the same nonzero terms in every tile product
-        for lane in b_lanes:
-            acc.push(mm(pa0, lane))
-            ttnn.deallocate(lane)
+        ar = LANE_STACK(pa0, len(b_lanes)) if B_LANE_KSTACK and LANE_STACK is not None else None
+        if ar is not None:
+            bl = ttnn.concat(b_lanes, dim=-2)
+            for lane in b_lanes:
+                ttnn.deallocate(lane)
+            acc.push(mm(ar, bl))
+            ttnn.deallocate(ar)
+            ttnn.deallocate(bl)
+        else:
+            for lane in b_lanes:
+                acc.push(mm(pa0, lane))
+                ttnn.deallocate(lane)
         neg0 = None
     else:
         stacked = None
-        if LANE_KSTACK is not None and LANE_STACK is not None and transpose_b and b_rep == 1:
+        # (a repeated b -- b_rep > 1 -- takes the K-stack too when its product goes through mm, which repeats b once)
+        if (
+            LANE_KSTACK is not None
+            and LANE_STACK is not None
+            and transpose_b
+            and (b_rep == 1 or QK_STACK_FIDELITY == ttnn.MathFidelity.HiFi4)
+        ):
             stacked = LANE_KSTACK(pa0)
+        if (
+            stacked is not None
+            and QK_NO_GUARD
+            and REST_KCAT
+            and len(rest) > 1
+            and QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4
+        ):
+            return _unguarded_qk(stacked, pa0, pb0, rest, keep_b and pb0 is terms[0][1])
         if stacked is not None:
             xs, neg0 = stacked
             n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
@@ -1115,10 +1217,17 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
             if not kr_kept:
                 ttnn.deallocate(kr)
         else:
-            lanes, neg0 = _lead_lanes(pa0)
-            for lane in lanes:
-                acc.push(mm(lane, pb0_l1))
-                ttnn.deallocate(lane)
+            y = None
+            if LANE_MASKED_BMM is not None and not transpose_b:
+                y = LANE_MASKED_BMM(pa0, pb0_l1, b_rep)
+            if y is not None:
+                acc.push(y)
+                neg0 = None
+            else:
+                lanes, neg0 = _lead_lanes(pa0)
+                for lane in lanes:
+                    acc.push(mm(lane, pb0_l1))
+                    ttnn.deallocate(lane)
     ex = acc.value()
     dn = mm(pa0, pb0_l1)
     kcat = REST_KCAT and transpose_b and b_rep == 1 and len(rest) > 1
@@ -1139,8 +1248,11 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         first = [_kcat_rest]
     else:
         first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
-    neg0 = ttnn.neg(pa0) if neg0 is None else neg0
-    nn = mm(neg0, pb0_l1)
+    if GUARD_NO_NN and GUARD_TAIL_NORMS is not None:
+        nn = None
+    else:
+        neg0 = ttnn.neg(pa0) if neg0 is None else neg0
+        nn = mm(neg0, pb0_l1)
     if pb0_l1 is not pb0:
         ttnn.deallocate(pb0_l1)
     if b_norm is None:

@@ -74,6 +74,8 @@ void kernel_main() {
     const auto s_lo = TensorAccessor(args_lo, addr_lo);
     const auto s_a = TensorAccessor(args_a, addr_a);
     const auto s_b = TensorAccessor(args_b, addr_b);
+    // 0: no negated-input product (the tail takes dn where the guard trips); nn's slot is never read
+    constexpr uint32_t has_nn = get_compile_time_arg_val(args_b.next_compile_time_args_offset());
 
     constexpr uint32_t cb_ex = 0, cb_dn = 1, cb_nn = 2, cb_a = 3, cb_lo = 4, cb_b = 5;
     constexpr uint32_t bytes = 4096;
@@ -96,8 +98,10 @@ void kernel_main() {
         noc_async_read(s_ex.get_noc_addr(i), get_write_ptr(cb_ex), bytes);
         cb_reserve_back(cb_dn, 1);
         noc_async_read(s_dn.get_noc_addr(i), get_write_ptr(cb_dn), bytes);
-        cb_reserve_back(cb_nn, 1);
-        noc_async_read(s_nn.get_noc_addr(i), get_write_ptr(cb_nn), bytes);
+        if constexpr (has_nn) {
+            cb_reserve_back(cb_nn, 1);
+            noc_async_read(s_nn.get_noc_addr(i), get_write_ptr(cb_nn), bytes);
+        }
         cb_reserve_back(cb_lo, 1);
         noc_async_read(s_lo.get_noc_addr(i), get_write_ptr(cb_lo), bytes);
         cb_reserve_back(cb_b, 1);
@@ -114,7 +118,9 @@ void kernel_main() {
         fill_first_row(l1_b);
         cb_push_back(cb_ex, 1);
         cb_push_back(cb_dn, 1);
-        cb_push_back(cb_nn, 1);
+        if constexpr (has_nn) {
+            cb_push_back(cb_nn, 1);
+        }
         cb_push_back(cb_lo, 1);
         cb_push_back(cb_b, 1);
     }

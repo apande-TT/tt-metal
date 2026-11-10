@@ -56,6 +56,10 @@ def _replicated(t, device, dtype=ttnn.float32):
     return ttnn.from_torch(t.contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device, **kw)
 
 
+# The column-parallel out-projections' two gathers axis 0 first (see TtQwenJointAttention.__init__)
+OUT_GATHER_COL_MAJOR = True
+
+
 def _sharded(t, device, dim, dtype=ttnn.bfloat16):
     if _is_mesh(device):
         return ttnn.from_torch(
@@ -124,10 +128,27 @@ class TtQwenJointAttention:
         # per lane product and gathers every chip's partial for the exact sum
         self.out_cols = _precise.ENABLED and self.tp > 1
 
+        # both of its gathers axis 0 first (the slower axis then carries the 1/C-wide shard): the heads' gather lands
+        # device (r, c)'s heads at block c * R + r, so the weight's K rows are laid out in that order; and each chip
+        # computes the output block that lands in natural order after the output's gather
+        self.out_order = _ccl.col_major_order(device) if OUT_GATHER_COL_MAJOR and self.out_cols else None
+
         def w_col_out(lin):  # column-sharded weight; the bias whole and replicated, added after the gather
             w = lin.weight.detach().to(torch.float32)
             b = lin.bias.detach().to(torch.float32) if lin.bias is not None else torch.zeros(w.shape[0])
-            return _sharded(w.t(), device, dim=-1), _replicated(b.reshape(1, -1), device)
+            wt = w.t()
+            order = self.out_order
+            if order is not None:
+                n = len(order)
+                kb, nb = wt.shape[0] // n, wt.shape[1] // n
+                # K rows: gathered position p holds device order[p]'s heads
+                wt = torch.cat([wt[d * kb : (d + 1) * kb] for d in order], 0)
+                # N columns: device d computes the block that lands at its gathered position (inverse of order)
+                pos = [0] * n
+                for p, d in enumerate(order):
+                    pos[d] = p
+                wt = torch.cat([wt[:, pos[d] * nb : (pos[d] + 1) * nb] for d in range(n)], 1)
+            return _sharded(wt, device, dim=-1), _replicated(b.reshape(1, -1), device)
 
         w_out = w_col_out if self.out_cols else w_row
         self.img_out = w_out(m.to_out[0])
@@ -308,6 +329,28 @@ class TtQwenJointAttention:
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
         mx = ttnn.max(s, dim=-1, keepdim=True)
+        if (
+            _precise.ENABLED
+            and _precise.EXP_SPLIT is not None
+            and _precise.SOFTMAX_FUSED_EXP
+            and _precise.SOFTMAX_DEFER_DIV
+            and not _precise.EXACT_PV
+        ):
+            # exp(s - max) and its P @ V limbs in one pass: e is written once and only read back by the row sum
+            res = _precise.EXP_SPLIT(s, mx, _precise.SOFTMAX_EXP_APPROX)
+            if res is not None:
+                ttnn.deallocate(s)
+                ttnn.deallocate(mx)
+                e, eh, el = res
+                sm = ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
+                ttnn.deallocate(e)
+                o = _precise.matmul_presplit(eh, el, v)
+                ttnn.deallocate(eh)
+                ttnn.deallocate(el)
+                o2 = ttnn.divide(o, sm)
+                ttnn.deallocate(o)
+                ttnn.deallocate(sm)
+                return o2
         if _precise.SOFTMAX_FUSED_EXP:  # exp(s - max) in the subtract's own pass: one score-sized write, not two
             e = ttnn.subtract(
                 s,
@@ -337,8 +380,9 @@ class TtQwenJointAttention:
     def _out(self, x, wb):  # row-parallel + all_reduce, bias once (or column-parallel, see __init__)
         w, b = wb
         if self.out_cols:
-            y = _precise.linear(_ccl.all_gather(x, self.device, dim=-1), w)
-            return ttnn.add(_ccl.all_gather(y, self.device, dim=-1), b)
+            gather = _ccl.all_gather_col_major if self.out_order is not None else _ccl.all_gather
+            y = _precise.linear(gather(x, self.device, dim=-1), w)
+            return ttnn.add(gather(y, self.device, dim=-1), b)
         if _precise.ENABLED:
             y = _precise.linear(x, w)
         else:

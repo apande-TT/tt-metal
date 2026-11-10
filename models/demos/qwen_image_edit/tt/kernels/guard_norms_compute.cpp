@@ -30,6 +30,8 @@ void kernel_main() {
     const uint32_t count = get_arg_val<uint32_t>(0);
     const uint32_t start = get_arg_val<uint32_t>(1);
     const uint32_t nt = get_arg_val<uint32_t>(2);
+    // 0: no negated-input product -- where the guard trips the tail takes dn (the dense product) for ex
+    constexpr uint32_t has_nn = get_compile_time_arg_val(0);
     constexpr uint32_t cb_ex = 0, cb_dn = 1, cb_nn = 2, cb_a = 3, cb_lo = 4, cb_b = 5, cb_out = 16;
     constexpr uint32_t EX = 0, DN = 1, NN = 2, TOL = 3, LO = 4, FAR = 5, TMP = 6, BN = 7;
 
@@ -41,7 +43,9 @@ void kernel_main() {
         }
         cb_wait_front(cb_ex, 1);
         cb_wait_front(cb_dn, 1);
-        cb_wait_front(cb_nn, 1);
+        if constexpr (has_nn) {
+            cb_wait_front(cb_nn, 1);
+        }
         cb_wait_front(cb_lo, 1);
         cb_wait_front(cb_b, 1);
         cb_reserve_back(cb_out, 1);
@@ -51,8 +55,10 @@ void kernel_main() {
         copy_tile(cb_ex, 0, EX);
         copy_init(cb_dn);
         copy_tile(cb_dn, 0, DN);
-        copy_init(cb_nn);
-        copy_tile(cb_nn, 0, NN);
+        if constexpr (has_nn) {
+            copy_init(cb_nn);
+            copy_tile(cb_nn, 0, NN);
+        }
         copy_init(cb_a);
         copy_tile(cb_a, 0, TOL);
         copy_init(cb_b);
@@ -68,18 +74,23 @@ void kernel_main() {
         abs_tile(FAR);  // |ex - dn|
         gt_binary_tile_init();
         gt_binary_tile(FAR, TOL, FAR);  // 1 where |ex - dn| > tol (the guard trips), else 0
-        binary_min_tile_init();
-        binary_min_tile(EX, DN, TOL);  // lo = min(ex, dn)       (tol no longer needed)
-        binary_max_tile_init();
-        binary_max_tile(EX, DN, TMP);  // hi = max(ex, dn)
-        negative_tile_init();
-        negative_tile(NN);  // -nn
-        binary_min_tile_init();
-        binary_min_tile(TMP, NN, TMP);  // min(hi, -nn)
-        binary_max_tile_init();
-        binary_max_tile(TOL, TMP, TOL);  // median(ex, dn, -nn)
-        where_tile_init();
-        where_tile<DataFormat::Float32>(FAR, TOL, EX, EX);  // far ? median : ex
+        if constexpr (has_nn) {
+            binary_min_tile_init();
+            binary_min_tile(EX, DN, TOL);  // lo = min(ex, dn)       (tol no longer needed)
+            binary_max_tile_init();
+            binary_max_tile(EX, DN, TMP);  // hi = max(ex, dn)
+            negative_tile_init();
+            negative_tile(NN);  // -nn
+            binary_min_tile_init();
+            binary_min_tile(TMP, NN, TMP);  // min(hi, -nn)
+            binary_max_tile_init();
+            binary_max_tile(TOL, TMP, TOL);  // median(ex, dn, -nn)
+            where_tile_init();
+            where_tile<DataFormat::Float32>(FAR, TOL, EX, EX);  // far ? median : ex
+        } else {
+            where_tile_init();
+            where_tile<DataFormat::Float32>(FAR, DN, EX, EX);  // far ? dn : ex
+        }
         add_binary_tile_init();
         add_binary_tile(EX, LO, EX);  // + lo
         tile_regs_commit();
@@ -91,7 +102,9 @@ void kernel_main() {
         cb_push_back(cb_out, 1);
         cb_pop_front(cb_ex, 1);
         cb_pop_front(cb_dn, 1);
-        cb_pop_front(cb_nn, 1);
+        if constexpr (has_nn) {
+            cb_pop_front(cb_nn, 1);
+        }
         cb_pop_front(cb_lo, 1);
         cb_pop_front(cb_b, 1);
         if (i + 1 == start + count || c + 1 == nt) {

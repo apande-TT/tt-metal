@@ -262,6 +262,19 @@ class TtTextAttention:
         return _gather_cols(out, self.tp)
 
 
+# The gate and up projections as ONE column-parallel weight: each chip's [gate shard | up shard] side by side, so the
+# (exact) linear runs its products once at N = 2 x inter / TP instead of twice, and the halves are sliced apart.
+MLP_GATE_UP_FOLD = True
+
+
+def _gate_up(gate_t, up_t, tp):
+    """[K, 2 I] with TP column block d = [gate block d | up block d] (each chip's column shard holds its own pair)."""
+    s = gate_t.shape[1] // tp
+    return torch.cat(
+        [torch.cat([gate_t[:, d * s : (d + 1) * s], up_t[:, d * s : (d + 1) * s]], 1) for d in range(tp)], 1
+    )
+
+
 class TtTextMLP:
     """down(silu(gate(x)) * up(x)), no biases -- gate/up column-parallel, down row-parallel."""
 
@@ -269,29 +282,63 @@ class TtTextMLP:
         """pair: a second MLP placed on mesh row 1 (row-staged layers); same TP split."""
         _, self.tp = mesh_shape(device)
         self.device = device
+        self.w_gu = None
+        fold = MLP_GATE_UP_FOLD and torch_module.gate_proj.out_features % (32 * self.tp) == 0
         if pair is not None:
-            self.w_gate = upload_rows(device, [_t(torch_module.gate_proj), _t(pair.gate_proj)], col_dim=-1)
-            self.w_up = upload_rows(device, [_t(torch_module.up_proj), _t(pair.up_proj)], col_dim=-1)
+            if fold:
+                self.w_gu = upload_rows(
+                    device,
+                    [
+                        _gate_up(_t(torch_module.gate_proj), _t(torch_module.up_proj), self.tp),
+                        _gate_up(_t(pair.gate_proj), _t(pair.up_proj), self.tp),
+                    ],
+                    col_dim=-1,
+                )
+                self.w_gate = self.w_up = None
+            else:
+                self.w_gate = upload_rows(device, [_t(torch_module.gate_proj), _t(pair.gate_proj)], col_dim=-1)
+                self.w_up = upload_rows(device, [_t(torch_module.up_proj), _t(pair.up_proj)], col_dim=-1)
             self.w_down = upload_rows(device, [_t(torch_module.down_proj), _t(pair.down_proj)], col_dim=0)
         else:
             col = shard_mapper(device, -1)
-            self.w_gate = upload(device, _t(torch_module.gate_proj), mapper=col)
-            self.w_up = upload(device, _t(torch_module.up_proj), mapper=col)
+            if fold:
+                self.w_gu = upload(
+                    device, _gate_up(_t(torch_module.gate_proj), _t(torch_module.up_proj), self.tp), mapper=col
+                )
+                self.w_gate = self.w_up = None
+            else:
+                self.w_gate = upload(device, _t(torch_module.gate_proj), mapper=col)
+                self.w_up = upload(device, _t(torch_module.up_proj), mapper=col)
             self.w_down = upload(device, _t(torch_module.down_proj), mapper=shard_mapper(device, 0))
         self.compute_cfg = hifi4_config()
+
+    @staticmethod
+    def _halves(gu):
+        s = list(gu.shape)
+        n = s[-1] // 2
+        gate = ttnn.slice(gu, [0] * len(s), s[:-1] + [n])
+        up = ttnn.slice(gu, [0] * (len(s) - 1) + [n], s)
+        ttnn.deallocate(gu)
+        return gate, up
 
     def __call__(self, x):
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
-            gate, up = split_linears(x, [self.w_gate, self.w_up], compute_kernel_config=cfg, exact=ex)
+            if self.w_gu is not None:
+                gate, up = self._halves(split_linear(x, self.w_gu, compute_kernel_config=cfg, exact=ex))
+            else:
+                gate, up = split_linears(x, [self.w_gate, self.w_up], compute_kernel_config=cfg, exact=ex)
             h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)])
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             return out
-        gate = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
-        up = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
+        if self.w_gu is not None:
+            gate, up = self._halves(ttnn.linear(x, self.w_gu, compute_kernel_config=self.compute_cfg))
+        else:
+            gate = ttnn.linear(x, self.w_gate, compute_kernel_config=self.compute_cfg)
+            up = ttnn.linear(x, self.w_up, compute_kernel_config=self.compute_cfg)
         out = ttnn.linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=self.compute_cfg)
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)

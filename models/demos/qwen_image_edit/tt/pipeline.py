@@ -28,11 +28,14 @@ from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
     batched_matmul,
+    exp_split,
     guard_tail,
     guard_tail_norms,
     head_split,
     lane_cols_sum,
+    masked_lane_bmm,
     masked_lane_linear,
+    masked_lane_linear2,
     modulate_tail,
     repeat_k,
     row_gather,
@@ -323,21 +326,33 @@ class TtQwenImageEditPipeline:
         in one C++ pass (row_sumsq) and the weight-side lanes as one K-stacked product (repeat_k)."""
         with self._hook(_te_attention, "NORM_SUMSQ", row_sumsq if self.weight_lane_split else None), self._hook(
             _te_attention, "LANE_STACK", repeat_k if self.weight_lane_split else None
+        ), self._hook(
+            # (and the attention products' 8 exact lanes as ONE K-stacked product, as the denoiser's QK^T)
+            _te_attention,
+            "LANE_KSTACK",
+            lanes_ttl.lanes8_stacked if self.lane_split else None,
+        ), self._hook(
+            # (and the non-transposed products' 8 a-side lanes + their sum by one C++ masked batched matmul)
+            _te_attention,
+            "LANE_MASKED_BMM",
+            masked_lane_bmm if self.weight_lane_split else None,
         ):
             yield
 
     def vision_encode(self, up):
         # (the attention P @ V products' exact lanes on V's rows: the C++ weight-lane split of the smaller operand)
         # (and the merged rows' unpermutation as an exact row gather, not one-hot products)
+        # (and those lanes as ONE K-stacked product: the probs repeated along K against the lanes stacked along K)
         with self._hook(_te_attention, "B_LANE_SPLIT", self.weight_lane_split), self._hook(
-            _vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None
-        ), self._hook(
+            _te_attention, "B_LANE_KSTACK", True
+        ), self._hook(_vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None), self._hook(
             _te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
+        # (and its MLP's gate / up as ONE column-parallel exact linear: _stubs/layer.py MLP_GATE_UP_FOLD)
         with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_text(up.te, image_embeds)
 
@@ -386,8 +401,18 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "SOFTMAX_DEFER_DIV", True),
             # (and that exp in the SFPU's fast approximate mode)
             (_dit_precise, "SOFTMAX_EXP_APPROX", True),
-            # (the guarded tail's tolerance a_norm x b_norm formed inside the C++ tail: no output-sized tol pass)
+            # (the guarded tail's tolerance a_norm x b_norm formed inside the C++ tail: no output-sized tol pass; norms in L1)
             (_te_attention, "GUARD_TAIL_NORMS", guard_tail_norms if self.fused_tail else None),
+            # (and no negated-input product for its vote: dn where the guard trips)
+            (_te_attention, "GUARD_NO_NN", True),
+            # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
+            (_te_attention, "QK_NO_GUARD", True),
+            # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
+            (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
+            # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
+            # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
+            # (and the 2-device axis reduced on that 1/4 slice before the one all_gather back)
+            (_dit_ccl, "A2A_REDUCE", bool(self.sum_parts)),
         )
         with contextlib.ExitStack() as stack:
             for module, name, fn in hooks:
@@ -447,6 +472,11 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_NSTACK", lane_cols_sum if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
+        ), self._hook(
+            # (and two weights sharing the input in one pass over it)
+            _te_attention,
+            "LANE_MASKED_MM2",
+            masked_lane_linear2 if self.weight_lane_split else None,
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._denoise_extras():
