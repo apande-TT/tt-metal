@@ -33,6 +33,7 @@ from models.demos.qwen_image_edit.tt.guard_kernel import (
     guard_tail_norms,
     head_split,
     lane_cols_sum,
+    masked_lane_bmm,
     masked_lane_linear,
     modulate_tail,
     repeat_k,
@@ -329,6 +330,11 @@ class TtQwenImageEditPipeline:
             _te_attention,
             "LANE_KSTACK",
             lanes_ttl.lanes8_stacked if self.lane_split else None,
+        ), self._hook(
+            # (and the non-transposed products' 8 a-side lanes + their sum by one C++ masked batched matmul)
+            _te_attention,
+            "LANE_MASKED_BMM",
+            masked_lane_bmm if self.weight_lane_split else None,
         ):
             yield
 

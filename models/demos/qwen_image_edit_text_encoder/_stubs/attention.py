@@ -399,6 +399,9 @@ QK_NO_GUARD = False
 # [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
 # the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
 B_LANE_KSTACK = False
+# Optional fused kernel for a non-transposed batched a @ b's 8 exact a-side lanes and their sum in one pass:
+# LANE_MASKED_BMM(a_lead, b_lead, b_rep) -> float32 [E, 1, M, N], or None for a shape it does not take.
+LANE_MASKED_BMM = None
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -1207,10 +1210,17 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
             if not kr_kept:
                 ttnn.deallocate(kr)
         else:
-            lanes, neg0 = _lead_lanes(pa0)
-            for lane in lanes:
-                acc.push(mm(lane, pb0_l1))
-                ttnn.deallocate(lane)
+            y = None
+            if LANE_MASKED_BMM is not None and not transpose_b:
+                y = LANE_MASKED_BMM(pa0, pb0_l1, b_rep)
+            if y is not None:
+                acc.push(y)
+                neg0 = None
+            else:
+                lanes, neg0 = _lead_lanes(pa0)
+                for lane in lanes:
+                    acc.push(mm(lane, pb0_l1))
+                    ttnn.deallocate(lane)
     ex = acc.value()
     dn = mm(pa0, pb0_l1)
     kcat = REST_KCAT and transpose_b and b_rep == 1 and len(rest) > 1
