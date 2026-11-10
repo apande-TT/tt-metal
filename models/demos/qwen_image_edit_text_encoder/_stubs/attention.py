@@ -627,11 +627,14 @@ def _lo_config(fidelity=None):
     )
 
 
-def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None, lo_fidelity=None):
+def split_linear(
+    x, w, bias=None, compute_kernel_config=None, exact=True, limbs=2, parts=None, lo_fidelity=None, bias_out_mem=None
+):
     """float32 x @ bf16 w (+ bias) -> float32. x is carried as `limbs` bf16 parts (exact products). With
     exact=True the K reduction is the exact lane sum (see above); otherwise one matmul per part.
     parts: split_bf16(x, limbs) when several projections share x (split once, not once per projection).
-    lo_fidelity: this call's lower-limb fidelity on the stock non-exact path (None: LO_FIDELITY)."""
+    lo_fidelity: this call's lower-limb fidelity on the stock non-exact path (None: LO_FIDELITY).
+    bias_out_mem: memory config of the separate float32 bias add's output (None: the add's default)."""
     cfg = precise_config()
     parts = split_bf16(x, limbs) if parts is None else parts
 
@@ -678,11 +681,15 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
                     ttnn.deallocate(t)
                 y = s
     # bias added separately in float32 (the fused bias add of ttnn.linear rounds: 3.1e-4 -> 5.1e-4)
-    if bias is not None and y.memory_config().buffer_type == ttnn.BufferType.L1:
-        out = ttnn.add(y, ttnn.typecast(bias, ttnn.float32), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    if bias is None:
+        return y
+    y_l1 = y.memory_config().buffer_type == ttnn.BufferType.L1
+    out_mem = bias_out_mem if bias_out_mem is not None else (ttnn.DRAM_MEMORY_CONFIG if y_l1 else None)
+    kw = {} if out_mem is None else {"memory_config": out_mem}
+    out = ttnn.add(y, ttnn.typecast(bias, ttnn.float32), **kw)
+    if y_l1:
         ttnn.deallocate(y)
-        return out
-    return ttnn.add(y, ttnn.typecast(bias, ttnn.float32)) if bias is not None else y
+    return out
 
 
 def rotate_half(t, mem=None):

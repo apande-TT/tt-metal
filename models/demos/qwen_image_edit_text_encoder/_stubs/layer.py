@@ -94,6 +94,9 @@ ROPE_HEADS_FN = None
 # with ROPE_HEADS_FN: q's / k's RoPE output in L1 (read by the QK^T product, freed after it) when q takes at most this
 # many bytes (0: DRAM)
 ROPE_L1_BYTES = 0
+# the LM attention's fused float32 qkv projection (its bias add's output) in L1 when it takes at most this many bytes,
+# read by the q / k RoPE and the v head slice and freed once they are made (0: its default placement)
+QKV_L1_BYTES = 0
 
 
 def _t(lin):
@@ -246,7 +249,16 @@ class TtTextAttention:
         b, s_pad = x.shape[0], x.shape[-2]
         cfg = self.compute_cfg
         ex = getattr(self, "exact", True)
-        qkv = split_linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=cfg, exact=ex)
+        qkv_bytes = 4 * b * s_pad * int(self.wqkv.padded_shape[-1])
+        qkv_l1 = 0 < qkv_bytes <= QKV_L1_BYTES
+        qkv = split_linear(
+            x,
+            self.wqkv,
+            bias=self.bqkv,
+            compute_kernel_config=cfg,
+            exact=ex,
+            bias_out_mem=ttnn.L1_MEMORY_CONFIG if qkv_l1 else None,
+        )
 
         def _heads(lo, n):
             if HEADS_BY_SLICES:  # one tile-aligned column block per head, stacked on dim 1 (no padded permute)
@@ -277,6 +289,8 @@ class TtTextAttention:
             return y if y is not None else _rope(_heads(lo, n))
 
         q, k, v = _rope_heads(0, hl), _rope_heads(hl, kvl), _heads(hl + kvl, kvl)
+        if qkv_l1:
+            ttnn.deallocate(qkv)
         if kv is not None:
             mode, cache, key, P = kv
             if mode == "store":
