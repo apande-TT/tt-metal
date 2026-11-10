@@ -391,6 +391,10 @@ GUARD_TAIL_NORMS = None
 # With GUARD_TAIL_NORMS: no negated-input product nn for the guard's vote -- where the guard trips (a glitch), the
 # tail takes the dense product dn instead of median(ex, dn, -nn), so nn's product, write and read are skipped.
 GUARD_NO_NN = False
+# The K-stacked exact QK^T (REST_KCAT) as ONE product with no guard: its trailing limb terms appended along K to the
+# exact lanes ([lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T), so no dense lead product, no separate
+# trailing product and no guard tail are formed (the exact lanes' rare glitches are not voted out).
+QK_NO_GUARD = False
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -1079,6 +1083,37 @@ def free_b_side(cache):
     cache.clear()
 
 
+def _unguarded_qk(stacked, pa0, pb0, rest, keep):
+    """QK_NO_GUARD: [lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T as one float32 product (transpose_b,
+    single-entry b: the K-stacked path's shapes); the b side is cached across query chunks."""
+    xs, _ = stacked
+    n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
+    rest_b = [pb for _, pb in rest]
+
+    def _kr_fold():
+        kr = LANE_STACK(pb0, n_lanes)
+        y = ttnn.concat([kr] + rest_b, dim=-1)
+        ttnn.deallocate(kr)
+        return y
+
+    kr2, kr2_kept = _b_side(keep, "kr_fold", [pb0] + rest_b, _kr_fold)
+    xs2 = ttnn.concat([xs] + [pa for pa, _ in rest], dim=-1)
+    ttnn.deallocate(xs)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=False):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
@@ -1116,6 +1151,14 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         stacked = None
         if LANE_KSTACK is not None and LANE_STACK is not None and transpose_b and b_rep == 1:
             stacked = LANE_KSTACK(pa0)
+        if (
+            stacked is not None
+            and QK_NO_GUARD
+            and REST_KCAT
+            and len(rest) > 1
+            and QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4
+        ):
+            return _unguarded_qk(stacked, pa0, pb0, rest, keep_b and pb0 is terms[0][1])
         if stacked is not None:
             xs, neg0 = stacked
             n_lanes = len(_lane_masks(pa0.device(), pa0.shape[-1], pa0.dtype, "strided"))
