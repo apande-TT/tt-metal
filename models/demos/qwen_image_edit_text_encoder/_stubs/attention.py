@@ -548,6 +548,9 @@ LANE_NSTACK = None
 # Optional in place of the K-stacked product: LANE_MASKED_MM(x, w, fidelity) -> sum_r lane_r(x) @ w in float32 with no
 # 8x copy of x (each core masks its x tiles into their lanes in L1), or None for a product it does not take.
 LANE_MASKED_MM = None
+# Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
+# pass over x, or None: weights sharing an input taken in pairs.
+LANE_MASKED_MM2 = None
 _ROW_LANE_MASKS = {}
 
 
@@ -580,6 +583,10 @@ def _weight_lane_sums(lead, ws):
         n_all = sum(w.shape[-1] for w in ws)
         if not LANE_STACK_MAX_K_PER_N or lead.shape[-1] <= LANE_STACK_MAX_K_PER_N * n_all:
             outs = []
+            if LANE_MASKED_MM2 is not None and len(ws) == 2:
+                pair = LANE_MASKED_MM2(lead, ws[0], ws[1], LANE_STACK_FIDELITY)
+                if pair is not None:
+                    return list(pair)
             for w in ws:
                 y = LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
                 if y is None:

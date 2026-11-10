@@ -35,6 +35,7 @@ from models.demos.qwen_image_edit.tt.guard_kernel import (
     lane_cols_sum,
     masked_lane_bmm,
     masked_lane_linear,
+    masked_lane_linear2,
     modulate_tail,
     repeat_k,
     row_gather,
@@ -468,6 +469,11 @@ class TtQwenImageEditPipeline:
             _te_attention, "LANE_NSTACK", lane_cols_sum if self.weight_lane_split else None
         ), self._hook(
             _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
+        ), self._hook(
+            # (and two weights sharing the input in one pass over it)
+            _te_attention,
+            "LANE_MASKED_MM2",
+            masked_lane_linear2 if self.weight_lane_split else None,
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._denoise_extras():
