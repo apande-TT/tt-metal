@@ -48,6 +48,18 @@ def _hf_token(args) -> str | None:
     return None
 
 
+def _current_repo_id(repo_id: str, token: str | None) -> str:
+    """The id HF serves ``repo_id`` under now. A renamed account or repo still answers to its old id, so a card that
+    names the old one still resolves, but under a name that is no longer the owner's. ``repo_id`` itself when the repo
+    does not exist yet or HF cannot be reached."""
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi(token=token).model_info(repo_id).id or repo_id
+    except Exception:  # noqa: BLE001
+        return repo_id
+
+
 # box (planner) -> (arch, hardware, mesh_device) for the tt-model.yaml serve block. hardware and
 # mesh_device must be values the vLLM plugin's closed table accepts; override with --hardware/--mesh.
 _BOX_TARGET = {
@@ -164,6 +176,12 @@ _SAMPLE_MODE_DEFAULT = "decode_only"
 # How far to follow a class's bases looking for its capabilities. Generators sit one or two levels
 # above the adapter class, so this only bounds a cycle.
 _CAPS_MAX_DEPTH = 6
+# Where the plugin is published, the ref a package follows unless told otherwise, and the script in it that
+# installs the vLLM release it is built against. tt-model rebuilds that script's environment from
+# runtime.vllm.version, so the version has to be the one the script at the pinned commit installs.
+_PLUGIN_REPO = "https://github.com/tenstorrent/vllm-tt-plugin"
+_PLUGIN_DEFAULT_REF = "main"
+_PLUGIN_INSTALL_RECIPE = "docs/install-vllm-tt.sh"
 
 
 # Finds a module's file the way the import system would, importing only its parent packages.
@@ -347,6 +365,7 @@ def _write_tt_model_yaml(
     lock: str | None = None,
     vllm_path: str | None = None,
     plugin_path: str | None = None,
+    overrides: list[str] | None = None,
 ) -> None:
     """Emit a schema-5.1 tt-model.yaml describing how to build+serve this optimized model as a
     v5.1 container package. Fields the run can't provide (the vLLM adapter dir, plugin) are stated
@@ -438,12 +457,13 @@ def _write_tt_model_yaml(
         (
             f"  plugin: {{path: {plugin_path}}}"
             if plugin_path
-            else f"  plugin: {{repo: https://github.com/tenstorrent/vllm-tt-plugin, ref: {plugin_ref}}}"
+            else f"  plugin: {{repo: {_PLUGIN_REPO}, ref: {plugin_ref}}}"
         ),
         f"  extra_models_dir: {extra_models_dir}",
         # runtime.lock is optional; only emit it when a real requirements.lock is provided, else the
         # build fails resolving a path that doesn't exist. Deps resolve live without it.
         *([f"  lock: {lock}"] if lock else []),
+        *([f"  overrides: {json.dumps(list(overrides))}"] if overrides else []),
         "",
         "serve:",
         "  port: 8000",
@@ -2849,6 +2869,34 @@ def _git_info(path):
     return (g("rev-parse", "HEAD") or None, g("remote", "get-url", "origin") or None)
 
 
+def _recipe_vllm_version(recipe: str):
+    """The one vLLM release a plugin install recipe installs, or None when it names none or several."""
+    import re
+
+    pins = set(re.findall(r"\bvllm==([0-9][0-9A-Za-z.+!-]*)", recipe or ""))
+    return pins.pop() if len(pins) == 1 else None
+
+
+def _plugin_serving_pair(repo: str, ref: str):
+    """(commit, vLLM release) for the plugin at ``ref``, or None when either cannot be read: the commit ``ref``
+    names now, and the release that commit's install recipe installs. A plugin imports vLLM modules of the release
+    it is built against, so both come from one commit; pinning the commit keeps a later move of ``ref`` from
+    pairing the image's plugin with another vLLM."""
+    with tempfile.TemporaryDirectory(prefix="ttpub_plugin_") as d:
+
+        def git(*a):
+            return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=300)
+
+        try:
+            if git("init", "-q").returncode or git("fetch", "-q", "--depth", "1", repo, ref).returncode:
+                return None
+            commit = git("rev-parse", "FETCH_HEAD").stdout.strip()
+            version = _recipe_vllm_version(git("show", f"FETCH_HEAD:{_PLUGIN_INSTALL_RECIPE}").stdout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return (commit, version) if commit and version else None
+
+
 def _discover_serving_stack():
     """Find a matched vLLM + in-tree-plugin serving stack on this host WITHOUT hardcoding a path or
     commit: scan bounded locations for a git checkout of the Tenstorrent vLLM carrying
@@ -2873,12 +2921,29 @@ def _discover_serving_stack():
     return None
 
 
+# What a vLLM install must not move: torch with the torchvision built for it (ttnn's extension modules are
+# built against that torch) and the transformers stack the model code was validated with.
+_VALIDATED_PACKAGES = ("torch", "torchvision", "transformers", "tokenizers")
+
+
 def _auto_constraint_file(checkout):
-    """Write a minimal pip CONSTRAINT pinning the versions the model was validated against (torch,
-    transformers, tokenizers) discovered from the checkout's python env, so a source-built vLLM cannot
-    pull a torch/transformers that mismatches the ttnn modules or the model code. Returns path or None."""
-    import subprocess
+    """Write a minimal pip CONSTRAINT of _validated_pins, so a source-built vLLM cannot pull a torch/transformers
+    that mismatches the ttnn modules or the model code. Returns path or None."""
     import tempfile
+    from pathlib import Path as _P
+
+    pins = _validated_pins(checkout)
+    if not pins:
+        return None
+    f = _P(tempfile.mkdtemp(prefix="ttpub_constraint_")) / "constraint.lock"
+    f.write_text("\n".join(pins) + "\n")
+    return str(f)
+
+
+def _validated_pins(checkout):
+    """``pkg==version`` for each of _VALIDATED_PACKAGES installed in the checkout's python env, the env the model
+    was validated in."""
+    import subprocess
     from pathlib import Path as _P
 
     py = str(_P(checkout) / "python_env" / "bin" / "python")
@@ -2899,15 +2964,11 @@ def _auto_constraint_file(checkout):
             return None
 
     pins = []
-    for pkg in ("torch", "transformers", "tokenizers"):
+    for pkg in _VALIDATED_PACKAGES:
         v = ver(pkg)
         if v:
             pins.append(f"{pkg}=={v.split('+')[0]}")
-    if not pins:
-        return None
-    f = _P(tempfile.mkdtemp(prefix="ttpub_constraint_")) / "constraint.lock"
-    f.write_text("\n".join(pins) + "\n")
-    return str(f)
+    return pins
 
 
 def _capture_vllm_provenance(args) -> None:
@@ -3297,6 +3358,30 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
     mesh_rc = _detect_mesh(Path(demo_dir))
     mesh_override = getattr(args, "mesh", None) or (f"({mesh_rc[0]}, {mesh_rc[1]})" if mesh_rc else None)
 
+    plugin_ref = getattr(args, "plugin_ref", None) or _PLUGIN_DEFAULT_REF
+    vllm_version = getattr(args, "vllm_version", None)
+    if not vllm_version and not getattr(args, "vllm_path", None):
+        if getattr(args, "plugin_path", None):
+            recipe = Path(args.plugin_path) / _PLUGIN_INSTALL_RECIPE
+            vllm_version = _recipe_vllm_version(recipe.read_text() if recipe.is_file() else "")
+            source = str(recipe)
+        else:
+            plugin_ref, vllm_version = _plugin_serving_pair(_PLUGIN_REPO, plugin_ref) or (plugin_ref, None)
+            source = f"{_PLUGIN_REPO} @ {plugin_ref}: {_PLUGIN_INSTALL_RECIPE}"
+        if not vllm_version:
+            print(
+                f"  [publish-hf] cannot read the vLLM release the plugin installs ({source}); "
+                "pass --vllm-version with the release that plugin needs."
+            )
+            return 2
+        print(f"  [publish-hf] serving stack: plugin {source} installs vLLM {vllm_version}")
+    # vLLM installed by version resolves the CUDA build's PyPI requirements, which name their own torch and
+    # transformers; with no lock to fix the set, hold those at the versions the model was validated with.
+    overrides = None
+    if not getattr(args, "vllm_path", None) and not getattr(args, "lock", None):
+        overrides = _validated_pins(checkout)
+        print(f"  [publish-hf] held at the validated env's versions: {', '.join(overrides) or 'none found'}")
+
     yaml_path = Path(tempfile.mkdtemp(prefix="tt_ttmodel_")) / "tt-model.yaml"
     try:
         _write_tt_model_yaml(
@@ -3311,13 +3396,14 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             hardware=getattr(args, "hardware", None),
             mesh_device=mesh_override,
             kind=getattr(args, "kind", None) or "vllm-plugin",
-            plugin_ref=getattr(args, "plugin_ref", None) or "main",
-            vllm_version=getattr(args, "vllm_version", None) or "0.24.0",
+            plugin_ref=plugin_ref,
+            vllm_version=vllm_version,
             extra_models_dir=extra,
             commit=commit,
             lock=getattr(args, "lock", None),
             vllm_path=getattr(args, "vllm_path", None),
             plugin_path=getattr(args, "plugin_path", None),
+            overrides=overrides,
         )
     except ValueError as exc:
         print(f"  [publish-hf] {exc}")
@@ -3722,6 +3808,10 @@ def cmd_publish_hf(args) -> int:
             args.weights = detected
             print(f"  [publish-hf] base weights auto-detected: {detected}")
     base_weights = getattr(args, "weights", None)
+    current = _current_repo_id(args.repo, _hf_token(args))
+    if current != args.repo:
+        print(f"  [publish-hf] {args.repo} is now {current} on HF; publishing under {current}.")
+        args.repo = current
 
     if getattr(args, "container", False):
         rc = _run_container(args, state, slug, demo_dir, commit)

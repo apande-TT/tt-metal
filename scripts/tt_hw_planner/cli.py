@@ -11749,8 +11749,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     pph.add_argument("--hardware", help="override serve.hardware (e.g. p300x2)")
     pph.add_argument("--mesh", help="override serve.mesh_device (e.g. P300x2)")
     pph.add_argument("--kind", help="tt-model kind: vllm-plugin (default) | vllm-fork | tt-dit-server")
-    pph.add_argument("--plugin-ref", dest="plugin_ref", help="vllm-tt-plugin git ref (default: main)")
-    pph.add_argument("--vllm-version", dest="vllm_version", help="vLLM version (default: 0.24.0)")
+    pph.add_argument(
+        "--plugin-ref", dest="plugin_ref", help="vllm-tt-plugin git ref, pinned to the commit it names (default: main)"
+    )
+    pph.add_argument(
+        "--vllm-version",
+        dest="vllm_version",
+        help="vLLM version (default: the release the plugin's docs/install-vllm-tt.sh installs)",
+    )
     pph.add_argument(
         "--vllm-path", dest="vllm_path", help="local vLLM source tree to build in the image (matched-pair serving)"
     )
