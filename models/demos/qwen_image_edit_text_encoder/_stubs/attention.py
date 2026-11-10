@@ -781,10 +781,11 @@ def _bmm_limbs(x):
     return split_bf16(x, 2)
 
 
-def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2):
+def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, out_mem=None):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
-    exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim)."""
+    exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim). out_mem: the
+    BMM_CONCAT_K product's output memory config (None: the matmul's default)."""
     cfg = precise_config()
     if not exact and limbs == 2 and LIMB_BMM_FN is not None and not transpose_b:
         # the three limb terms in one C++ program (b as [K, N]: P @ V)
@@ -814,6 +815,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
         b3 = ttnn.concat([pb_all[0], pb_all[1], pb_all[0]], dim=-1 if transpose_b else -2)
         pc3 = _bmm_split_m_config(a3, b3, transpose_b) if BMM_SPLIT_M and BMM_CORE_GRID is not None else None
         kw = {} if pc3 is not None or BMM_CORE_GRID is None else {"core_grid": BMM_CORE_GRID}
+        if out_mem is not None:
+            kw["memory_config"] = out_mem
         y = ttnn.matmul(
             a3, b3, transpose_b=transpose_b, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=pc3, **kw
         )

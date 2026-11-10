@@ -83,6 +83,8 @@ SOFTMAX_L1_BYTES = 0
 SOFTMAX_FUSED_EXP = False
 # with SOFTMAX_L1_BYTES: the masked scores and the probabilities in L1 too (the softmax reads and P @ V reads them)
 SOFTMAX_IO_L1 = False
+# with SOFTMAX_L1_BYTES: the raw QK^T scores in L1 too (read by the mask add; freed once it is made)
+SCORES_L1 = False
 # fn(t, cos, sin) -> the precise LM attention's RoPE t * cos + rotate_half(t) * sin in one call (e.g. a fused kernel),
 # or None to run the stock ops (None: slices + neg + concat + multiplies + add)
 ROPE_FN = None
@@ -287,7 +289,11 @@ class TtTextAttention:
                 kp, vp = cache[key]
                 k, v = ttnn.concat([kp, k], dim=2), ttnn.concat([vp, v], dim=2)
         q = ttnn.reshape(q, (b, kvl, G * s_pad, D))
-        scores = split_matmul(q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex)
+        n_keys = int(k.shape[-2])
+        s_l1 = SCORES_L1 and SOFTMAX_L1_BYTES and 4 * b * kvl * G * s_pad * n_keys <= SOFTMAX_L1_BYTES
+        scores = split_matmul(
+            q, k, transpose_b=True, compute_kernel_config=cfg, exact=ex, out_mem=ttnn.L1_MEMORY_CONFIG if s_l1 else None
+        )
         for t in (q, k):
             if t.memory_config().buffer_type == ttnn.BufferType.L1:
                 ttnn.deallocate(t)
