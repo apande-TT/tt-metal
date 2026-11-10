@@ -66,13 +66,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
-from .discovery import safe_relative_to_root
+from .discovery import safe_relative_to_root, ttt_path
 
 
 _LOG = logging.getLogger(__name__)
 
 
-DEFAULT_PROMPTS_FILE = "models/tt_transformers/demo/sample_prompts/" "input_data_questions_prefill_128.json"
+DEFAULT_PROMPTS_FILE = "models/ttt_compat/demo/sample_prompts/" "input_data_questions_prefill_128.json"
 
 
 DEFAULT_COMPARE_TOKENS = 32
@@ -276,7 +276,7 @@ def load_demo_first_prompt(
     if repo_root is None:
         return None
 
-    path = repo_root / prompts_file
+    path = repo_root / ttt_path(prompts_file, repo_root)
     if not path.exists():
         return None
 
@@ -302,16 +302,19 @@ def _detect_repo_root() -> Optional[Path]:
 
     When the planner runs inside an isolated worktree (env var
     TT_HW_PLANNER_BRINGUP_CWD set), return that. Otherwise walk up
-    from this module's location to find ``models/tt_transformers/demo``.
+    from this module's location to find the transformers stack's ``demo`` folder (either layout).
     """
-    from .discovery import BRINGUP_ROOT, REPO_ROOT as _CANONICAL_REPO_ROOT
+    from .discovery import BRINGUP_ROOT, REPO_ROOT as _CANONICAL_REPO_ROOT, TTT_DIRS
+
+    def has_demo(r: Path) -> bool:
+        return any((r / d / "demo").is_dir() for d in TTT_DIRS)
 
     root = BRINGUP_ROOT()
-    if root != _CANONICAL_REPO_ROOT and (root / "models" / "tt_transformers" / "demo").is_dir():
+    if root != _CANONICAL_REPO_ROOT and has_demo(root):
         return root
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "models" / "tt_transformers" / "demo").is_dir():
+        if has_demo(parent):
             return parent
     return None
 
@@ -598,7 +601,7 @@ def gather_tt_weight_cache_summary(
 def gather_backend_file_paths(
     repo_root: Optional[Path] = None,
     *,
-    backend_dir: str = "models/tt_transformers/tt",
+    backend_dir: str = "models/ttt_compat/tt",
     max_files: int = 60,
 ) -> str:
     """Produce a compact list of the backend's source files so the
@@ -614,6 +617,7 @@ def gather_backend_file_paths(
     if repo_root is None:
         return "  (could not detect repo root)"
 
+    backend_dir = ttt_path(backend_dir, repo_root)
     base = repo_root / backend_dir
     if not base.is_dir():
         return f"  (backend directory not found: {backend_dir})"

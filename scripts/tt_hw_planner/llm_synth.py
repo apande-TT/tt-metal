@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from .discovery import safe_relative_to_root, BRINGUP_ROOT
+from .discovery import safe_relative_to_root, BRINGUP_ROOT, TTT_NAMES
 import ast
 import datetime as _dt
 import json
@@ -1803,7 +1803,7 @@ def _infer_category_from_demo(demo_dir: Path) -> str:
         return "Video"
     if "multimodal" in parts:
         return "VLM"
-    if "tt_transformers" in parts or "llama" in parts or "qwen" in parts or "mistral" in parts:
+    if any(n in parts for n in TTT_NAMES) or "llama" in parts or "qwen" in parts or "mistral" in parts:
         return "LLM"
     return "NLP"
 

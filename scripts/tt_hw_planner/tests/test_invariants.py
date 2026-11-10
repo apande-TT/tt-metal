@@ -2348,15 +2348,16 @@ def test_env_compat_detects_unpatched_transformers_5x() -> None:
     import unittest.mock
     import sys
     from scripts.tt_hw_planner.cli import _check_demo_environment_compat
+    from scripts.tt_hw_planner.discovery import ttt_dir
 
     fake_files: Dict[str, str] = {
         "models/common/llama_models.py": (
             "from transformers import AutoModelForVision2Seq, " "AutoProcessor, pipeline\n"
         ),
-        "models/tt_transformers/tt/model_config.py": (
+        f"{ttt_dir()}/tt/model_config.py": (
             'self.rope_theta = text_config.get("rope_theta")\n' 'self.rope_scaling = text_config.get("rope_scaling")\n'
         ),
-        "models/tt_transformers/tt/common.py": (
+        f"{ttt_dir()}/tt/common.py": (
             "def encode_prompt_hf(tokenizer, prompt_text):\n"
             "    result = tokenizer.apply_chat_template(chat, "
             "add_generation_prompt=True, tokenize=True)\n"

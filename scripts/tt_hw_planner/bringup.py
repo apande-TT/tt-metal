@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .compatibility import CompatReport, Status, check_compatibility
-from .discovery import ModelDiscovery, discover_model, safe_relative_to_root
+from .discovery import ModelDiscovery, discover_model, safe_relative_to_root, ttt_path
 from .family_backends import FamilyBackend, pick_backend
 from .hardware import HARDWARE, find_box
 from .kernel_constraints import KernelReport, Severity, evaluate_kernels
@@ -17,19 +17,19 @@ from .verdict import FitRow, evaluate_all
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-DEMO_TEST_PATH = "models/tt_transformers/demo/simple_text_demo.py"
+DEMO_TEST_PATH = "models/ttt_compat/demo/simple_text_demo.py"
 
 
 def _model_config_path() -> Path:
-    from .discovery import BRINGUP_ROOT
+    from .discovery import BRINGUP_ROOT, ttt_dir
 
-    return BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "model_config.py"
+    return BRINGUP_ROOT() / ttt_dir() / "tt" / "model_config.py"
 
 
 def _trace_region_path() -> Path:
-    from .discovery import BRINGUP_ROOT
+    from .discovery import BRINGUP_ROOT, ttt_dir
 
-    return BRINGUP_ROOT() / "models" / "tt_transformers" / "demo" / "trace_region_config.py"
+    return BRINGUP_ROOT() / ttt_dir() / "demo" / "trace_region_config.py"
 
 
 def __getattr__(name):
@@ -317,7 +317,7 @@ def _build_tt_transformers_invocation(
     if data_parallel > 1:
         args += ["--data_parallel", str(data_parallel)]
     env = {"HF_MODEL": hf_model, "MESH_DEVICE": mesh_device, "TT_HW_PLANNER_OVERLAY_MODEL": hf_model}
-    return PytestInvocation(test_path=DEMO_TEST_PATH, args=args, env=env)
+    return PytestInvocation(test_path=ttt_path(DEMO_TEST_PATH), args=args, env=env)
 
 
 def _build_external_invocation(

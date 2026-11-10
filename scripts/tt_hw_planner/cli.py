@@ -22,7 +22,7 @@ from .bringup import (
     render_script as render_bringup_script,
     render_text as render_bringup_text,
 )
-from .discovery import BRINGUP_ROOT, safe_relative_to_root
+from .discovery import BRINGUP_ROOT, TTT_DIRS, TTT_NAMES, safe_relative_to_root, ttt_path
 from .pcc_targets import E2E_PCC
 from .bringup_loop import (
     autofill_stubs,
@@ -1526,127 +1526,7 @@ def _enforce_memory_fit_or_abort(
     return 2
 
 
-def _check_demo_environment_compat(
-    *, demo_module_path: str = "models.tt_transformers.demo.simple_text_demo"
-) -> Tuple[bool, List[str]]:
-    """2026-05-23 environment pre-check: validate that the demo path
-    the tool is about to invoke can actually run with the installed
-    `transformers` version.
-
-    Why this exists: `up --auto <supported-LLM>` ends up invoking
-    `tt_transformers/simple_text_demo.py` via pytest. That demo was
-    written against `transformers==4.x`. When `transformers==5.x` is
-    installed (e.g. 5.8.1 on this box), the demo fails with errors
-    like:
-      - `ImportError: cannot import name 'AutoModelForVision2Seq'`
-      - `TypeError: pow(NoneType, Tensor)` (rope_theta missing)
-      - `RuntimeError: Could not infer dtype of tokenizers.Encoding`
-
-    Each individual symptom is opaque. The user has to dig through
-    repo code to figure out why their model crashed. The TOOL's
-    contract is to catch this kind of thing upfront and abort with
-    a clear message.
-
-    Returns (ok, problems_list). On `not ok`, the caller is expected
-    to print the problems and abort. Returns `(True, [])` when the
-    environment looks clean and the demo should be able to run.
-
-    Strategy: fast static checks only. No subprocess imports (those
-    would take 5-10s and pull in ttnn). We grep the demo's import
-    chain for known-broken symbols and version-check transformers."""
-    problems: List[str] = []
-
-    try:
-        import transformers as _tf
-
-        tf_version = getattr(_tf, "__version__", "(unknown)")
-    except Exception as exc:
-        problems.append(f"transformers is not importable ({type(exc).__name__}: {exc})")
-        return False, problems
-
-    try:
-        major = int(str(tf_version).split(".")[0])
-    except (ValueError, IndexError):
-        major = 0
-
-    if major >= 5:
-        repo_files_on_demo_path = [
-            BRINGUP_ROOT() / "models" / "common" / "llama_models.py",
-            BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "model_config.py",
-            BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "common.py",
-        ]
-
-        for p in repo_files_on_demo_path:
-            if not p.is_file():
-                continue
-            try:
-                src = p.read_text()
-            except Exception:
-                continue
-
-            for i, line in enumerate(src.splitlines()):
-                if "AutoModelForVision2Seq" not in line:
-                    continue
-                if "from transformers import" not in line:
-                    continue
-                window = "\n".join(src.splitlines()[max(0, i - 3) : i + 4])
-                if "AutoModelForImageTextToText" not in window:
-                    problems.append(
-                        f"{safe_relative_to_root(p)}:{i + 1} "
-                        f"imports `AutoModelForVision2Seq` from "
-                        f"transformers (removed in 5.x; renamed "
-                        f"to `AutoModelForImageTextToText`). The "
-                        f"demo will ImportError before the model "
-                        f"even loads."
-                    )
-
-        mc_path = BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "model_config.py"
-        if mc_path.is_file():
-            try:
-                mc_src = mc_path.read_text()
-            except Exception:
-                mc_src = ""
-            if 'text_config.get("rope_theta")' in mc_src and "rope_parameters" not in mc_src:
-                problems.append(
-                    "models/tt_transformers/tt/model_config.py reads "
-                    "`rope_theta` only; transformers 5.x migrates this "
-                    "field to `rope_parameters['rope_theta']` for some "
-                    "models (e.g. Phi-3.5). Runtime will crash with "
-                    "`TypeError: pow(NoneType, Tensor)` at rope.py."
-                )
-
-        common_path = BRINGUP_ROOT() / "models" / "tt_transformers" / "tt" / "common.py"
-        if common_path.is_file():
-            try:
-                common_src = common_path.read_text()
-            except Exception:
-                common_src = ""
-            if "apply_chat_template" in common_src and (
-                "_normalize_token_result_to_list" not in common_src
-                and "_chat_template_ids" not in common_src
-                and 'hasattr(result, "input_ids")' not in common_src
-                and 'hasattr(encoded, "input_ids")' not in common_src
-                and 'hasattr(encoded, "ids")' not in common_src
-            ):
-                problems.append(
-                    "models/tt_transformers/tt/common.py calls "
-                    "`apply_chat_template(tokenize=True)` but does "
-                    "not normalize the return type. In transformers "
-                    "5.x this returns `BatchEncoding` (or "
-                    "`tokenizers.Encoding`), not `List[int]`. "
-                    "Runtime will crash with `RuntimeError: Could "
-                    "not infer dtype of tokenizers.Encoding`."
-                )
-
-    if problems:
-        problems.insert(
-            0,
-            f"transformers=={tf_version} is installed; the "
-            f"`{demo_module_path}` codepath assumes 4.x APIs in "
-            f"several places. Detected issues:",
-        )
-
-    return (not problems), problems
+from ._cli_helpers.demo_env import _check_demo_environment_compat  # noqa: F401
 
 
 def _run_advisory_meta_plan(
@@ -1930,7 +1810,7 @@ def _git_worktree_diff_hash() -> str:
 _CACHE_AFFECTING_FILE_GLOBS: Tuple[str, ...] = (
     "**/load_checkpoints*.py",
     "**/state_dict*.py",
-    "**/tt_transformers/tt/common.py",
+    *(f"**/{n}/tt/common.py" for n in TTT_NAMES),
 )
 
 
@@ -3040,6 +2920,7 @@ def _run_pcc_gate(
     from .output_validation import (
         compare_token_sequences,
         DEFAULT_COMPARE_TOKENS,
+        DEFAULT_PROMPTS_FILE,
         extract_demo_user_output,
         generate_hf_reference,
         load_demo_first_prompt,
@@ -3086,7 +2967,7 @@ def _run_pcc_gate(
     if not prompt:
         print(
             "  PCC gate: could not load the demo's first prompt from "
-            f"{'/'.join(['models', 'tt_transformers', 'demo', 'sample_prompts', 'input_data_questions_prefill_128.json'])}. "
+            f"{ttt_path(DEFAULT_PROMPTS_FILE)}. "
             "Skipping the gate (the prompts file is unexpectedly "
             "missing or malformed)."
         )
@@ -5208,7 +5089,7 @@ def _classify_failure(summary: str, details: str) -> str:
     # the combination of NotImplementedError + tt_transformers in the
     # traceback. The escalation table maps this class to additional
     # editable paths in the canonical tree.
-    if "NotImplementedError" in text and ("models/tt_transformers/tt/" in text or "models/common/" in text):
+    if "NotImplementedError" in text and (any(f"{d}/tt/" in text for d in TTT_DIRS) or "models/common/" in text):
         return "CONFIG_PARAM"
 
     oom_explicit = ("Out of Memory" in text) or ("Not enough space to allocate" in text)
@@ -5402,160 +5283,12 @@ def _failure_signature(summary: str, details: str) -> str:
     return _root_cause((summary or details or "(unknown)").strip())[:220]
 
 
-_EDIT_SCOPE_FOR_FAILURE_CLASS: Dict[str, List[str]] = {
-    "L1_SMALL_ZERO": ["conftest.py", "tests/pcc/conftest.py"],
-    "EMBEDDING_DTYPE": ["tests/pcc/conftest.py", "_captured/**/*.py"],
-    "HANG": ["tests/pcc/conftest.py"],
-}
-
-
-# Repo-relative escalation paths (resolved against BRINGUP_ROOT, not demo_dir).
-# Used when the failure originates outside the demo dir — e.g. a
-# NotImplementedError from `models/tt_transformers/tt/rope.py` whose real
-# fix lives in `models/tt_transformers/tt/model_config.py`. Without this,
-# the LLM is given no path to fix bugs in canonical code that it didn't
-# author. The Phi-3.5 attention failure (use_qk_fused for head_dim=96)
-# is the motivating case.
-_REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS: Dict[str, List[str]] = {
-    "CONFIG_PARAM": [
-        "models/tt_transformers/tt/model_config.py",
-        "models/tt_transformers/tt/rope.py",
-        "models/common/rmsnorm.py",
-    ],
-}
-
-
-def _resolve_extra_edit_paths(
-    demo_dir: Path,
-    failure_class: str,
-) -> List[Path]:
-    """Expand the failure-class-keyed permission table into concrete
-    file paths. Returns an empty list when the class is unknown or has
-    no escalation.
-
-    Used by the prompt-assembly path to emit an ESCALATED EDIT SCOPE
-    section instructing the LLM that, for this iteration only, it may
-    additionally edit the listed files. The default `_stubs/<comp>.py`
-    write-scope is always implicitly allowed.
-
-    Two tables are consulted:
-      * ``_EDIT_SCOPE_FOR_FAILURE_CLASS`` — paths globbed under demo_dir
-        (e.g. conftest.py inside the per-model test tree).
-      * ``_REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS`` — paths resolved
-        against BRINGUP_ROOT (e.g. canonical tt_transformers source).
-        Used when the bug lives in shared code, not the demo-local tree.
-    """
-    out: List[Path] = []
-
-    # demo_dir-relative patterns (existing behavior).
-    patterns = _EDIT_SCOPE_FOR_FAILURE_CLASS.get(failure_class, [])
-    for pattern in patterns:
-        try:
-            for p in demo_dir.glob(pattern):
-                if p.is_file():
-                    out.append(p)
-        except Exception:
-            continue
-
-    # repo-relative patterns (canonical source fixes).
-    repo_patterns = _REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS.get(failure_class, [])
-    if repo_patterns:
-        try:
-            from .discovery import BRINGUP_ROOT as _BR
-
-            repo_root = _BR()
-        except Exception:
-            repo_root = None
-        if repo_root is not None:
-            for rel in repo_patterns:
-                p = repo_root / rel
-                if p.is_file():
-                    out.append(p)
-
-    return sorted(set(out))
-
-
-def _format_escalated_edit_scope_block(
-    demo_dir: Path,
-    failure_class: str,
-) -> str:
-    """Render the ESCALATED EDIT SCOPE section for the LLM prompt.
-
-    Returns an empty string when the failure class does not unlock
-    any extra files — keeps the prompt small and avoids tempting the
-    LLM to touch files it has no business in."""
-    extra = _resolve_extra_edit_paths(demo_dir, failure_class)
-    if not extra:
-        return ""
-    lines = [
-        "ESCALATED EDIT SCOPE (failure-class-specific):",
-        f"  Failure class `{failure_class}` cannot be fixed inside the per-",
-        "  component stub alone. For THIS iteration ONLY, you are also",
-        "  permitted to edit the following file(s):",
-    ]
-    for p in extra:
-        try:
-            rel = safe_relative_to_root(p)
-        except Exception:
-            rel = p
-        lines.append(f"    - {rel}")
-    if failure_class == "L1_SMALL_ZERO":
-        lines.extend(
-            [
-                "",
-                "  For L1_SMALL_ZERO specifically: edit the device fixture in",
-                "  the listed conftest.py to pass `l1_small_size=16384` (or",
-                "  a larger power-of-two if the diagnostic reports a bigger",
-                "  buffer requirement) to whatever ttnn device-creation helper",
-                "  the fixture uses. Look for `ttnn.open_device(...)`,",
-                "  `ttnn.open_mesh_device(...)`, or",
-                "  `MeshDevice.create(...)` invocations and add the kwarg.",
-                "  This single change unblocks every conv2d/halo/sliding-window",
-                "  op the model uses; no stub rewrite is needed once it lands.",
-            ]
-        )
-    elif failure_class == "EMBEDDING_DTYPE":
-        lines.extend(
-            [
-                "",
-                "  For EMBEDDING_DTYPE: the test harness may be passing index",
-                "  tensors as float32/bfloat16 when ttnn.embedding requires",
-                "  uint32. Cast indices to uint32 either inside `__call__`",
-                "  (preferred — robust to harness changes) or in the conftest",
-                "  fixture's input prep step.",
-            ]
-        )
-    elif failure_class == "HANG":
-        lines.extend(
-            [
-                "",
-                "  For HANG: if multiple components hang at the SAME stage",
-                "  (e.g. `ttnn_to_torch`), this is likely a harness bug",
-                "  rather than a stub bug. Inspect `_ttnn_to_torch_mesh_safe`",
-                "  in the test conftest and consider replacing it with a",
-                "  per-output type-dispatch (handle Tensor, tuple, list, dict)",
-                "  that calls `ttnn.synchronize_device(device)` before drain.",
-            ]
-        )
-    elif failure_class == "CONFIG_PARAM":
-        lines.extend(
-            [
-                "",
-                "  For CONFIG_PARAM: a NotImplementedError was raised from",
-                "  canonical tt_transformers code because a model_config flag",
-                "  (e.g. `use_qk_fused`, `use_hf_rope`) is set inconsistently",
-                "  with the model's architecture (e.g. head_dim not divisible",
-                "  by 64). The fix is usually a one-line addition to the",
-                "  derivation in `model_config.py` to also gate on the",
-                "  relevant architecture constraint. Trace the exception back",
-                "  from the `raise NotImplementedError` site to wherever the",
-                "  offending flag is set; add the missing condition there.",
-                "  DO NOT just override the flag in the wrapper — that won't",
-                "  stick if downstream code re-reads from configuration.",
-            ]
-        )
-    lines.append("")
-    return "\n".join(lines)
+from ._cli_helpers.edit_scope import (  # noqa: F401
+    _EDIT_SCOPE_FOR_FAILURE_CLASS,
+    _REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS,
+    _format_escalated_edit_scope_block,
+    _resolve_extra_edit_paths,
+)
 
 
 _AGENTIC_INVESTIGATION_CLASSES = frozenset(

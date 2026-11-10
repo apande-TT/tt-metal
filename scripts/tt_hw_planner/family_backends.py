@@ -35,6 +35,12 @@ class FamilyBackend:
 
     use_module_tree: bool = False
 
+    def __post_init__(self) -> None:
+        from .discovery import ttt_path
+
+        self.demo_path = ttt_path(self.demo_path)
+        self.smoke_test_entry = ttt_path(self.smoke_test_entry)
+
     def effective_pytest_exclude_k(self) -> str:
         return self.pytest_exclude_k_override or DEFAULT_TEMPLATE_PYTEST_EXCLUDE_K
 
@@ -43,7 +49,7 @@ _BACKENDS: List[FamilyBackend] = [
     FamilyBackend(
         category="LLM",
         name="tt_transformers / simple_text_demo",
-        demo_path="models/tt_transformers/demo/simple_text_demo.py",
+        demo_path="models/ttt_compat/demo/simple_text_demo.py",
         routing_mode="generic",
         canonical_hf_id=None,
         notes="Generic text LLM backend; accepts HF_MODEL for any supported text-causal-LM.",
@@ -67,7 +73,7 @@ _BACKENDS: List[FamilyBackend] = [
     FamilyBackend(
         category="VLM",
         name="tt_transformers / simple_text_demo (multimodal)",
-        demo_path="models/tt_transformers/demo/simple_text_demo.py",
+        demo_path="models/ttt_compat/demo/simple_text_demo.py",
         routing_mode="generic",
         canonical_hf_id=None,
         notes="Generic VLM backend for the Qwen-VL / Gemma3 / Mistral-3.1 lineage.",
@@ -256,13 +262,13 @@ _BACKENDS: List[FamilyBackend] = [
     FamilyBackend(
         category="VLM",
         name="Mistral-Small-3.1 (mistral3 VLM)",
-        demo_path="models/tt_transformers/demo/simple_text_demo.py",
+        demo_path="models/ttt_compat/demo/simple_text_demo.py",
         routing_mode="template",
         canonical_hf_id="mistralai/Mistral-Small-3.1-24B-Instruct-2503",
         notes="Mistral Small 3.1 24B multimodal instruction model. Text path runs via tt_transformers/simple_text_demo.py with HF_MODEL set; vision path is not yet ported.",
         model_type_keys=["mistral3"],
         pipeline_tags=["image-text-to-text"],
-        smoke_test_entry="models/tt_transformers/demo/simple_text_demo.py",
+        smoke_test_entry="models/ttt_compat/demo/simple_text_demo.py",
         use_module_tree=False,
     ),
 ]

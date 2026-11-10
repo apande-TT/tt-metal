@@ -75,6 +75,42 @@ def safe_relative_to_root(p) -> Path:
     return p
 
 
+# The shared transformers stack's package, newest layout first. Upstream moved it from models/tt_transformers to
+# models/ttt_compat and left only an import alias at the old path; a checkout from before the move still has its
+# files at the old one. Repo-relative paths written against either layout go through ttt_path.
+TTT_DIRS = ("models/ttt_compat", "models/tt_transformers")
+TTT_NAMES = tuple(Path(d).name for d in TTT_DIRS)
+
+
+def ttt_dir(root=None) -> str:
+    """The stack's package directory in ``root`` (default BRINGUP_ROOT()), repo-relative: the newest layout there."""
+    base = Path(root) if root is not None else BRINGUP_ROOT()
+    return next((d for d in TTT_DIRS if (base / d).is_dir()), TTT_DIRS[0])
+
+
+def ttt_path(path, root=None):
+    """``path`` (repo-relative, possibly with trailing arguments) as it lies in ``root`` (default BRINGUP_ROOT()):
+    under ``root``'s own stack directory when it is under any TTT_DIRS layout, unless only the path as written exists
+    there (a file left at the old location). Other paths are returned unchanged; a Path stays a Path."""
+    if not path:
+        return path
+    base = Path(root) if root is not None else BRINGUP_ROOT()
+    s = Path(path).as_posix() if isinstance(path, Path) else str(path)
+    for d in TTT_DIRS:
+        if s == d or s.startswith(d + "/"):
+            out = ttt_dir(base) + s[len(d) :]
+            if not (base / out.split()[0]).exists() and (base / s.split()[0]).exists():
+                out = s
+            return Path(out) if isinstance(path, Path) else out
+    return path
+
+
+def mentions_ttt(text) -> bool:
+    """Whether ``text`` (a path or a traceback) names the stack under any of its layouts."""
+    s = str(text)
+    return any(n in s for n in TTT_NAMES)
+
+
 _FILE_KIND_PRIORITY = {
     "test_demo": 100,
     "demo_py": 80,
@@ -296,7 +332,7 @@ def _pick_primary_demo(refs: List[FileMatch]) -> Optional[FileMatch]:
         if m.kind == "demo_py":
             return m
     for m in refs:
-        if m.kind == "model_config" and "tt_transformers" in str(m.path):
+        if m.kind == "model_config" and mentions_ttt(m.path):
             return m
     return None
 
@@ -327,7 +363,7 @@ def _arch_compatibility_from_skus(skus: Dict[str, str]) -> frozenset:
 
 def _arch_compatibility_from_path(path: Path) -> frozenset:
     parts = [p.lower() for p in path.parts]
-    if "tt_transformers" in parts:
+    if any(n in parts for n in TTT_NAMES):
         return frozenset({"Wormhole", "Blackhole"})
     if "wormhole" in parts or "t3000" in parts or "galaxy" in parts:
         return frozenset({"Wormhole"})
@@ -340,7 +376,7 @@ def _arch_compatibility_from_path(path: Path) -> frozenset:
 def _path_notes(path: Path, arches: frozenset) -> List[str]:
     parts = [p.lower() for p in path.parts]
     notes: List[str] = []
-    if "tt_transformers" in parts:
+    if any(n in parts for n in TTT_NAMES):
         notes.append("Driven by `tt_transformers/simple_text_demo.py` (arch-portable).")
         return notes
     notes.append(f"External demo path: `{path.as_posix()}`.")
@@ -372,7 +408,7 @@ def discover_model(hf_id: str, repo_root: Path = REPO_ROOT) -> ModelDiscovery:
         discovery.primary_demo = primary.path
         s = str(primary.path)
         discovery.is_supported = True
-        discovery.in_tt_transformers = "tt_transformers" in s
+        discovery.in_tt_transformers = mentions_ttt(s)
         discovery.in_external_demo = "models/demos/" in s
         discovery.arch_compatibility = _arch_compatibility_from_path(primary.path)
         discovery.notes = _path_notes(primary.path, discovery.arch_compatibility)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts.tt_hw_planner.discovery import ttt_dir
 from scripts.tt_hw_planner.reuse_registry import (
     lookup,
     lookup_by_concept,
@@ -29,14 +30,14 @@ class TestRegistryLookup:
         hit = lookup("qwen3", "Qwen3Attention")
         assert hit is not None
         assert hit.status == REUSE
-        assert hit.tt_path == "models/tt_transformers/tt/attention.py"
+        assert hit.tt_path == f"{ttt_dir()}/tt/attention.py"
         assert hit.tt_class == "Attention"
 
     def test_qwen3_rotary_is_reuse(self):
         hit = lookup("qwen3", "Qwen3RotaryEmbedding")
         assert hit is not None
         assert hit.status == REUSE
-        assert hit.tt_path == "models/tt_transformers/tt/rope.py"
+        assert hit.tt_path == f"{ttt_dir()}/tt/rope.py"
 
     def test_unknown_class_returns_none(self):
         assert lookup("qwen3", "NotARealClass") is None
@@ -53,7 +54,7 @@ class TestRegistryLookup:
     def test_phi4_attention_shares_with_qwen3(self):
         hit = lookup("phi4", "Phi4Attention")
         assert hit is not None
-        assert hit.tt_path == "models/tt_transformers/tt/attention.py"
+        assert hit.tt_path == f"{ttt_dir()}/tt/attention.py"
 
     def test_model_type_case_insensitive(self):
         assert lookup("QWEN3", "Qwen3RMSNorm") is not None

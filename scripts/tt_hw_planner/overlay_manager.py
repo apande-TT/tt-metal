@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from .discovery import TTT_DIRS
+
 
 _THIS_DIR = Path(__file__).resolve().parent
 _INDEX_NAME = "index.json"
@@ -57,7 +59,7 @@ def _main_repo_overlays_dir() -> Path:
 
 
 _SHARED_PREFIXES = (
-    "models/tt_transformers/",
+    *(f"{d}/" for d in TTT_DIRS),
     "models/common/",
     "models/perf/",
 )
@@ -968,8 +970,7 @@ def reconcile_for(model_id: str, demo_dir: Path) -> Tuple[int, List[str]]:
                 meta = _repath_stored_patch(model_id, meta, rel, new_rel)
         except OSError as exc:
             print(
-                f"[overlay] reconcile_for({model_id}): could not re-hang {rel}: "
-                f"{type(exc).__name__}: {exc}",
+                f"[overlay] reconcile_for({model_id}): could not re-hang {rel}: " f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
             remapped[rel] = meta

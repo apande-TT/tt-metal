@@ -945,7 +945,7 @@ def find_demo_dir(model_id: str, repo_root: Optional[Path] = None) -> Optional[P
     fail with "No scaffolded demo folder found" even right after
     scaffold had written it.
     """
-    from .discovery import BRINGUP_ROOT, REPO_ROOT as _CANONICAL_REPO_ROOT
+    from .discovery import BRINGUP_ROOT, REPO_ROOT as _CANONICAL_REPO_ROOT, TTT_DIRS
 
     if repo_root is None or Path(repo_root).resolve() == _CANONICAL_REPO_ROOT.resolve():
         repo_root = BRINGUP_ROOT()
@@ -954,7 +954,7 @@ def find_demo_dir(model_id: str, repo_root: Optional[Path] = None) -> Optional[P
     # sits outside `models/demos/`.
     search_roots = [
         repo_root / "models" / "demos",
-        repo_root / "models" / "tt_transformers" / "demo",
+        *(repo_root / d / "demo" for d in TTT_DIRS),
         repo_root / "models" / "tt_dit",
     ]
     for root in search_roots:

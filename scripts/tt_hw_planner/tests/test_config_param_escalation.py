@@ -38,6 +38,15 @@ def test_classifier_returns_config_param_for_tt_transformers_notimplementederror
     assert _classify_failure(summary, details) == "CONFIG_PARAM"
 
 
+def test_classifier_returns_config_param_for_every_stack_layout():
+    from scripts.tt_hw_planner.cli import _classify_failure
+    from scripts.tt_hw_planner.discovery import TTT_DIRS
+
+    for d in TTT_DIRS:
+        details = f"  File '/home/ttuser/tt-metal/{d}/tt/rope.py', line 462\nNotImplementedError: use_qk_fused"
+        assert _classify_failure("test_attention failed", details) == "CONFIG_PARAM", d
+
+
 def test_classifier_returns_config_param_for_models_common_notimplementederror():
     from scripts.tt_hw_planner.cli import _classify_failure
 
@@ -63,13 +72,14 @@ def test_classifier_does_not_promote_unrelated_notimplementederror_to_config_par
 
 def test_repo_relative_edit_scope_includes_canonical_model_config():
     from scripts.tt_hw_planner.cli import _REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS
+    from scripts.tt_hw_planner.discovery import ttt_dir, ttt_path
 
-    paths = _REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS.get("CONFIG_PARAM", [])
-    assert "models/tt_transformers/tt/model_config.py" in paths, (
+    paths = [ttt_path(p) for p in _REPO_RELATIVE_EDIT_SCOPE_FOR_FAILURE_CLASS.get("CONFIG_PARAM", [])]
+    assert f"{ttt_dir()}/tt/model_config.py" in paths, (
         "CONFIG_PARAM escalation must include model_config.py — that's where "
         "the use_qk_fused derivation lives and where the typical fix lands"
     )
-    assert "models/tt_transformers/tt/rope.py" in paths, (
+    assert f"{ttt_dir()}/tt/rope.py" in paths, (
         "CONFIG_PARAM should also unlock rope.py since that's where the "
         "NotImplementedError raises (LLM may need to read it to understand "
         "the trigger condition)"
@@ -108,11 +118,12 @@ def test_unrelated_failure_class_gets_empty_escalation(tmp_path: Path):
     """Sanity check that other failure classes don't accidentally trigger
     the CONFIG_PARAM canonical-path escalation."""
     from scripts.tt_hw_planner.cli import _resolve_extra_edit_paths
+    from scripts.tt_hw_planner.discovery import TTT_DIRS
 
     # SHAPE / DTYPE_MISMATCH are common; they should NOT get tt_transformers paths
     paths = _resolve_extra_edit_paths(demo_dir=tmp_path, failure_class="DTYPE_MISMATCH")
     path_strs = [str(p) for p in paths]
-    has_canonical = any("models/tt_transformers/tt/model_config.py" in s for s in path_strs)
+    has_canonical = any(f"{d}/tt/model_config.py" in s for d in TTT_DIRS for s in path_strs)
     assert not has_canonical, (
         "DTYPE_MISMATCH should not unlock canonical tt_transformers paths — "
         "those should be reserved for CONFIG_PARAM specifically"

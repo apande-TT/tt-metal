@@ -22,6 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ..discovery import TTT_DIRS, ttt_dir
 from ..optimize_dashboard import (
     collect_state,
     find_run_dir,
@@ -446,8 +447,9 @@ def _write_tt_model_yaml(
         "    - models/common",
         # The vLLM adapter subclasses a base generator from models/tt_transformers/tt/generator_vllm
         # (initialize_vllm_model etc.), so that package MUST be in the image or the import fails at
-        # serve time and the engine dies with AttributeError.
-        "    - models/tt_transformers",
+        # serve time and the engine dies with AttributeError. After the layout move the old path is
+        # only an import alias for the new one, so every layout the checkout has ships.
+        *[f"    - {d}" for d in ([d for d in TTT_DIRS if (Path(checkout) / d).is_dir()] or [ttt_dir(checkout)])],
         f"    - models/demos/{slug}",
         '  ubuntu: "22.04"',
         '  python: "3.12"',

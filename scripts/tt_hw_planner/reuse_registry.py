@@ -18,6 +18,11 @@ class ReuseEntry:
     status: str
     notes: str = ""
 
+    def __post_init__(self) -> None:
+        from .discovery import ttt_path
+
+        object.__setattr__(self, "tt_path", ttt_path(self.tt_path))
+
     def matches(self, model_type: Optional[str], hf_class_name: Optional[str]) -> bool:
         if not hf_class_name:
             return False
@@ -80,7 +85,7 @@ _HANDWRITTEN_COMPOSITES: List[ReuseEntry] = [
         model_types=("qwen3", "qwen3_embedding"),
         hf_class_pattern=re.compile(r"^Qwen3DecoderLayer$"),
         concept="decoder_layer",
-        tt_path="models/tt_transformers/tt/decoder.py",
+        tt_path="models/ttt_compat/tt/decoder.py",
         tt_class="TransformerBlock",
         status="ADAPT",
         notes="Composite Attention+MLP+RMSNorm block; tt_transformers TransformerBlock is the template (presumed adaptable — runs canonical, LLM refines via iterate loop if per-component PCC < 0.99).",
@@ -89,7 +94,7 @@ _HANDWRITTEN_COMPOSITES: List[ReuseEntry] = [
         model_types=("qwen3", "qwen3_embedding"),
         hf_class_pattern=re.compile(r"^Qwen3Model$"),
         concept="model_root",
-        tt_path="models/tt_transformers/tt/model.py",
+        tt_path="models/ttt_compat/tt/model.py",
         tt_class="Transformer",
         status="ADAPT",
         notes="Top-level decoder stack; tt_transformers/tt/model.py is the template (presumed adaptable — runs canonical, LLM refines via iterate loop if per-component PCC < 0.99).",

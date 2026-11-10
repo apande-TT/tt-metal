@@ -34,6 +34,12 @@ class BuildingBlock:
     model_type_keys: Optional[Tuple[str, ...]] = None
     registry_tt_path: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        from .discovery import ttt_path
+
+        self.tt_path = ttt_path(self.tt_path)
+        self.registry_tt_path = ttt_path(self.registry_tt_path)
+
 
 @dataclass
 class CheckResult:
@@ -371,7 +377,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Token embedding",
         description="Embedding lookup (input ids -> hidden states)",
         needed_when=lambda c: True,
-        tt_path="models/tt_transformers/tt/embedding.py",
+        tt_path="models/ttt_compat/tt/embedding.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="BF16 weights only; ScaledEmbedding variant for Gemma is included.",
@@ -380,7 +386,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="MHA attention",
         description="Standard multi-head attention",
         needed_when=lambda c: _attn_grouping(c) == "MHA" and not _is_mla(c),
-        tt_path="models/tt_transformers/tt/attention.py",
+        tt_path="models/ttt_compat/tt/attention.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
     ),
@@ -388,7 +394,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="GQA attention",
         description="Grouped-query attention (num_kv_heads < num_heads)",
         needed_when=lambda c: _attn_grouping(c) == "GQA" and not _is_mla(c),
-        tt_path="models/tt_transformers/tt/attention.py",
+        tt_path="models/ttt_compat/tt/attention.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Requires num_attention_heads % num_key_value_heads == 0.",
@@ -399,7 +405,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="MQA attention",
         description="Multi-query attention (single KV head)",
         needed_when=lambda c: _attn_grouping(c) == "MQA" and not _is_mla(c),
-        tt_path="models/tt_transformers/tt/attention.py",
+        tt_path="models/ttt_compat/tt/attention.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
     ),
@@ -426,7 +432,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
                 and (c["text_config"].get("model_type") or "").lower().startswith(("qwen3", "phi4", "olmo2", "olmoe"))
             )
         ),
-        tt_path="models/tt_transformers/tt/attention.py",
+        tt_path="models/ttt_compat/tt/attention.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Auto-detected from q_norm / k_norm tensor names in the checkpoint.",
@@ -435,7 +441,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Sliding-window attention",
         description="Local-window attention for some/all layers",
         needed_when=_is_sliding,
-        tt_path="models/tt_transformers/tt/attention.py",
+        tt_path="models/ttt_compat/tt/attention.py",
         status_when_needed=Status.PARTIAL,
         effort_when_needed=Effort.LIGHT,
         notes=(
@@ -448,7 +454,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Standard RoPE",
         description="Rotary positional embedding",
         needed_when=lambda c: not _is_ssm(c) and _rope_scaling_type(c) in (None, "default"),
-        tt_path="models/tt_transformers/tt/rope.py",
+        tt_path="models/ttt_compat/tt/rope.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         class_name_pattern=r".*RotaryEmbedding$",
@@ -458,7 +464,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Llama-3 RoPE scaling",
         description="Frequency rescaling used by Llama-3.1+",
         needed_when=lambda c: _rope_scaling_type(c) == "llama3",
-        tt_path="models/tt_transformers/tt/rope.py",
+        tt_path="models/ttt_compat/tt/rope.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
     ),
@@ -466,7 +472,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="YaRN RoPE scaling",
         description="YaRN long-context extrapolation",
         needed_when=lambda c: _rope_scaling_type(c) == "yarn",
-        tt_path="models/tt_transformers/tt/rope.py",
+        tt_path="models/ttt_compat/tt/rope.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
     ),
@@ -474,7 +480,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="LongRoPE (Phi-3)",
         description="Phi-3 long-context RoPE scaling",
         needed_when=lambda c: _rope_scaling_type(c) == "longrope",
-        tt_path="models/tt_transformers/tt/rope.py",
+        tt_path="models/ttt_compat/tt/rope.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
     ),
@@ -502,7 +508,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="RMSNorm (text)",
         description="Root-mean-square normalization between blocks",
         needed_when=lambda c: not _is_ssm(c),
-        tt_path="models/tt_transformers/tt/distributed_norm.py (wraps models/common/rmsnorm.py)",
+        tt_path="models/ttt_compat/tt/distributed_norm.py (wraps models/common/rmsnorm.py)",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="ttnn.rms_norm requires TILE layout; distributed RMSNorm handles multi-chip.",
@@ -514,7 +520,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Extra Gemma-style norms",
         description="pre_/post_feedforward_layernorm (Gemma 2/3/4)",
         needed_when=lambda c: (c.get("model_type") or "").lower().startswith("gemma"),
-        tt_path="models/tt_transformers/tt/decoder.py",
+        tt_path="models/ttt_compat/tt/decoder.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Auto-detected from checkpoint keys; activates only if present.",
@@ -525,7 +531,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         needed_when=lambda c: _hidden_act(c) in ("silu", "swiglu", "gelu_pytorch_tanh")
         and not _is_moe(c)
         and not _is_ssm(c),
-        tt_path="models/tt_transformers/tt/mlp.py",
+        tt_path="models/ttt_compat/tt/mlp.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="hidden_act dispatched via activation_map; supports silu/gelu/relu/quick_gelu/gelu_pytorch_tanh.",
@@ -536,7 +542,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="MoE routing (Mixtral-style)",
         description="Top-k expert routing + weighted combine",
         needed_when=lambda c: _is_moe(c) and not _is_mla(c),
-        tt_path="models/tt_transformers/tt/mixtral_moe.py",
+        tt_path="models/ttt_compat/tt/mixtral_moe.py",
         status_when_needed=Status.PARTIAL,
         effort_when_needed=Effort.LIGHT,
         notes=(
@@ -572,7 +578,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="LM head",
         description="Output projection over vocabulary",
         needed_when=lambda c: True,
-        tt_path="models/tt_transformers/tt/lm_head.py",
+        tt_path="models/ttt_compat/tt/lm_head.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Sharded vocab + all_reduce; pads to padded_vocab_size.",
@@ -581,7 +587,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Tied embeddings",
         description="LM head shares weights with token embedding",
         needed_when=_tied_embeddings,
-        tt_path="models/tt_transformers/tt/load_checkpoints.py",
+        tt_path="models/ttt_compat/tt/load_checkpoints.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="standardize_hf_keys auto-duplicates embed_tokens -> lm_head.",
@@ -590,7 +596,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Vision tower",
         description="Image encoder (ViT-style)",
         needed_when=_has_vision,
-        tt_path="models/tt_transformers/tt/multimodal/ + models/demos/{qwen25_vl,qwen3_vl,multimodal/gemma3,mistral_24b}/",
+        tt_path="models/ttt_compat/tt/multimodal/ + models/demos/{qwen25_vl,qwen3_vl,multimodal/gemma3,mistral_24b}/",
         status_when_needed=Status.PARTIAL,
         effort_when_needed=Effort.LIGHT,
         notes=(
@@ -603,7 +609,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Cross-attention (vision -> text)",
         description="Image-conditioned cross-attention layers in the decoder",
         needed_when=_has_cross_attn,
-        tt_path="models/tt_transformers/tt/multimodal/llama_cross_attention.py",
+        tt_path="models/ttt_compat/tt/multimodal/llama_cross_attention.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Llama-vision style cross-attention; other VLMs use feature concat instead.",
@@ -612,7 +618,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Checkpoint key remap",
         description="Mapping HF state-dict keys to TT module fields",
         needed_when=lambda c: True,
-        tt_path="models/tt_transformers/tt/load_checkpoints.py",
+        tt_path="models/ttt_compat/tt/load_checkpoints.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes=(
@@ -634,7 +640,7 @@ BUILDING_BLOCKS: List[BuildingBlock] = [
         name="Generator / inference loop",
         description="Prefill + decode orchestration with KV cache",
         needed_when=lambda c: True,
-        tt_path="models/tt_transformers/tt/generator.py",
+        tt_path="models/ttt_compat/tt/generator.py",
         status_when_needed=Status.SUPPORTED,
         effort_when_needed=Effort.DROP_IN,
         notes="Chunked prefill, paged KV, tracing, sampling.",

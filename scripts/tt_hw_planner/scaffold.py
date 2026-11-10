@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
 
-from .discovery import BRINGUP_ROOT, safe_relative_to_root
+from .discovery import BRINGUP_ROOT, safe_relative_to_root, ttt_dir
 from .bringup import (
     MODEL_CONFIG_PATH,
     REPO_ROOT,
@@ -28,7 +28,7 @@ from .scaffold_demo_folder import collect_demo_folder_changes
 
 
 def _model_params_dir() -> Path:
-    return BRINGUP_ROOT() / "models" / "tt_transformers" / "model_params"
+    return BRINGUP_ROOT() / ttt_dir() / "model_params"
 
 
 def _find_sibling_params_dir(sibling_tail: str, sibling_base: str) -> Optional[Path]:
@@ -911,9 +911,9 @@ def render_apply(plan: ScaffoldPlan, applied: List[str]) -> str:
         out.append("    2. NEW rows = replace the matching `_stubs/*.py` with a real TTNN port.")
         out.append("    3. Once every NEW stub is implemented, re-run `prepare --execute`.")
     else:
-        out.append("    git restore models/tt_transformers/tt/model_config.py")
-        out.append("    git restore models/tt_transformers/demo/trace_region_config.py")
-        out.append(f"    rm -rf models/tt_transformers/model_params/{plan.new_tail}/")
+        out.append(f"    git restore {safe_relative_to_root(MODEL_CONFIG_PATH).as_posix()}")
+        out.append(f"    git restore {safe_relative_to_root(TRACE_REGION_PATH).as_posix()}")
+        out.append(f"    rm -rf {ttt_dir()}/model_params/{plan.new_tail}/")
     out.append("")
     out.append(sep)
     return "\n".join(out)

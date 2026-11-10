@@ -166,11 +166,12 @@ def test_every_mesh_label_the_planner_emits_resolves_in_the_demo_it_invokes():
     import re
     from pathlib import Path
 
-    from scripts.tt_hw_planner.bringup import MESH_DEVICE_MAP
+    from scripts.tt_hw_planner.bringup import DEMO_TEST_PATH, MESH_DEVICE_MAP
+    from scripts.tt_hw_planner.discovery import BRINGUP_ROOT, ttt_dir, ttt_path
 
     consumers = [
-        Path("models/tt_transformers/demo/simple_text_demo.py"),
-        Path("models/tt_transformers/conftest.py"),
+        BRINGUP_ROOT() / ttt_path(DEMO_TEST_PATH),
+        BRINGUP_ROOT() / ttt_dir() / "conftest.py",
     ]
     for path in consumers:
         src = path.read_text()

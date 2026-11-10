@@ -28,12 +28,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .discovery import TTT_DIRS
+
 
 UPSTREAM_URL = "https://github.com/tenstorrent/tt-metal.git"
 UPSTREAM_BRANCH = "main"
 
 _SYNCED_SUBTREES = (
-    "models/tt_transformers",
+    *TTT_DIRS,
     "models/tt_dit",
     "models/tt_cnn",
     "models/common",
@@ -58,7 +60,7 @@ class Root:
 
 
 REUSE_ROOTS: Tuple[Root, ...] = (
-    Root("models/tt_transformers/tt", "component", "reuse"),
+    *(Root(f"{d}/tt", "component", "reuse") for d in TTT_DIRS),
     Root("models/common/modules", "component", "adapt"),
     Root("models/tt_dit/blocks", "component", "adapt"),
     Root("models/tt_dit/layers", "component", "adapt"),
@@ -349,7 +351,7 @@ def check_registry_drift(repo_root, include_unmapped: bool = True, unmapped_root
     if include_unmapped:
         scan_root = Path(unmapped_root) if unmapped_root else root
         for base, recursive in (
-            ("models/tt_transformers/tt", False),
+            *((f"{d}/tt", False) for d in TTT_DIRS),
             ("models/tt_dit", True),
             ("models/tt_cnn", True),
         ):
