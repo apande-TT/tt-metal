@@ -788,16 +788,18 @@ def _bmm_limbs(x):
     return split_bf16(x, 2)
 
 
-def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, out_mem=None):
+def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True, limbs=2, out_mem=None, k_tiles=None):
     """float32 a @ float32 b over bf16 limbs of both operands, keeping the limb products whose order
     (i + j) is below `limbs` (2 limbs: ah.bh + ah.bl + al.bh; 3 limbs: six terms, ~float32). With
     exact=True each term's K reduction is the exact lane sum (the lanes mask a's last dim). out_mem: the
-    BMM_CONCAT_K product's output memory config (None: the matmul's default)."""
+    BMM_CONCAT_K product's output memory config (None: the matmul's default). k_tiles: optional [batch, M / 32]
+    count of a's leading K tiles per output tile row past which a is exactly zero, handed to LIMB_BMM_FN (k_tiles=)."""
     cfg = precise_config()
     if not exact and limbs == 2 and LIMB_BMM_FN is not None and not transpose_b:
         # the three limb terms in one C++ program (b as [K, N]: P @ V)
         pa2, pb2 = _bmm_limbs(a), _bmm_limbs(b)
-        y = LIMB_BMM_FN(pa2[0], pa2[1], pb2[0], pb2[1])
+        kw = {} if k_tiles is None else {"k_tiles": k_tiles}
+        y = LIMB_BMM_FN(pa2[0], pa2[1], pb2[0], pb2[1], **kw)
         for t in list(pa2) + list(pb2):
             ttnn.deallocate(t)
         if y is not None:

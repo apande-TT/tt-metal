@@ -99,6 +99,25 @@ ROPE_L1_BYTES = 0
 QKV_L1_BYTES = 0
 
 
+# mask_k_tiles of the additive mask the caller is about to run the LM layers with (set by the caller around its
+# forward_padded calls, None outside them): the LM attention's P @ V then accumulates per output tile row only the
+# key tiles that mask leaves unmasked (the probabilities past them are exactly 0), through LIMB_BMM_FN(..., k_tiles=)
+PV_K_TILES = None
+
+
+def mask_k_tiles(mask):
+    """mask [B, 1, R, N] additive (MASK_NEG = masked) -> int [B, R / 32]: per tile row, 1 + the last key tile any of
+    its rows leaves unmasked -- every key tile past it is masked in all of the tile's rows, so their softmax
+    probabilities are exactly 0 (exp of ~MASK_NEG). A row with no unmasked key (uniform softmax) takes all N / 32."""
+    B, _, R, N = mask.shape
+    nt = N // 32
+    open_ = mask[:, 0] > MASK_NEG / 2  # [B, R, N]
+    any_open = open_.any(axis=-1)  # [B, R]
+    last = np.where(any_open, N - 1 - np.argmax(open_[:, :, ::-1], axis=-1), N - 1)  # last open key (or all)
+    per_row = last // 32 + 1
+    return per_row.reshape(B, R // 32, 32).max(axis=-1).astype(np.int64).clip(1, nt)
+
+
 def _t(lin):
     return lin.weight.detach().float().t().contiguous()
 
@@ -325,7 +344,14 @@ class TtTextAttention:
         else:
             e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=sm), memory_config=sm)
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg), memory_config=io)
-        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex)  # [B, kvl, G*S, D]
+        kt = None
+        tbl = PV_K_TILES
+        if tbl is not None and tbl.shape[1] == G * s_pad // 32 and int(tt_mask.shape[-1]) == n_keys:
+            if int(tbl.max()) <= n_keys // 32:  # (a table of this mask: its rows and key tiles)
+                # one program runs every chip's sequences (a row-split batch puts different ones on different
+                # chips): each tile row takes the most key tiles any sequence needs there
+                kt = np.broadcast_to(tbl.max(axis=0), (b * kvl, tbl.shape[1]))  # [B * kvl, G * s_pad / 32]
+        o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex, k_tiles=kt)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         op = MERGE_SPLIT_FN(o) if MERGE_SPLIT_FN is not None and hl > 1 else None
         if op is not None:  # the out projection's limbs read straight from the head-major o (no merged o)
