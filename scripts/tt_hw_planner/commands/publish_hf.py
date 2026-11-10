@@ -272,6 +272,61 @@ def _with_declared_device_sampling(additional: dict, checkout: Path, bundle_dir:
     return {**(additional or {}), _PLUGIN_CONFIG_KEY: {**(tt or {}), _SAMPLE_MODE_KEY: _SAMPLE_MODE_DEFAULT}}
 
 
+def _serve_hardware(state: dict, box, arch, hardware, mesh_device) -> dict:
+    """The serve target and how the card names it: {arch, hardware, mesh_device, hw_phrase, perf_hw}, each given
+    value kept, the rest derived from the run's box. Raises ValueError when there is no target."""
+    import re as _re
+
+    a, hw, mesh = _serve_target(box, state.get("env"))
+    arch = arch or a
+    hardware_given = hardware
+    hardware = hardware or hw
+    mesh_device = mesh_device or mesh
+    if not (arch and hardware and mesh_device):
+        raise ValueError(
+            "no serve target: the run's detected hardware (%s) is no single known box and no --box / "
+            "--arch / --hardware / --mesh was given" % (state.get("env") or {}).get("arch")
+        )
+    _validate_mesh_device(mesh_device)
+    # A run that opened fewer chips than its box (1 chip of a QB2) serves on that smaller mesh, and
+    # tt-model refuses a hardware label naming more chips than the mesh opens. So the label names the
+    # chips opened, and the card says which box they are on.
+    hw_phrase, perf_hw = _hardware_phrase(state, hardware), hardware
+    _mt = _re.fullmatch(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", str(mesh_device))
+    if _mt and not hardware_given:
+        opened = int(_mt.group(1)) * int(_mt.group(2))
+        fitted = _hardware_for_chips(hardware, arch, opened)
+        if fitted != hardware:
+            unit = "chip" if opened == 1 else "chips"
+            hw_phrase = f"{opened} Tenstorrent {_arch_name({'env': {'arch': arch}})} {unit} of a {hardware}"
+            perf_hw = f"{opened} {unit} of a {hardware}"
+            hardware = fitted
+    return {"arch": arch, "hardware": hardware, "mesh_device": mesh_device, "hw_phrase": hw_phrase, "perf_hw": perf_hw}
+
+
+def _adapter_demo_modules(checkout, adapter_file, demo_pkg) -> list:
+    """Modules of the demo package `demo_pkg` that the bundle adapter imports, anywhere in it (an adapter imports its
+    pipeline inside try/except, so a missing dependency only shows when a request is served), sorted. `from M import
+    name` counts M.name when that is a module of the checkout, else M."""
+    import ast
+
+    try:
+        tree = ast.parse(Path(adapter_file).read_text(errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            base = Path(checkout, *node.module.split("."))
+            for a in node.names:
+                sub = base / a.name
+                is_module = sub.with_suffix(".py").is_file() or (sub / "__init__.py").is_file()
+                mods.add(f"{node.module}.{a.name}" if is_module else node.module)
+    return sorted(m for m in mods if m.startswith(demo_pkg + "."))
+
+
 def _write_tt_model_yaml(
     path: Path,
     *,
@@ -296,7 +351,6 @@ def _write_tt_model_yaml(
     """Emit a schema-5.1 tt-model.yaml describing how to build+serve this optimized model as a
     v5.1 container package. Fields the run can't provide (the vLLM adapter dir, plugin) are stated
     as sane defaults/overrides; `tt-model package --container` resolves and validates the rest."""
-    a, hw, mesh = _serve_target(box, state.get("env"))
     _batch = state.get("batch")
     serve_max = _batch or 32
     serve_maxlen = None
@@ -329,37 +383,20 @@ def _write_tt_model_yaml(
             )
     except Exception:
         pass
-    arch = arch or a
     # A novel-arch adapter is not a vLLM/Transformers built-in, so the engine must be told which
     # registered TT class to use (there is no built-in to ride); stock arches omit this.
     _serve_args = ["--trust-remote-code"]
     if serve_hf_override:
         _serve_args += ["--hf-overrides", json.dumps({"architectures": [serve_hf_override]})]
     _serve_args += serve_extra_args
-    hardware_given = hardware
-    hardware = hardware or hw
-    mesh_device = mesh_device or mesh
-    if not (arch and hardware and mesh_device):
-        raise ValueError(
-            "no serve target: the run's detected hardware (%s) is no single known box and no --box / "
-            "--arch / --hardware / --mesh was given" % (state.get("env") or {}).get("arch")
-        )
-    _validate_mesh_device(mesh_device)
-    # A run that opened fewer chips than its box (1 chip of a QB2) serves on that smaller mesh, and
-    # tt-model refuses a hardware label naming more chips than the mesh opens. So the label names the
-    # chips opened, and the card says which box they are on.
-    import re as _re
-
-    hw_phrase, perf_hw = _hardware_phrase(state, hardware), hardware
-    _mt = _re.fullmatch(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", str(mesh_device))
-    if _mt and not hardware_given:
-        opened = int(_mt.group(1)) * int(_mt.group(2))
-        fitted = _hardware_for_chips(hardware, arch, opened)
-        if fitted != hardware:
-            unit = "chip" if opened == 1 else "chips"
-            hw_phrase = f"{opened} Tenstorrent {_arch_name({'env': {'arch': arch}})} {unit} of a {hardware}"
-            perf_hw = f"{opened} {unit} of a {hardware}"
-            hardware = fitted
+    target = _serve_hardware(state, box, arch, hardware, mesh_device)
+    arch, hardware, mesh_device = target["arch"], target["hardware"], target["mesh_device"]
+    hw_phrase, perf_hw = target["hw_phrase"], target["perf_hw"]
+    demo_pkg = f"models.demos.{slug}"
+    verify = [f"import {demo_pkg} as m; assert m"] + [
+        f"import {m}"
+        for m in _adapter_demo_modules(checkout, Path(checkout) / extra_models_dir / slug / "adapter.py", demo_pkg)
+    ]
     thr = state.get("throughput") or {}
     sv = state.get("serving") or {}
     pt = sv.get("per_token") or {}
@@ -421,7 +458,7 @@ def _write_tt_model_yaml(
         f"  args: {json.dumps(_serve_args)}",
         "",
         "verify:",
-        f'  - "import models.demos.{slug} as m; assert m"',
+        *(f"  - {json.dumps(v)}" for v in verify),
         "",
         "card:",
         f"  description: >",
@@ -1442,15 +1479,95 @@ class @TTARCH@:
 '''
 
 
+def _demo_tt_dir(checkout, slug) -> Path:
+    return Path(checkout) / "models" / "demos" / slug / "tt"
+
+
+def _demo_tt_module(slug, stem) -> str:
+    return "models.demos.%s.tt.%s" % (slug, stem)
+
+
 def _demo_pipeline_module(checkout, slug):
     """Dotted import path to the demo resident pipeline if it exposes build_pipeline, else None."""
-    pf = Path(checkout) / "models" / "demos" / slug / "tt" / "pipeline.py"
+    pf = _demo_tt_dir(checkout, slug) / "pipeline.py"
     try:
         if pf.is_file() and "def build_pipeline" in pf.read_text(errors="replace"):
-            return "models.demos.%s.tt.pipeline" % slug
+            return _demo_tt_module(slug, pf.stem)
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+# The row-per-request serving hooks a demo module declares to be served by _ROWS_ADAPTER_TMPL.
+_SERVING_BUILDER = "build_serving_pipeline"
+_SERVING_ROWS = "SERVING_ROWS"
+_SERVING_KV = "SERVING_KV_CAPACITY"
+_SERVING_DEVICE_PARAMS = "SERVING_DEVICE_PARAMS"
+# The rendered adapter's first docstring line: a bundle adapter carrying it is the tool's rendering, re-rendered on
+# every publish so it follows the template and the demo's current hooks.
+_ROWS_ADAPTER_MARK = "Rendered by tt_hw_planner publish-hf from the demo's serving hooks"
+
+
+_NOT_LITERAL = type("_NotLiteral", (), {"__repr__": lambda self: "an expression, not a literal"})()
+
+
+def _literal_assignments(tree) -> dict:
+    """Module-level NAME = <value> assignments of a parsed module: the literal value, or _NOT_LITERAL."""
+    import ast
+
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if isinstance(target, ast.Name):
+            try:
+                out[target.id] = ast.literal_eval(value)
+            except (ValueError, TypeError, SyntaxError):
+                out[target.id] = _NOT_LITERAL
+    return out
+
+
+def _demo_serving_hooks(checkout, slug):
+    """The demo's row-per-request serving hooks, read from source (never imported), or None when no module of its
+    tt/ package defines a top-level build_serving_pipeline.
+
+    Returns {"module", "rows", "kv", "device_params"}, or {"module", "problem"} when the hooks are incomplete: the
+    module must also assign SERVING_ROWS and SERVING_KV_CAPACITY positive int literals; SERVING_DEVICE_PARAMS, when
+    present, is a literal dict of the device-open settings the pipeline needs (the plugin's tt config keys)."""
+    import ast
+
+    tt_dir = _demo_tt_dir(checkout, slug)
+    hits = []
+    for pf in sorted(tt_dir.glob("*.py")) if tt_dir.is_dir() else []:
+        try:
+            tree = ast.parse(pf.read_text(errors="replace"))
+        except (SyntaxError, ValueError):
+            continue
+        if any(isinstance(n, ast.FunctionDef) and n.name == _SERVING_BUILDER for n in tree.body):
+            hits.append((_demo_tt_module(slug, pf.stem), _literal_assignments(tree)))
+    if not hits:
+        return None
+    module, consts = hits[0]
+    if len(hits) > 1:
+        return {"module": module, "problem": "%s is defined in %s" % (_SERVING_BUILDER, ", ".join(m for m, _ in hits))}
+    rows, kv, params = consts.get(_SERVING_ROWS), consts.get(_SERVING_KV), consts.get(_SERVING_DEVICE_PARAMS, {})
+    for name, value in ((_SERVING_ROWS, rows), (_SERVING_KV, kv)):
+        if not (isinstance(value, int) and not isinstance(value, bool) and value > 0):
+            return {"module": module, "problem": "%s is not a positive int literal (got %r)" % (name, value)}
+    if not (isinstance(params, dict) and all(isinstance(k, str) for k in params)):
+        return {"module": module, "problem": "%s is not a literal dict (got %r)" % (_SERVING_DEVICE_PARAMS, params)}
+    return {"module": module, "rows": rows, "kv": kv, "device_params": params}
+
+
+def _rendered_rows_adapter(bundle_dir) -> bool:
+    try:
+        return _ROWS_ADAPTER_MARK in (Path(bundle_dir) / "adapter.py").read_text(errors="replace")
+    except OSError:
+        return False
 
 
 def _pipeline_serve_profile(checkout, slug):
@@ -1459,7 +1576,7 @@ def _pipeline_serve_profile(checkout, slug):
 
     kv = 2048
     try:
-        pf = Path(checkout) / "models" / "demos" / slug / "tt" / "pipeline.py"
+        pf = _demo_tt_dir(checkout, slug) / "pipeline.py"
         m = _re.search(r"KV_CAPACITY\\s*=\\s*(\\d+)", pf.read_text(errors="replace"))
         if m:
             kv = int(m.group(1))
@@ -1486,12 +1603,461 @@ def _pipeline_adapter_src(slug, arch, tt_arch, pipeline_mod, kv):
     )
 
 
+_ROWS_ADAPTER_TMPL = '''# SPDX-License-Identifier: Apache-2.0
+"""@MARK@ (@SMOD@); edit those, not this file.
+
+vLLM generator for @SLUG@ (@ARCH@) on Tenstorrent: the demo's own optimized pipeline, one device row per request.
+The tt-metal vLLM plugin registers this class as @TTARCH@ via vllm_metadata.json (a bundle registers ahead of the
+plugin's built-in generators) and drives it through the generator contract (initialize_vllm_model ->
+allocate_kv_cache_per_layer -> warmups -> prefill_forward / decode_forward).
+
+Serve profile: up to @ROWS@ concurrent sequences (--max-num-seqs @ROWS@, the pipeline's device rows), prompt and
+generated tokens bounded by the resident KV capacity (--max-model-len @KV@).
+
+Sampling: with --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}' every decode token is sampled
+on device by the pipeline's own sampler, each row by its request's temperature / top_k / top_p (greedy is
+temperature 0 or top_k 1), among the row's top pipe.top_k candidates, from the request's seed (a random one when
+unset); only the token ids are read back. vLLM samples on the host whenever a request needs what the device does not
+do (logprobs, min_p, logit bias, ...): that step returns the logits. A request with a repetition / presence /
+frequency penalty is sampled on the host here, from the logits and its token history. Prefill always returns the
+logits (vLLM samples the first token).
+
+Each request owns one device row for its whole life: the plugin hands prefill the row (`empty_slots`), the prompt's
+K, V go into that row only, and the row is remembered by the request's first KV block id (unique per live request;
+block 0 is vLLM's null block, so padding rows never match). Decode writes every row's input token before the step,
+and the positions only when they change (a request joined or left). Rows with no request repeat a served row's token
+and position; whatever they write into their own cache rows is rewritten by that row's next prefill -- a preempted
+request is re-prefilled on resume.
+
+Decode is traced whenever vLLM asks for it (enable_trace): one step of each kind (sampled ids, logits) is captured
+and replayed for every token, the per-row inputs written in place before each replay. Under vLLM's async scheduling
+a sampled step's ids are read back without waiting and the next step is queued before they arrive (its input ids are
+the ones the last step left on device), so the chip runs while vLLM handles the last step. Prefill stays eager (its
+length follows the prompt). A prefill that compiled programs the device had not run before may have placed their
+buffers over a captured trace's, so the traces are released then and captured again at the next decode.
+"""
+from __future__ import annotations
+
+import logging
+import secrets
+from types import SimpleNamespace
+
+import torch
+
+try:
+    import @SMOD@ as _serving_module
+    import ttnn  # noqa: F401
+
+    _build_serving_pipeline = _serving_module.build_serving_pipeline
+    _import_error = None
+except Exception as e:  # noqa: BLE001  (available only inside the serving image)
+    _build_serving_pipeline = None
+    _import_error = e
+
+log = logging.getLogger(__name__)
+
+_SLUG = "@SLUG@"
+_SERVING_MODULE = "@SMOD@"
+_KV_CAPACITY = @KV@
+# Concurrent prompts of this many tokens are compiled at startup, in every power-of-two count up to --max-num-seqs,
+# rather than under a client's first requests.
+_WARM_PREFILL_LEN = 128
+_GREEDY = (1.0, 1, 1.0, None)  # a row's device rule: (1 / temperature, top_k, top_p, seed)
+# Decode step kinds in recording order. Every recording records all of them in this order: one kind recorded
+# beside the other's held trace lays L1 out differently, and its circular buffers can then clash with that
+# trace's L1 outputs.
+_KINDS = ("tokens", "logits")
+
+
+def _request_seed(seed):
+    return int(seed) if seed is not None and int(seed) >= 0 else secrets.randbits(31)
+
+
+class _DeviceIds:
+    """A sampled decode step's ids on device (`dev`), each request's device row (`rows`, vLLM's batch order) and,
+    once a read is queued, its host destination."""
+
+    __slots__ = ("dev", "rows", "host")
+
+    def __init__(self, dev, rows):
+        self.dev, self.rows, self.host = dev, rows, None
+
+
+class @TTARCH@:
+    """Generator contract over the demo's serving pipeline (@SMOD@)."""
+
+    # Read by the plugin off the CLASS before the model exists.
+    model_capabilities = {"supports_sample_on_device": True, "supports_async_decode": True}
+
+    def __init__(self, pipe, max_batch_size, max_seq_len, mesh_device=None):
+        self.pipe = pipe
+        self.mesh_device = mesh_device
+        self.max_batch_size = int(max_batch_size)
+        self.max_seq_len = int(max_seq_len)
+        self.vocab_size = int(getattr(pipe.config, "vocab_size", 0)) or None
+        self.rows = int(pipe.batch)
+        self.pad_id = int(pipe.pad_id)
+        self._row_of_block = {}  # a live request's first KV block id -> its device row
+        self._dev_pos = None  # every row's position on device now (None: unknown, write them all)
+        self._dev_rule = None  # every row's rule on device now (None: never written)
+        self._seeds = [None] * self.rows  # each row's request seed
+        self._fresh = set()  # rows prefilled since their request's seed was taken
+        self._host_gens = {}  # row -> the host sampler's generator for its request
+        self.already_warmed_up_prefill = False
+        self._traceable = mesh_device is not None
+        self._traces = {}  # "tokens" / "logits" -> (trace id, its output tensor)
+        self._untraceable = set()
+        self._compiled = set()
+        self._last_kind = None  # the last decode step's kind; "tokens": every row's next input is on device
+
+    @classmethod
+    def initialize_vllm_model(cls, hf_config, mesh_device, max_batch_size, max_seq_len=None, n_layers=None, **_ignored):
+        msl = int(max_seq_len or _KV_CAPACITY)
+        if msl > _KV_CAPACITY:
+            raise ValueError(
+                "%s: resident KV capacity is %d tokens; use --max-model-len %d or less (got %d)."
+                % (cls.__name__, _KV_CAPACITY, _KV_CAPACITY, msl)
+            )
+        if _build_serving_pipeline is None:
+            raise RuntimeError("serving module %s not importable: %s" % (_SERVING_MODULE, _import_error))
+        pipe = _build_serving_pipeline(mesh_device, capacity=msl, layers=n_layers)
+        if not 1 <= int(max_batch_size) <= int(pipe.batch):
+            raise ValueError(
+                "%s serves up to %d concurrent sequences (the pipeline's device rows); launch vLLM with "
+                "--max-num-seqs %d or less (got %s)." % (cls.__name__, pipe.batch, pipe.batch, max_batch_size)
+            )
+        log.info(
+            "built %s serving pipeline (device rows=%s, KV=%s, max seqs=%s)", _SLUG, pipe.batch, msl, max_batch_size
+        )
+        return cls(pipe, max_batch_size, msl, mesh_device)
+
+    def allocate_kv_cache_per_layer(self, per_layer_specs):
+        return [None for _ in per_layer_specs]  # the pipeline owns its cache
+
+    def allocate_kv_cache(self, kv_cache_shape=None, dtype=None, num_layers=None):
+        return [None for _ in range(int(num_layers or 0))]
+
+    def _vocab(self, logits):
+        return logits[..., : self.vocab_size or logits.shape[-1]].float()
+
+    def _programs(self):
+        """Programs the device has compiled (None when the device does not say)."""
+        count = getattr(self.mesh_device, "num_program_cache_entries", None)
+        try:
+            return int(count()) if callable(count) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _run(self, kind):
+        """One decode step on device: "tokens" -> the sampled ids, "logits" -> the logits."""
+        return self.pipe.decode_tokens() if kind == "tokens" else self.pipe.decode_logits()
+
+    def _capture(self, kind):
+        """Record one decode step of this kind (recording runs nothing on the device); None when it cannot be."""
+        tid = None
+        try:
+            tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+            out = self._run(kind)
+            ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        except Exception as e:  # noqa: BLE001
+            if tid is not None:
+                try:
+                    ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    ttnn.release_trace(self.mesh_device, tid)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._untraceable.add(kind)
+            log.warning(
+                "%s: %s decode trace capture failed (%s); those steps decode eagerly, much slower", _SLUG, kind, e
+            )
+            return None
+        self._traces[kind] = (tid, out)
+        log.info("%s: %s decode trace captured; every such decode token replays it", _SLUG, kind)
+        return self._traces[kind]
+
+    def _release_traces(self):
+        for tid, _ in self._traces.values():
+            try:
+                ttnn.release_trace(self.mesh_device, tid)
+            except Exception:  # noqa: BLE001
+                pass
+        self._traces = {}
+
+    def _capture_all(self):
+        """Record every compiled step kind afresh, in _KINDS order; a kind that cannot be recorded decodes eagerly."""
+        self._release_traces()
+        for kind in _KINDS:
+            if kind in self._compiled and kind not in self._untraceable:
+                self._capture(kind)
+
+    def _step(self, kind, enable_trace):
+        # Capturing before the step's programs have run once would compile them mid-capture.
+        if enable_trace and self._traceable and kind in self._compiled and kind not in self._untraceable:
+            if kind not in self._traces:
+                self._capture_all()
+            trace = self._traces.get(kind)
+            if trace is not None:
+                ttnn.execute_trace(self.mesh_device, trace[0], cq_id=0, blocking=False)
+                return trace[1]
+        # An eager step beside a held trace can clash with its L1 outputs, and a first run compiles programs whose
+        # buffers may overlap it.
+        self._release_traces()
+        out = self._run(kind)
+        self._compiled.add(kind)
+        return out
+
+    @staticmethod
+    def _generator(seed):
+        g = torch.Generator()
+        g.manual_seed(_request_seed(seed))
+        return g
+
+    @staticmethod
+    def _penalised(sp, n):
+        return any(
+            float(sp.presence_penalty[i]) != 0.0
+            or float(sp.frequency_penalty[i]) != 0.0
+            or float(sp.repetition_penalty[i]) != 1.0
+            for i in range(n)
+        )
+
+    def _load_rule(self, sp, served):
+        """Each served row's request rule -> the device sampler (written only on change); a row new to its request
+        takes the request's seed (a random one when unset)."""
+        K = int(self.pipe.top_k)
+        seeds = getattr(sp, "seed", None)
+        rule = list(self._dev_rule or [_GREEDY] * self.rows)
+        for i, row in enumerate(served):
+            if row in self._fresh:
+                self._seeds[row] = _request_seed(seeds[i] if seeds is not None else None)
+                self._fresh.discard(row)
+            temp, top_k, top_p = float(sp.temperature[i]), int(sp.top_k[i]), float(sp.top_p[i])
+            if temp <= 0.0 or top_k == 1:
+                rule[row] = _GREEDY
+            else:
+                rule[row] = (1.0 / temp, min(top_k, K) if top_k > 0 else K, min(top_p, 1.0), self._seeds[row])
+        if rule != self._dev_rule:
+            inv_t, k, p, row_seeds = (list(c) for c in zip(*rule))
+            self.pipe.set_sampling(inv_t, k, p, row_seeds)
+            self._dev_rule = rule
+
+    def _host_sample(self, logits, sp, served, prompt_tokens, output_tokens):
+        """vLLM's rule on the host for a step whose requests carry penalties: logits [n, V] -> ids [n] int32."""
+        ids = torch.empty((logits.shape[0],), dtype=torch.int32)
+        seeds = getattr(sp, "seed", None)
+        for i, row in enumerate(served):
+            x = logits[i].clone()
+            out = output_tokens[i][output_tokens[i] >= 0].long() if output_tokens is not None else x.new_empty(0).long()
+            rep, pres, freq = (
+                float(sp.repetition_penalty[i]),
+                float(sp.presence_penalty[i]),
+                float(sp.frequency_penalty[i]),
+            )
+            if rep != 1.0:
+                seen = (
+                    out if prompt_tokens is None else torch.cat([out, prompt_tokens[i][prompt_tokens[i] >= 0].long()])
+                )
+                seen = seen[seen < x.shape[0]].unique()
+                x[seen] = torch.where(x[seen] > 0, x[seen] / rep, x[seen] * rep)
+            if pres != 0.0 or freq != 0.0:
+                count = torch.bincount(out[out < x.shape[0]], minlength=x.shape[0]).float()
+                x -= freq * count + pres * (count > 0).float()
+            temp, top_k, top_p = float(sp.temperature[i]), int(sp.top_k[i]), float(sp.top_p[i])
+            if temp <= 0.0 or top_k == 1:
+                ids[i] = int(torch.argmax(x))
+                continue
+            x = x / temp
+            if 0 < top_k < x.shape[0]:
+                x[x < torch.topk(x, top_k).values[-1]] = float("-inf")
+            if top_p < 1.0:
+                order = torch.argsort(x, descending=True)
+                probs = torch.softmax(x[order], dim=-1)
+                drop = torch.cumsum(probs, dim=-1) - probs >= top_p  # exclusive cumulative probability
+                x[order[drop]] = float("-inf")
+            if row not in self._host_gens:
+                self._host_gens[row] = self._generator(seeds[i] if seeds is not None else None)
+            ids[i] = int(torch.multinomial(torch.softmax(x, dim=-1), 1, generator=self._host_gens[row]))
+        return ids
+
+    def prefill_forward(
+        self, tokens, page_table=None, *, prompt_lens=None, start_pos=None, empty_slots=None, **_compat
+    ):
+        n = int(tokens.shape[0])
+        if start_pos is not None and int(torch.as_tensor(start_pos).max()) != 0:
+            raise ValueError("chunked / prefix-cached prefill is not supported by this generator")
+        rows = [int(s) for s in empty_slots] if empty_slots is not None else list(range(n))
+        if len(rows) != n:
+            raise ValueError("prefill of %d sequences got %d slots" % (n, len(rows)))
+        lens = [int(prompt_lens[i]) if prompt_lens is not None else int(tokens.shape[1]) for i in range(n)]
+        for T in lens:
+            if T > self.max_seq_len:
+                raise ValueError("prompt of %d tokens exceeds max_model_len=%d" % (T, self.max_seq_len))
+        before = self._programs()
+        logits = self.pipe.prefill_rows([tokens[i, : lens[i]].to(torch.int64).tolist() for i in range(n)], rows)
+        if before is None or self._programs() != before:
+            self._release_traces()
+        for i, row in enumerate(rows):
+            if page_table is not None:
+                self._row_of_block[int(page_table[i, 0])] = row
+            self._fresh.add(row)
+            self._host_gens.pop(row, None)
+        self._last_kind = None
+        return self._vocab(torch.as_tensor(logits)).reshape(n, 1, -1)
+
+    def decode_forward(
+        self,
+        tokens,
+        start_pos=None,
+        page_table=None,
+        *,
+        enable_trace=False,
+        sampling_params=None,
+        prompt_tokens=None,
+        output_tokens=None,
+        reset_batch=None,
+        read_from_device=True,
+        **_compat,
+    ):
+        tokens = torch.as_tensor(tokens).reshape(-1)
+        n = int(tokens.shape[0])
+        positions = (
+            torch.as_tensor(start_pos).reshape(-1) if start_pos is not None else torch.zeros(n, dtype=torch.int64)
+        )
+        dev = self._dev_pos
+        tok = torch.full((self.rows,), self.pad_id, dtype=torch.int32)
+        pos = dev.clone() if dev is not None else torch.zeros((self.rows,), dtype=torch.int32)
+        idle = torch.ones((self.rows,), dtype=torch.bool)
+        served = []  # device row of each request, in vLLM's batch order (padding rows trail)
+        for i in range(n):
+            p = int(positions[i])
+            if p < 0:
+                break  # vLLM's padding rows
+            row = self._row_of_block.get(int(page_table[i, 0])) if page_table is not None else i
+            if row is None:
+                raise RuntimeError("decode row %d (first KV block %d) was never prefilled" % (i, int(page_table[i, 0])))
+            tok[row], pos[row], idle[row] = int(tokens[i]), p, False
+            served.append(row)
+        if served:
+            tok[idle], pos[idle] = tok[served[0]], pos[served[0]]
+        # vLLM's async decode submits a step before the last one's ids are back and applied, so its tokens are
+        # placeholders and its positions one step behind: after a sampled step over the same rows (reset_batch
+        # False) each row's next input id and position are the ones that step left on device.
+        if reset_batch is False and self._last_kind == "tokens" and dev is not None:
+            tok, pos = None, dev
+        self.pipe.set_decode_rows(tok, None if dev is not None and torch.equal(pos, dev) else pos)
+        self._dev_pos = None
+        sp = sampling_params
+        on_device = sp is not None and not self._penalised(sp, len(served))
+        if on_device:
+            self._load_rule(sp, served)
+        kind = "tokens" if on_device else "logits"
+        out = self._step(kind, enable_trace)
+        self._last_kind = kind
+        self._dev_pos = pos + 1
+        rows = torch.tensor(served, dtype=torch.long)
+        if on_device:
+            ids = _DeviceIds(out, rows)
+            return ids if not read_from_device else self.process_decode_output_host(ids)
+        logits = self._vocab(self.pipe.logits_to_torch(out)).index_select(0, rows)
+        if sp is not None:  # vLLM wants ids, but a penalty needs the token history the device does not keep
+            return self._host_sample(logits, sp, served, prompt_tokens, output_tokens)
+        return logits.unsqueeze(1)
+
+    def read_decode_output(self, tt_out, async_read=False, **_compat):
+        """vLLM's async decode: start reading a sampled step's ids back without waiting (the copy is queued
+        behind the step); returns (the pending output, [its event]). Host outputs pass through."""
+        if not isinstance(tt_out, _DeviceIds):
+            return (tt_out, []) if async_read else tt_out
+        if not async_read:
+            return self.process_decode_output_host(tt_out)
+        tt_out.host = tt_out.dev.cpu(blocking=False)
+        return tt_out, [ttnn.record_event(self.mesh_device, 0)]
+
+    def process_decode_output_host(self, tt_out, is_tokens=True, **_compat):
+        """A sampled step's ids (read, or still on device) -> int32 [n] in vLLM's batch order."""
+        if not isinstance(tt_out, _DeviceIds):
+            return tt_out
+        host = tt_out.host if tt_out.host is not None else tt_out.dev.cpu(blocking=True)
+        ids = ttnn.to_torch(ttnn.get_device_tensors(host)[0]).reshape(-1)[: self.rows].to(torch.int64)  # may be uint32
+        return ids.index_select(0, tt_out.rows).to(torch.int32)
+
+    def warmup_model_prefill(self, *, kv_cache=None, can_sample_on_device=False, enable_trace=False, **_compat):
+        if enable_trace:
+            return  # prefill stays eager: its length follows the prompt
+        bos = getattr(self.pipe.config, "bos_token_id", None)
+        bos = int(bos) if bos is not None else self.pad_id
+        T = min(_WARM_PREFILL_LEN, self.max_seq_len - 2)
+        n = 1
+        while n <= self.max_batch_size:
+            self.prefill_forward(
+                torch.full((n, T), bos, dtype=torch.int64), None, prompt_lens=[T] * n, empty_slots=list(range(n))
+            )
+            n *= 2
+        self.already_warmed_up_prefill = True
+
+    def warmup_model_decode(
+        self,
+        *,
+        kv_cache=None,
+        max_batch_size=1,
+        num_blocks=0,
+        can_sample_on_device=False,
+        enable_trace=False,
+        **_compat,
+    ):
+        if enable_trace:
+            if not self._traceable:
+                log.warning(
+                    "%s: vLLM asked for traced decode without a mesh device; decoding eagerly, which is much slower",
+                    _SLUG,
+                )
+                return
+            self._capture_all()
+            return
+        if not self.already_warmed_up_prefill:
+            return
+        T = min(_WARM_PREFILL_LEN, self.max_seq_len - 2)
+        self.decode_forward(torch.zeros((1, 1), dtype=torch.int64), torch.tensor([T]), None)
+        greedy = SimpleNamespace(
+            temperature=[0.0],
+            top_k=[1],
+            top_p=[1.0],
+            presence_penalty=[0.0],
+            frequency_penalty=[0.0],
+            repetition_penalty=[1.0],
+            seed=[None],
+        )
+        self.decode_forward(torch.zeros((1, 1), dtype=torch.int64), torch.tensor([T + 1]), None, sampling_params=greedy)
+
+    def cleanup(self):
+        self._release_traces()
+'''
+
+
+def _rows_adapter_src(slug, arch, tt_arch, hooks) -> str:
+    """Render the row-per-request generator over the demo's serving hooks (see _demo_serving_hooks)."""
+    return (
+        _ROWS_ADAPTER_TMPL.replace("@MARK@", _ROWS_ADAPTER_MARK)
+        .replace("@SLUG@", slug)
+        .replace("@TTARCH@", tt_arch)
+        .replace("@ARCH@", arch)
+        .replace("@SMOD@", hooks["module"])
+        .replace("@ROWS@", str(hooks["rows"]))
+        .replace("@KV@", str(hooks["kv"]))
+    )
+
+
 def _scaffold_vllm_bundle(
     checkout: Path, extra_models_dir: str, arch: str, model_type: str | None, weights: str | None, slug: str
 ) -> tuple[bool, bool, str]:
     """Create the vLLM adapter bundle (vllm_metadata.json + adapter.py) under the checkout if absent,
     so the container manifest is complete for ANY model. Returns (created, is_stub, path).
 
+    - A demo declaring the row-per-request serving hooks (_demo_serving_hooks), any arch -> adapter is
+      _ROWS_ADAPTER_TMPL over them: the demo's own pipeline serves, servable (is_stub False).
     - Stock arch (Llama/Qwen/Mistral/Gemma/...) -> adapter is a trivial subclass of the stock
       generator: servable as-is.
     - Novel arch -> adapter subclasses the closest base with a clearly-marked TODO body."""
@@ -1510,6 +2076,27 @@ def _scaffold_vllm_bundle(
     created = not meta.is_file()
     bundle.mkdir(parents=True, exist_ok=True)
     tt_arch = arch if arch.startswith("TT") else "TT" + arch
+
+    hooks = _demo_serving_hooks(checkout, slug)
+    if hooks and hooks.get("problem"):
+        print(f"  [publish-hf] serving hooks in {hooks['module']} not used: {hooks['problem']}")
+    elif hooks:
+        rows_meta = {
+            "arch": arch,
+            "main_class": "adapter:" + tt_arch,
+            "weights": weights or "REPLACE/with-base-weights-repo",
+            "note": "Generator over the demo's serving pipeline (%s), one device row per request; serve with "
+            "--max-num-seqs %d --max-model-len %d." % (hooks["module"], hooks["rows"], hooks["kv"]),
+            "max_num_seqs": hooks["rows"],
+            "max_model_len": hooks["kv"],
+        }
+        if hooks["device_params"]:
+            rows_meta["additional_config"] = {_PLUGIN_CONFIG_KEY: dict(hooks["device_params"])}
+        if is_stub:  # not a plugin built-in: the engine must be told which registered class serves it
+            rows_meta["serve_hf_override_arch"] = tt_arch
+        meta.write_text(json.dumps(rows_meta, indent=2) + "\n")
+        (bundle / "adapter.py").write_text(_rows_adapter_src(slug, arch, tt_arch, hooks))
+        return created, False, str(bundle)
 
     # Novel arch WITH its own resident demo pipeline -> ship a real pipeline-wrapping generator
     # skeleton (the Nemotron-shaped serve contract) instead of a no-op stub, so publish-hf always
@@ -1949,7 +2536,9 @@ def _eager_serve_lines(log: str) -> list:
 
 def _time_served_decode(base_url: str, model: str, users: int, osl: int = 128, timeout: int = 1800) -> dict:
     """``users`` concurrent streamed greedy completions of exactly ``osl`` tokens, each with its own
-    ~128-token prompt. Mean TTFT (s) and TPOT (ms), per-user and total decode tok/s."""
+    ~128-token prompt. Mean TTFT (s) and TPOT (ms), per-user and total decode tok/s. ``ignore_eos`` alone
+    fixes the length: ``min_tokens`` would add a logits processor, which moves TT sampling off the device
+    and so times a slower path than a plain client request takes."""
     import threading
     import time
     import urllib.request
@@ -1961,7 +2550,6 @@ def _time_served_decode(base_url: str, model: str, users: int, osl: int = 128, t
             "model": model,
             "prompt": f"Reader {u}: " + " ".join(["The quick brown fox jumps over the lazy dog."] * 12),
             "max_tokens": osl,
-            "min_tokens": osl,
             "ignore_eos": True,
             "temperature": 0,
             "stream": True,
@@ -2185,6 +2773,47 @@ def _served_speed_gate(args, state: dict, staged) -> tuple:
         "optimized": optimized,
         "date": _dt.date.today().isoformat(),
     }
+
+
+def _served_headline(served: dict, perf_hw: str) -> str:
+    """The card's one-line speed from the serve gate's rows: what `tt serve` measured on this package."""
+    rows = sorted(served["rows"], key=lambda r: r[0], reverse=True)
+    parts = [
+        f"{per_user:.1f} tok/s/user with 1 user"
+        if users == 1
+        else f"{per_user:.1f} tok/s/user with {users} users at once ({total:,.0f} tok/s total)"
+        for users, _isl, _osl, _ttft, _tpot, per_user, total in rows
+    ]
+    _u, isl, osl, *_ = rows[0]
+    return (
+        f"{' and '.join(parts)}, served by `tt serve` on {perf_hw} "
+        f"(~{isl}-token prompts, {osl} output tokens each, greedy)."
+    )
+
+
+def _restate_card_speed(staged, headline: str) -> bool:
+    """Replace the built package's card speed (the bring-up number tt-model wrote into README.md and the manifest's
+    container.card.performance) with `headline`. True when the manifest held one to replace."""
+    mpath, rpath = Path(staged) / "tt_kernel_manifest.json", Path(staged) / "README.md"
+    try:
+        mani = json.loads(mpath.read_text())
+    except (OSError, ValueError):
+        return False
+    card = (mani.get("container") or {}).get("card")
+    old = str((card or {}).get("performance") or "").strip()
+    if not old:
+        return False
+    card["performance"] = headline + "\n"
+    mpath.write_text(json.dumps(mani, indent=2))
+    try:
+        readme = rpath.read_text()
+    except OSError:
+        return True
+    if old in readme:
+        rpath.write_text(readme.replace(old, headline, 1))
+    else:
+        print(f"  [publish-hf] card speed: {rpath} does not carry the manifest's line; only the manifest was restated.")
+    return True
 
 
 def _served_card_body(served: dict) -> str:
@@ -2572,7 +3201,7 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
     # arch gets a scaffolded stub and is NOT servable until an adapter is written. Drives honest card
     # labeling below — the tool never claims a stub package can serve.
     bundle_dir = Path(checkout) / extra / slug
-    adapter_ready = _adapter_is_working(bundle_dir)
+    adapter_ready = _adapter_is_working(bundle_dir) and not _rendered_rows_adapter(bundle_dir)
     if adapter_ready and _refresh_eager_pipeline_adapter(checkout, slug, bundle_dir):
         print(
             f"  [publish-hf] re-rendered {bundle_dir / 'adapter.py'}: it was an earlier copy of the tool's "
@@ -2622,25 +3251,32 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
         created, is_stub, bpath = _scaffold_vllm_bundle(
             checkout, extra, _arch_for_bundle, mtype, getattr(args, "weights", None), slug
         )
-        state_note = (
-            "STUB — not servable until an adapter is written"
-            if (is_stub or _mistral_fallback or not arch_det)
-            else "stock generator — servable as-is"
-        )
+        rows_adapter = _rendered_rows_adapter(bpath)
+        if rows_adapter and arch_det and not _mistral_fallback:
+            servable = True
+        if is_stub or _mistral_fallback or not arch_det:
+            state_note = "STUB — not servable until an adapter is written"
+        elif rows_adapter:
+            state_note = "the demo's own serving pipeline, one device row per request — servable"
+        else:
+            state_note = "stock generator — servable as-is"
         print(f"  [publish-hf] vLLM bundle {'created' if created else 'exists'}: {bpath}  ({state_note})")
-        _own_pipeline = _demo_pipeline_module(checkout, slug) if not is_stub else None
+        _own_pipeline = _demo_pipeline_module(checkout, slug) if not (is_stub or rows_adapter) else None
         if _own_pipeline:
             print(
                 f"  [publish-hf] NOTE: this package serves the stock "
                 f"{_pick_base_generator(_arch_for_bundle, mtype)[0]} from {_GEN_MOD}, not this demo's own "
                 f"optimized pipeline ({_own_pipeline}); what customers get is the served speed, not the "
-                "optimized run's number."
+                f"optimized run's number. To serve the pipeline itself, give one module of the demo's tt/ package "
+                f"the serving hooks ({_SERVING_BUILDER}, {_SERVING_ROWS}, {_SERVING_KV})."
             )
 
     # A novel-arch pipeline adapter must serve out of the box: build the image from the MATCHED
     # local vLLM+plugin (no version skew) and give that plugin novel-arch support. Stock arches are
     # unaffected (they ride a vLLM built-in; the hooks only fire on a novel EXTRA_MODELS_DIR bundle).
-    _is_pipeline_adapter = (not adapter_ready) and bool(_demo_pipeline_module(checkout, slug))
+    _is_pipeline_adapter = (not adapter_ready) and (
+        bool(_demo_pipeline_module(checkout, slug)) or _rendered_rows_adapter(bundle_dir)
+    )
     if getattr(args, "container", False) and _is_pipeline_adapter:
         if not getattr(args, "vllm_path", None):
             disc = _discover_serving_stack()
@@ -2755,6 +3391,25 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
         return 5
     if served:
         state["served"] = served
+        target = _serve_hardware(
+            state,
+            getattr(args, "box", None),
+            getattr(args, "arch", None),
+            getattr(args, "hardware", None),
+            mesh_override,
+        )
+        if _restate_card_speed(staged, _served_headline(served, target["perf_hw"])):
+            print("  [publish-hf] card speed: the served numbers above (was the bring-up measurement).")
+    if getattr(args, "no_upload", False):
+        print(f"  [publish-hf] --no-upload: built and gated, NOT uploading. Package: {staged}")
+        try:
+            perf = json.loads((Path(staged) / "tt_kernel_manifest.json").read_text())["container"]["card"][
+                "performance"
+            ]
+            print(f"  [publish-hf] card speed: {perf.strip()}")
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return 0
     # Upload the built bundle OURSELVES (create_repo + upload_large_folder) rather than `tt-model push`:
     # tt-model's push depends on a huggingface_hub version whose folder-upload API drifts between
     # releases, so doing it in-process with this interpreter's hub keeps the whole flow one automated
@@ -3070,7 +3725,7 @@ def cmd_publish_hf(args) -> int:
 
     if getattr(args, "container", False):
         rc = _run_container(args, state, slug, demo_dir, commit)
-        if rc == 0:
+        if rc == 0 and not getattr(args, "no_upload", False):
             _maybe_run_container_eval(args, slug, demo_dir)
             _maybe_mirror_container_card(args, slug, state, base_weights, commit, demo_dir)
             _maybe_autocommit(args, demo_dir)

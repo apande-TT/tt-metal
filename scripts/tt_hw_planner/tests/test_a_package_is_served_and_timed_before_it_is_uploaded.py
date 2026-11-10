@@ -151,9 +151,11 @@ def test_the_gate_refuses_rather_than_skips_when_it_cannot_serve(tmp_path, monke
 
 class _Streamer(BaseHTTPRequestHandler):
     gap = 0.01
+    bodies = []
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.bodies.append(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -184,6 +186,17 @@ def test_served_decode_is_timed_per_user_from_the_token_stream(server):
     assert 30 < r["per_user"] < 150, r  # one token every ~10 ms, loosely: localhost TCP batches small writes
     assert r["total"] == pytest.approx(4 * r["per_user"])
     assert r["ttft"] >= 0.05
+
+
+def test_the_timed_requests_are_plain_greedy_completions_a_client_would_send(server):
+    _Streamer.bodies.clear()
+    ph._time_served_decode(server, "m", 2, osl=8)
+    assert len(_Streamer.bodies) == 2
+    for body in _Streamer.bodies:
+        assert body["ignore_eos"] and body["temperature"] == 0 and body["max_tokens"] == 8
+        assert (
+            "min_tokens" not in body
+        ), "its logits processor moves TT sampling to the host: a slower path than clients take"
 
 
 def test_the_card_sweep_runs_the_full_model_not_the_tests_default(tmp_path, monkeypatch):

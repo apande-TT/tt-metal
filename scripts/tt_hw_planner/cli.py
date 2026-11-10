@@ -11802,6 +11802,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "(by default a package that serves under --serve-gate-min of its optimized speed is not uploaded)",
     )
     pph.add_argument(
+        "--no-upload",
+        dest="no_upload",
+        action="store_true",
+        help="--container: build the package and serve-gate it (its card restated with the served speed), then stop "
+        "before anything goes to Hugging Face; the package stays in --out for review",
+    )
+    pph.add_argument(
         "--serve-gate-min",
         dest="serve_gate_min",
         type=float,
