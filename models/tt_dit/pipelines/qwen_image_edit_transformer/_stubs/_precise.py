@@ -111,6 +111,11 @@ class StackedLimbs:
         self.t, self.rows, self.mp, self.parts = t, rows, mp, parts
 
 
+# split_bf16(x, mem) also returns x's registered limbs when a placement `mem` is asked for (they stay where their
+# producer made them; False: only a split_bf16(x) with no placement takes them)
+PRESPLIT_ANY_MEM = False
+
+
 def register_split(x, parts):
     """x's (hi, lo) limbs, made by its producer as SPLIT_FN would: the next split_bf16(x) returns them."""
     _PRESPLIT[id(x)] = (x, parts)
@@ -118,7 +123,7 @@ def register_split(x, parts):
 
 def split_bf16(x, mem=None):
     pre = _PRESPLIT.pop(id(x), None)
-    if pre is not None and pre[0] is x and mem is None:
+    if pre is not None and pre[0] is x and (mem is None or PRESPLIT_ANY_MEM):
         return pre[1]
     x32 = x if x.dtype == ttnn.float32 else ttnn.typecast(x, ttnn.float32)
     if SPLIT_FN is not None and x32.layout == ttnn.TILE_LAYOUT and x32.is_sharded() is False:

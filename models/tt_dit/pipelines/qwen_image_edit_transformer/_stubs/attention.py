@@ -202,9 +202,21 @@ class TtQwenJointAttention:
         r = ttnn.rsqrt(ttnn.add(ms, self.eps))
         return ttnn.multiply(ttnn.multiply(x, r), w)
 
-    def _rope(self, x, freqs):  # x [B, Hl, S, D] half-split; freqs [S, D] = [cos | sin]
+    def _rope(self, x, freqs, limbs=False):  # x [B, Hl, S, D] half-split; freqs [S, D] = [cos | sin]
+        """limbs: the result is only ever split into its bf16 limbs (by the exact QK^T product): ROPE_SPLIT_FN may
+        make the limbs instead, the hi limb then returned with both registered as its split (_precise.register_split).
+        """
         if freqs is None:
             return x
+        if limbs and ROPE_SWAP and ROPE_SPLIT_FN is not None and _precise.ENABLED and _precise.EXACT_QK:
+            mem = ttnn.L1_MEMORY_CONFIG if _precise.EXACT_QK_LIMBS_L1 else ttnn.DRAM_MEMORY_CONFIG
+            parts = ROPE_SPLIT_FN(x, *_rope_tables(freqs, self.half, rot=True), mem)
+            if parts is not None:
+                if x.memory_config().buffer_type == ttnn.BufferType.L1:
+                    ttnn.deallocate(x)
+                _precise.register_split(parts[0], tuple(parts))
+                _LIMB_HANDLES.add(id(parts[0]))
+                return parts[0]
         if ROPE_SWAP and ROPE_FN is not None:  # the same products and sum in one kernel: x * cc + rot(x) * [sin | sin]
             out = ROPE_FN(x, *_rope_tables(freqs, self.half, rot=True), ttnn.DRAM_MEMORY_CONFIG)
             if out is not None:
@@ -327,6 +339,10 @@ class TtQwenJointAttention:
                 s = _precise.matmul_bt(q, kh)
         else:
             s = self._qk(q, kh, kl)
+        for t in (q, kh):  # a ROPE_SPLIT_FN hi limb (its split consumed by the product): freed now, not at return
+            if id(t) in _LIMB_HANDLES:
+                _LIMB_HANDLES.discard(id(t))
+                ttnn.deallocate(t)
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
         if SOFTMAX_FN is not None and SOFTMAX_SPLIT and _precise.ENABLED:
@@ -462,8 +478,9 @@ class TtQwenJointAttention:
             else:
                 q, k, v = self._heads(y), self._heads(y, n), self._heads(y, 2 * n)
             l1n = fj is not None  # the normalised q / k go straight to the rope: they may stay in L1
-            q = self._rope(self._rms(q, wq, l1_out=l1n), fj)
-            k = self._rope(self._rms(k, wk, l1_out=l1n), fj)
+            # (limbs: q / k are read only by the exact QK^T product's limb split)
+            q = self._rope(self._rms(q, wq, l1_out=l1n), fj, limbs=True)
+            k = self._rope(self._rms(k, wk, l1_out=l1n), fj, limbs=True)
             if vdt != ttnn.float32:
                 v = ttnn.typecast(v, vdt)
             if y is not None:
@@ -597,6 +614,10 @@ RMS_FN = None
 # with ROPE_SWAP: fn(x, [cos | cos], [sin | sin], mem) -> x * [cos | cos] + rotate_half(x) * [sin | sin] in one pass
 # (e.g. rope_rows.fused_rope: -x2 * sin is x2 * -sin exactly), or None where it does not take the shapes
 ROPE_FN = None
+# with ROPE_SWAP: fn(x, [cos | cos], [sin | sin], mem) -> the bf16 limbs (hi, lo) of ROPE_FN's output in one pass (e.g.
+# rope_rows.fused_rope_split), for a q / k only ever split into its limbs; None where it does not take the shapes
+ROPE_SPLIT_FN = None
+_LIMB_HANDLES = set()  # ids of the hi limbs _rope returned for ROPE_SPLIT_FN (freed by _attend after the QK^T product)
 # rotary tensor id -> (the tensor, held so its id stays valid; [cos | cos]; [-sin | sin]; [sin | sin])
 _ROPE_TABLES = {}
 
