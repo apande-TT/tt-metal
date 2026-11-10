@@ -390,7 +390,7 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_TAIL_NORMS", guard_tail_norms if self.fused_tail else None),
             # (and no negated-input product for its vote: dn where the guard trips)
             (_te_attention, "GUARD_NO_NN", True),
-            # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail)
+            # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
             # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
             (_dit_ccl, "A2A_REDUCE", bool(self.sum_parts)),

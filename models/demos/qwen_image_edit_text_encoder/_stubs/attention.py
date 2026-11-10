@@ -981,6 +981,8 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
     pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
     terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
 
+    reps = {}  # (each b operand's entries repeated once per call, not once per product: the lanes share one b limb)
+
     def mm(p, q):
         y = None
         if BMM_KERNEL is not None:
@@ -988,7 +990,11 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
         if y is not None:
             return y
         if b_rep > 1:
-            q = _repeat_entries(q, b_rep)
+            ent = reps.get(id(q))
+            if ent is None or ent[0] is not q:
+                ent = (q, _repeat_entries(q, b_rep))
+                reps[id(q)] = ent
+            q = ent[1]
         return ttnn.matmul(
             p,
             q,
