@@ -388,6 +388,9 @@ GUARD_TAIL = None
 # rest_fn) with a_s the slack-scaled [.., M, 1] row norms -- the same value, no output-sized tol tensor -- consuming
 # ex, dn, nn and rest_fn()'s product (not a_s / b_norm), or None (rest_fn not called) for a shape it does not take.
 GUARD_TAIL_NORMS = None
+# With GUARD_TAIL_NORMS: no negated-input product nn for the guard's vote -- where the guard trips (a glitch), the
+# tail takes the dense product dn instead of median(ex, dn, -nn), so nn's product, write and read are skipped.
+GUARD_NO_NN = False
 # Optional fused kernel for the strided lane split: LANE_SPLIT(lead) -> (the EXACT_LANES lanes of the bf16 lead
 # limb, each equal to lead * its strided mask; -lead), or None for a shape it does not take.
 LANE_SPLIT = None
@@ -477,6 +480,11 @@ def _guarded(ex, dn, nn, a_norm, b_norm, rest_fn=None, rest2_fn=None):
         if y is not None:
             return y
     near = ttnn.le(ttnn.subtract(ex, dn, activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.ABS)]), tol)
+    if nn is None:  # (GUARD_NO_NN: dn where the guard trips)
+        y = ttnn.where(near, ex, dn)
+        if rest_fn is not None:
+            y = ttnn.add(y, rest_fn())
+        return y if rest2_fn is None else ttnn.add(y, rest2_fn())
     lo, hi = ttnn.minimum(ex, dn), ttnn.maximum(ex, dn)
     neg = [ttnn.UnaryWithParam(ttnn.UnaryOpType.NEG)]
     med = ttnn.maximum(lo, ttnn.minimum(hi, nn, input_tensor_b_activations=neg))  # median(ex, dn, -nn)
@@ -1155,8 +1163,11 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         first = [_kcat_rest]
     else:
         first = [lambda pa=pa, pb=pb: mm(pa, pb) for pa, pb in rest[:2]]
-    neg0 = ttnn.neg(pa0) if neg0 is None else neg0
-    nn = mm(neg0, pb0_l1)
+    if GUARD_NO_NN and GUARD_TAIL_NORMS is not None:
+        nn = None
+    else:
+        neg0 = ttnn.neg(pa0) if neg0 is None else neg0
+        nn = mm(neg0, pb0_l1)
     if pb0_l1 is not pb0:
         ttnn.deallocate(pb0_l1)
     if b_norm is None:

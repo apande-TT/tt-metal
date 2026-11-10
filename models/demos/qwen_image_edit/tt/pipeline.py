@@ -388,6 +388,8 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "SOFTMAX_EXP_APPROX", True),
             # (the guarded tail's tolerance a_norm x b_norm formed inside the C++ tail: no output-sized tol pass; norms in L1)
             (_te_attention, "GUARD_TAIL_NORMS", guard_tail_norms if self.fused_tail else None),
+            # (and no negated-input product for its vote: dn where the guard trips)
+            (_te_attention, "GUARD_NO_NN", True),
             # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
             (_dit_ccl, "A2A_REDUCE", bool(self.sum_parts)),
         )

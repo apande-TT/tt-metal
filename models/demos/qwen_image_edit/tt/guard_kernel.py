@@ -180,7 +180,8 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
     or a single batch broadcast over it): no output-sized tol tensor written and read back. Consumes ex, dn, nn and
     lo_fn()'s product, not a_s / b_norm. Returns None (lo_fn not called) for a shape it does not take."""
     s = list(ex.shape)
-    if len(s) < 2 or not all(_plain(t, s) for t in (ex, dn, nn)):
+    # (nn None: no negated-input product -- where the guard trips the tail takes dn)
+    if len(s) < 2 or not all(_plain(t, s) for t in ((ex, dn) if nn is None else (ex, dn, nn))):
         return None
     for t in (a_s, b_norm):
         if t.dtype != ttnn.float32 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
@@ -217,10 +218,11 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
         )
 
     cbs = [cb_desc(cb) for cb in (0, 1, 2, 3, 4, 5, _OUT_CB)]
-    ins = [ex, dn, nn, lo, a_s, b_norm]
+    ins = [ex, dn, dn if nn is None else nn, lo, a_s, b_norm]
     reader_cta = []
     for t in ins:
         reader_cta.extend(ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    reader_cta.append(int(nn is not None))
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     addrs = [t.buffer_address() for t in ins]
     for c, start, count in work:
@@ -247,7 +249,7 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
             kernel_source=_NORMS_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[],
+            compile_time_args=[int(nn is not None)],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
@@ -261,7 +263,7 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
         ),
     ]
     ttnn.generic_op(ins + [y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
-    for t in (ex, dn, nn, lo):
+    for t in (ex, dn, lo) if nn is None else (ex, dn, nn, lo):
         ttnn.deallocate(t)
     return y
 
