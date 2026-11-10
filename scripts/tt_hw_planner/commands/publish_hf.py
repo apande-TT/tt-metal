@@ -625,11 +625,18 @@ def _tt_validated_block(state: dict, hw_phrase: str, commit: str | None) -> str:
     ft = sv.get("first_token") or {}
     batch = state.get("batch")
     served = state.get("served") or {}
+    measured_on = served.get("measured_on") or hw_phrase
     rows = [f"| Hardware | {hw_phrase} |"]
+    if measured_on != hw_phrase:
+        rows.append(f"| Measured on | {measured_on} |")
     if served.get("rows"):
         # What a customer gets from `tt serve`, measured on this package before it was uploaded. The
         # perf test's figures are bring-up measurements (fixed batch, no server) and go below it.
         rows.append(f"| Concurrent users (`tt serve`) | up to {served.get('max_num_seqs')} |")
+        if served.get("max_model_len"):
+            rows.append(
+                f"| Context per request (`tt serve`) | {int(served['max_model_len']):,} tokens, prompt + answer |"
+            )
         for users, isl, osl, ttft, tpot_ms, per_user, total in served["rows"]:
             who = "1 user" if users == 1 else f"{users} users at once"
             rows.append(
@@ -658,7 +665,7 @@ def _tt_validated_block(state: dict, hw_phrase: str, commit: str | None) -> str:
     table = "\n".join(["| Measured on Tenstorrent | Value |", "| --- | --- |", *rows])
     return (
         "## Validated on Tenstorrent\n\n"
-        f"Brought up and measured on {hw_phrase} through a PCC-gated end-to-end pipeline. "
+        f"Brought up and measured on {measured_on} through a PCC-gated end-to-end pipeline. "
         "Every figure in this section is measured on Tenstorrent hardware; the sections below are the "
         "upstream base-model card (measured by the base-model authors on GPU), reproduced for reference.\n\n"
         + table
@@ -818,6 +825,11 @@ def _mirror_body_tt(body: str, base_weights: str, demo_dir, state: dict) -> str:
         return body
 
 
+# tenstorrent 1.2.1 accepts any typer>=0.27.2, and typer 0.29.0 dropped the click module its CLI
+# imports, so a plain `uv tool install tenstorrent` gives a `tt` that fails on its first command.
+_TT_CLI_INSTALL = "uv tool install tenstorrent --with 'typer<0.29'"
+
+
 def _tt_run_section(repo_id: str | None, base_weights: str | None = None) -> str:
     """How to actually serve this model on Tenstorrent: the `tt` CLI (Tenstorrent's packaged serving
     flow) pulls the published package and serves it as an OpenAI-compatible API, then any OpenAI
@@ -827,11 +839,11 @@ def _tt_run_section(repo_id: str | None, base_weights: str | None = None) -> str
     return (
         "## Run on Tenstorrent\n\n"
         "```bash\n"
-        "uv tool install tenstorrent          # once \u2014 the Tenstorrent CLI, `tt`\n"
+        f"{_TT_CLI_INSTALL}   # once \u2014 the Tenstorrent CLI, `tt`\n"
         f"tt model pull {rid}\n"
         f"tt serve {rid}                       # OpenAI-compatible API on http://localhost:20000/v1\n"
         "```\n\n"
-        "Then query it with any OpenAI client:\n\n"
+        "Then query it with any OpenAI client (`pip install openai`):\n\n"
         "```python\n"
         "from openai import OpenAI\n"
         'client = OpenAI(base_url="http://localhost:20000/v1", api_key="EMPTY")\n'
@@ -961,12 +973,18 @@ def _compose_mirrored_card(
     if arch_tag:
         fm.append(f"  - {arch_tag}")
     fm.append("---")
+    measured_on = (state.get("served") or {}).get("measured_on") or hw
+    tables = (
+        "the base-model benchmark tables are shown with a Tenstorrent column (the on-device score when a "
+        "bounded TT eval has been run, else 'pending (TT)')."
+        if "| Tenstorrent |" in body
+        else "the base-model benchmark results are the base-model authors' own, reproduced unchanged."
+    )
     intro = (
         f"A Tenstorrent deployment of [`{base_weights}`](https://huggingface.co/{base_weights}) — the same "
-        f"weights, brought up on {hw}. This card mirrors the upstream model card: the "
+        f"weights, brought up on {measured_on}. This card mirrors the upstream model card: the "
         "**Validated on Tenstorrent** section holds figures measured on Tenstorrent hardware. GPU-specific "
-        "deployment/usage has been removed; the base-model benchmark tables are shown with a Tenstorrent "
-        "column (the on-device score when a bounded TT eval has been run, else 'pending (TT)')."
+        f"deployment/usage has been removed; {tables}"
     )
     return (
         "\n".join(fm)
@@ -2792,6 +2810,7 @@ def _served_speed_gate(args, state: dict, staged) -> tuple:
     return True, {
         "rows": rows,
         "max_num_seqs": seqs,
+        "max_model_len": ((mani.get("container") or {}).get("serve") or {}).get("max_model_len"),
         "optimized": optimized,
         "date": _dt.date.today().isoformat(),
     }
@@ -3478,7 +3497,6 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
         )
         return 5
     if served:
-        state["served"] = served
         target = _serve_hardware(
             state,
             getattr(args, "box", None),
@@ -3486,6 +3504,8 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             getattr(args, "hardware", None),
             mesh_override,
         )
+        served = {**served, "measured_on": target["hw_phrase"]}
+        state["served"] = served
         if _restate_card_speed(staged, _served_headline(served, target["perf_hw"])):
             print("  [publish-hf] card speed: the served numbers above (was the bring-up measurement).")
     if getattr(args, "no_upload", False):
