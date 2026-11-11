@@ -551,6 +551,8 @@ LANE_MASKED_MM = None
 # Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
 # pass over x, or None: weights sharing an input taken in pairs.
 LANE_MASKED_MM2 = None
+# Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
+INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
 
 
@@ -679,9 +681,12 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
     neg_lead = None
     if exs is None:
         accs = [_LaneAcc() for _ in mms]
+        lane_mms = mms
+        if INPUT_LANE_FIDELITY is not None and ws is not None and all(len(w.shape) == 2 for w in ws):
+            lane_mms = [_linear_mm(lead, w, INPUT_LANE_FIDELITY) for w in ws]
         lanes, neg_lead = _lead_lanes(lead)
         for lane in lanes:
-            for i, mm in enumerate(mms):
+            for i, mm in enumerate(lane_mms):
                 accs[i].push(mm(lane))
             ttnn.deallocate(lane)
         exs = [acc.value() for acc in accs]
