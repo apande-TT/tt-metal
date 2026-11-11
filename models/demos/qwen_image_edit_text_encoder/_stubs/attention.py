@@ -766,6 +766,9 @@ def _bmm_split_m_config(a, b, transpose_b):
 
 # split_matmul's plain products on _bmm_split_m_config (M split over the grid) instead of BMM_CORE_GRID alone
 BMM_SPLIT_M = False
+# BMM_CONCAT_K: each stacked operand ([ah | ah | al], [bh ; bl ; bh]) concatenated into L1 when it takes at most
+# this many bytes (0: the concat's default placement)
+BMM_CONCAT_L1_BYTES = 0
 # split_matmul's plain two-limb products as one product over the limbs concatenated along K (False: three products
 # + two adds)
 BMM_CONCAT_K = False
@@ -820,8 +823,12 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
 
     if not exact and BMM_CONCAT_K and limbs == 2 and int(pa_all[0].shape[-1]) % TILE == 0:
         # the three terms as ONE product over a 3x K: [ah | ah | al] @ [bh ; bl ; bh], accumulated in the fp32 dest
-        a3 = ttnn.concat([pa_all[0], pa_all[0], pa_all[1]], dim=-1)
-        b3 = ttnn.concat([pb_all[0], pb_all[1], pb_all[0]], dim=-1 if transpose_b else -2)
+        def _l1(parts):  # BMM_CONCAT_L1_BYTES: the stacked operand in L1 (freed right after the product)
+            nbytes = 3 * 2 * math.prod(int(d) for d in parts[0].padded_shape)
+            return {"memory_config": ttnn.L1_MEMORY_CONFIG} if 0 < nbytes <= BMM_CONCAT_L1_BYTES else {}
+
+        a3 = ttnn.concat([pa_all[0], pa_all[0], pa_all[1]], dim=-1, **_l1(pa_all))
+        b3 = ttnn.concat([pb_all[0], pb_all[1], pb_all[0]], dim=-1 if transpose_b else -2, **_l1(pb_all))
         pc3 = _bmm_split_m_config(a3, b3, transpose_b) if BMM_SPLIT_M and BMM_CORE_GRID is not None else None
         kw = {} if pc3 is not None or BMM_CORE_GRID is None else {"core_grid": BMM_CORE_GRID}
         if out_mem is not None:
