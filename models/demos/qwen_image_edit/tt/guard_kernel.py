@@ -174,6 +174,11 @@ def _batch(t):
     return v
 
 
+# guard_tail_norms' output in L1 (interleaved) when it is at most this many bytes: the softmax reads the guarded
+# scores straight back. 0 = always DRAM.
+GUARD_OUT_L1_MAX = 16 * 2**20
+
+
 def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
     """guard_tail(ex, dn, nn, a_s * b_norm, lo_fn) with the tolerance's outer product formed tile by tile inside the
     kernel (a_s: the slack-scaled [.., M, 1] row norms, b_norm the [.., 1, N] column norms; each batch-matched to ex
@@ -203,7 +208,16 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
         ttnn.deallocate(lo)
         return None
     n_tiles = nb * mt * nt
-    y = ttnn.empty_like(ex)
+    y = None
+    if GUARD_OUT_L1_MAX and n_tiles * _FP32_TILE_BYTES <= GUARD_OUT_L1_MAX:
+        # (the guarded scores stay in L1 for the softmax that reads them next; DRAM when L1 has no room)
+        try:
+            y = ttnn.empty(
+                s, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=ex.device(), memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+        except Exception:  # noqa: BLE001
+            y = None
+    y = ttnn.empty_like(ex) if y is None else y
     grid = y.device().compute_with_storage_grid_size()
     work = _cores(grid, n_tiles)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
