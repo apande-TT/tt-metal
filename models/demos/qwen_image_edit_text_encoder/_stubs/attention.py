@@ -551,6 +551,9 @@ LANE_MASKED_MM = None
 # Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
 # pass over x, or None: weights sharing an input taken in pairs.
 LANE_MASKED_MM2 = None
+# The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
+# no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
+LINEAR_NO_GUARD = False
 # Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
 INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
@@ -690,6 +693,18 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
                 accs[i].push(mm(lane))
             ttnn.deallocate(lane)
         exs = [acc.value() for acc in accs]
+    if LINEAR_NO_GUARD:
+        ys = []
+        for i, mm in enumerate(mms):
+            acc = _LaneAcc()
+            acc.push(exs[i])
+            exs[i] = None
+            for part in parts[1:3]:
+                acc.push(lo_mms[i](part))
+            for part in parts[3:]:
+                acc.push(mm(part))
+            ys.append(acc.value())
+        return ys
     neg_lead = ttnn.neg(lead) if neg_lead is None else neg_lead
     a_norm = _norm_last(lead)
     ys = []

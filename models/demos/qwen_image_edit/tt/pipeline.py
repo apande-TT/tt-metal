@@ -336,6 +336,11 @@ class TtQwenImageEditPipeline:
             _te_attention,
             "LANE_MASKED_BMM",
             masked_lane_bmm if self.weight_lane_split else None,
+        ), self._hook(
+            # (and the exact linears unguarded: lane sum + trailing limbs, no dense / negated check products)
+            _te_attention,
+            "LINEAR_NO_GUARD",
+            True,
         ):
             yield
 
