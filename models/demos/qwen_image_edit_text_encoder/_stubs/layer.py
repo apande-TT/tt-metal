@@ -379,6 +379,8 @@ class TtTextAttention:
         o = split_matmul(probs, v, compute_kernel_config=cfg, exact=ex, k_tiles=kt)  # [B, kvl, G*S, D]
         o = ttnn.reshape(o, (b, hl, s_pad, D))
         op = MERGE_SPLIT_FN(o) if MERGE_SPLIT_FN is not None and hl > 1 else None
+        if op is not None and o.memory_config().buffer_type == ttnn.BufferType.L1:
+            ttnn.deallocate(o)  # (an L1 P @ V output: read only by the split, freed before the out projection)
         if op is not None:  # the out projection's limbs read straight from the head-major o (no merged o)
             out = split_linear(op[0], self.wo, compute_kernel_config=cfg, exact=ex, parts=tuple(op))
             return _reduce(out, self.device, self.tp, residual)
