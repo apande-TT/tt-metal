@@ -24,6 +24,24 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import mesh_shap
 from models.demos.qwen_image_edit_text_encoder._stubs.encoder_stack import TtRMSNorm, _fp32
 from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtTokenEmbed
 
+# PCC-bounded partial: the layer slots whose exact linears run their input-lane products at LOW_LANE_FIDELITY (slot i
+# = layer i, and layer n/2 + i on row 1 when row-staged); the rest keep the default
+LOW_LANE_SLOTS = frozenset(range(4, 14))
+LOW_LANE_FIDELITY = ttnn.MathFidelity.HiFi3
+
+
+def _slot_forward(i, lyr, *args):
+    from models.demos.qwen_image_edit_text_encoder._stubs import attention as _att
+
+    if i not in LOW_LANE_SLOTS:
+        return lyr.forward_padded(*args)
+    prev = _att.INPUT_LANE_FIDELITY
+    _att.INPUT_LANE_FIDELITY = LOW_LANE_FIDELITY
+    try:
+        return lyr.forward_padded(*args)
+    finally:
+        _att.INPUT_LANE_FIDELITY = prev
+
 
 class TtTextModel:
     """Composed of the graduated ports: 28 x v_l_decoder_layer, each with its language_model_layers_0_mlp.
@@ -120,8 +138,8 @@ class TtTextModel:
                 xin = self._rows(self._batch_slice(x, t, mb), self._take_row(prev, 0))
                 mask = self._rows(self._batch_slice(tt_mask, t, mb), self._batch_slice(tt_mask, t - 1, mb))
             y = xin
-            for lyr in self.layers:
-                y = lyr.forward_padded(y, tt_cos, tt_sin, mask)
+            for i, lyr in enumerate(self.layers):
+                y = _slot_forward(i, lyr, y, tt_cos, tt_sin, mask)
             if 0 < t < m:  # the row-selected mask is this step's own; a plain batch slice may be a view of tt_mask
                 ttnn.deallocate(mask)
             if t >= 1:
@@ -135,12 +153,12 @@ class TtTextModel:
         stages pipelined over that many micro-batches (see _pipelined)."""
         if self.row_stages and micro > 1 and x.shape[0] % micro == 0:
             return self.norm(self._pipelined(x, tt_cos, tt_sin, tt_mask, micro))
-        for lyr in self.layers:
-            x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
+        for i, lyr in enumerate(self.layers):
+            x = _slot_forward(i, lyr, x, tt_cos, tt_sin, tt_mask)
         if self.row_stages:
             x = self._take_row(x, 0)  # layers [0, n/2) done on row 0 -> hand to row 1
-            for lyr in self.layers:
-                x = lyr.forward_padded(x, tt_cos, tt_sin, tt_mask)
+            for i, lyr in enumerate(self.layers):
+                x = _slot_forward(i, lyr, x, tt_cos, tt_sin, tt_mask)
             x = self._take_row(x, 1)  # layers [n/2, n) done on row 1 -> everyone
         return self.norm(x)
 

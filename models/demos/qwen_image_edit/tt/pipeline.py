@@ -136,8 +136,8 @@ def bmm_config_2d(p, q, transpose_b=False):
         batch *= d
     grid = q.device().compute_with_storage_grid_size()
     # (K up to 32 tiles: the K-stacked exact-lane QK^T, 8 lanes x 128, takes it too -- a narrower K block keeps its
-    # 3 x 38-tile blocks within L1)
-    if kt > 32 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
+    # 3 x 38-tile blocks within L1; and up to 64: the unguarded QK^T's lanes + trailing limbs, 8 x 128 + 5 x 128)
+    if kt > 64 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
         return None
     key = (mt, kt, nt, grid.x, grid.y)
     if key not in _BMM_2D:
@@ -336,6 +336,11 @@ class TtQwenImageEditPipeline:
             _te_attention,
             "LANE_MASKED_BMM",
             masked_lane_bmm if self.weight_lane_split else None,
+        ), self._hook(
+            # (and the exact linears unguarded: lane sum + trailing limbs, no dense / negated check products)
+            _te_attention,
+            "LINEAR_NO_GUARD",
+            True,
         ):
             yield
 
@@ -353,6 +358,7 @@ class TtQwenImageEditPipeline:
     def text_encode(self, up, image_embeds):
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
         # (and its MLP's gate / up as ONE column-parallel exact linear: _stubs/layer.py MLP_GATE_UP_FOLD)
+        # (slots 4-13's input-lane products at HiFi3: _stubs/v_l_text_model.py LOW_LANE_SLOTS)
         with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
             return self.text_encoder.encode_text(up.te, image_embeds)
 
@@ -407,6 +413,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_NO_NN", True),
             # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
+            # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
+            (_te_attention, "LINEAR_NO_GUARD", True),
             # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
