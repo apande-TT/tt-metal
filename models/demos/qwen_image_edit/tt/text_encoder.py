@@ -182,8 +182,8 @@ class TtQwenTextEncoder:
         _te_attention.SHARE_SPLIT = True
         # the LM's two-limb linears as one C++ program each (limb_linear.cpp: the weight streamed once for both limbs,
         # the same fp32 products and RNE add)
-        _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w: fused_limb_linear(
-            hi, lo, w, ttnn.DRAM_MEMORY_CONFIG, fidelity=ttnn.MathFidelity.HiFi3,  # both limbs' products at HiFi3
+        _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w, mem=ttnn.DRAM_MEMORY_CONFIG: fused_limb_linear(
+            hi, lo, w, mem, fidelity=ttnn.MathFidelity.HiFi3,  # both limbs' products at HiFi3
             long_groups=True,  # columns split over parallel senders so the rows' cores fill the grid
             chunk_tiles=128,  # in weight chunks of up to 256 KB (fewer sender / receivers handshakes)
             full_dest=True,  # with 8 float32 DEST tiles: 4-column output blocks
@@ -217,6 +217,7 @@ class TtQwenTextEncoder:
         _te_layer.ROPE_HEADS_FN = fused_rope_heads  # reading q's / k's heads straight from the fused qkv
         _te_layer.ROPE_L1_BYTES = 8 * 1024 * 1024  # into L1 (q: 5.4 MB), freed after the QK^T product
         _te_layer.QKV_L1_BYTES = 8 * 1024 * 1024  # reading the fused qkv (7.1 MB float32) from L1, freed after
+        _te_attention.LIMB_OUT_L1_WITH_BIAS = True  # and its pre-bias product in L1 as well, freed after the bias add
         _te_attention.VISION_FUSED_SCALE_MASK = True  # and the vision attention's
         _te_attention.VISION_ROPE_L1_BYTES = 4 * 1024 * 1024  # its RoPE intermediates (q / k: 2.2 MB) in L1
         # the vision attention's q / k / v heads by one C++ face-copy program each (head width 80: five 16-column
