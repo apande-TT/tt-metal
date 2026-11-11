@@ -49,6 +49,19 @@ from models.demos.qwen_image_edit_text_encoder._stubs.attention import MASK_NEG,
 from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import mask_k_tiles, text_attention_mask
 
+# fused_limb_bmm (the LM P @ V) writes its float32 output to L1 when it takes at most this many bytes (0: DRAM)
+PV_OUT_L1_BYTES = 6 * 1024 * 1024
+
+
+def _pv_out_mem(ah, bh):
+    dims = [int(d) for d in ah.padded_shape]
+    nbytes = 4 * (dims[0] if len(dims) else 1)
+    for d in dims[1:-1]:
+        nbytes *= d
+    nbytes *= int(bh.padded_shape[-1])
+    return ttnn.L1_MEMORY_CONFIG if 0 < nbytes <= PV_OUT_L1_BYTES else ttnn.DRAM_MEMORY_CONFIG
+
+
 # the LM attention's P @ V skips, per tile row, the key tiles the causal + padding mask zeroes (bit-identical:
 # those probabilities are exactly 0; one table for every chip's sequences: per tile row the most any sequence needs);
 # False: every P @ V accumulates all key tiles
@@ -151,8 +164,10 @@ class TtQwenTextEncoder:
         _te_attention.BMM_CONCAT_K = True
         _te_attention.BMM_CONCAT_L1_BYTES = 9 * 1024 * 1024  # its stacked operands (Q side 8.3 MB) in L1
         # and P @ V rather as one C++ limb_bmm program (limb_bmm.fused_limb_bmm, full grid) where it fits
+        # (its output -- the LM P @ V, [8, 1, 1344, 128] float32, 5.5 MB -- in L1 for the merge-heads limb split,
+        # which frees it: _te_layer.PV_OUT_L1)
         _te_attention.LIMB_BMM_FN = lambda ah, al, bh, bl, k_tiles=None: fused_limb_bmm(
-            ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG, k_tiles=k_tiles
+            ah, al, bh, bl, _pv_out_mem(ah, bh), k_tiles=k_tiles
         )
         # and its exact-lane linears on the full core grid (ttnn's own pick: 30-48 cores)
         _te_attention.EXACT_LINEAR_CORE_GRID = ttnn.CoreGrid(y=grid.y, x=grid.x)
