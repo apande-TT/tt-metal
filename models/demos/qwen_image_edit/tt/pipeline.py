@@ -19,6 +19,7 @@ the uploaded encoded inputs and the output image runs on device.
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 
 import torch
@@ -63,6 +64,9 @@ from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae
 # scheduler repeats.
 PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae_decode"]
 
+# The denoiser's masked-lane linears' column lanes of x: 4 lanes of 8 K terms per 32-group halve the lane products
+# of the 8-lane form (the encoders keep 8)
+DENOISE_MM_LANES = 4
 _SCHED_COLS = 32  # schedule table width: col 0 = t / 1000, col 1 = sigma_next - sigma
 
 
@@ -479,12 +483,14 @@ class TtQwenImageEditPipeline:
         ), self._hook(
             _te_attention, "LANE_NSTACK", lane_cols_sum if self.weight_lane_split else None
         ), self._hook(
-            _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
+            _te_attention,
+            "LANE_MASKED_MM",
+            functools.partial(masked_lane_linear, lanes=DENOISE_MM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             # (and two weights sharing the input in one pass over it)
             _te_attention,
             "LANE_MASKED_MM2",
-            masked_lane_linear2 if self.weight_lane_split else None,
+            functools.partial(masked_lane_linear2, lanes=DENOISE_MM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._denoise_extras():

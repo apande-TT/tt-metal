@@ -29,7 +29,7 @@ void kernel_main() {
     constexpr uint32_t kt = get_compile_time_arg_val(base);
     constexpr uint32_t nt = get_compile_time_arg_val(base + 1);
     constexpr uint32_t nc = get_compile_time_arg_val(base + 2);
-    constexpr uint32_t lanes = 8;
+    constexpr uint32_t lanes = get_compile_time_arg_val(base + 3);  // column lanes of x (8, or 4: 8 K terms per 32)
     const auto x = TensorAccessor(x_args, x_addr);
     const auto w = TensorAccessor(w_args, w_addr);
     const auto masks = TensorAccessor(m_args, m_addr);

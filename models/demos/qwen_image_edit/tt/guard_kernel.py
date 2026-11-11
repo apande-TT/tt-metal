@@ -505,16 +505,18 @@ _COL_MASKS = {}
 _MM_L1_BYTES = 1000 * 1024
 
 
-def _col_masks(device):
-    """The 8 column-lane mask tiles ([8 x 32, 32] bf16; tile r keeps the columns j % 8 == r: lane r of an input's K)."""
-    if id(device) not in _COL_MASKS:
-        vals = [1.0 if j % 8 == r else 0.0 for r in range(8) for _ in range(TILE) for j in range(TILE)]
-        m = ttnn.Tensor(vals, [8 * TILE, TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
-        _COL_MASKS[id(device)] = ttnn.typecast(m, ttnn.bfloat16)
-    return _COL_MASKS[id(device)]
+def _col_masks(device, lanes=8):
+    """The column-lane mask tiles ([lanes x 32, 32] bf16; tile r keeps the columns j % lanes == r: lane r of an
+    input's K)."""
+    key = (id(device), lanes)
+    if key not in _COL_MASKS:
+        vals = [1.0 if j % lanes == r else 0.0 for r in range(lanes) for _ in range(TILE) for j in range(TILE)]
+        m = ttnn.Tensor(vals, [lanes * TILE, TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
+        _COL_MASKS[key] = ttnn.typecast(m, ttnn.bfloat16)
+    return _COL_MASKS[key]
 
 
-def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
+def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
     """sum_r lane_r(x) @ w in float32 (lane r of x keeping its K columns k % 8 == r: the exact-lane sum of the
     weight-side lanes) for a bf16 interleaved tile input [..., M, K] and bf16 weight [K, N] (M, K, N tile-aligned),
     with no 8x copy of x: each core masks its own x tiles into their lanes in L1 and reads w once. None for a shape
@@ -534,7 +536,7 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
     work = _cores(dev.compute_with_storage_grid_size(), mt)
     rmax = max(c for _, _, c in work)
     page = _FP32_TILE_BYTES // 2
-    fixed = (2 * rmax + 8 + 8 * rmax) * page  # x (double), masks, lanes
+    fixed = (2 * rmax + lanes + lanes * rmax) * page  # x (double), masks, lanes
     nc = next(
         (
             d
@@ -543,10 +545,18 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
         ),
         0,
     )
+    w_bufs = 2
+    # a single-buffered weight row when it cuts the column chunks: each chunk re-masks every x tile into its lanes
+    nc1 = next(
+        (d for d in range(nt, 0, -1) if nt % d == 0 and fixed + d * (rmax * _FP32_TILE_BYTES + page) <= _MM_L1_BYTES),
+        0,
+    )
+    if nc and nc1 and nt // nc1 < nt // nc:
+        nc, w_bufs = nc1, 1
     if not nc:
         return None
     sbw = 2 if nc % 2 == 0 else 1  # (2-row subblocks: 2 x sbw <= the 4 float32 DST tiles)
-    masks = _col_masks(dev)
+    masks = _col_masks(dev, lanes)
     y = ttnn.empty(s[:-1] + [ws[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
 
@@ -560,9 +570,9 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
 
     cbs = [
         cb(0, 2 * rmax, ttnn.bfloat16),
-        cb(1, 2 * nc, ttnn.bfloat16),
-        cb(2, 8, ttnn.bfloat16),
-        cb(3, 8 * rmax, ttnn.bfloat16),
+        cb(1, w_bufs * nc, ttnn.bfloat16),
+        cb(2, lanes, ttnn.bfloat16),
+        cb(3, lanes * rmax, ttnn.bfloat16),
         cb(_OUT_CB, rmax * nc, ttnn.float32),
     ]
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -579,7 +589,7 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
             compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args()
             + ttnn.TensorAccessorArgs(w).get_compile_time_args()
             + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
-            + [kt, nt, nc],
+            + [kt, nt, nc, lanes],
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -587,7 +597,7 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3):
             kernel_source=_MM_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, nc, sbw, rmax],
+            compile_time_args=[kt, nt, nc, sbw, rmax, lanes],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
@@ -608,7 +618,7 @@ _MM2_READER = f"{_DIR}/masked_mm2_reader.cpp"
 _MM2_WRITER = f"{_DIR}/masked_mm2_writer.cpp"
 
 
-def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
+def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
     """(masked_lane_linear(x, w), masked_lane_linear(x, w2)) in ONE pass for two bf16 weights [K, N], [K, N2] sharing
     the input: x is read and masked into its lanes once per column chunk of both, not of each. None for shapes the
     single-weight kernel does not take."""
@@ -630,7 +640,7 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
     work = _cores(dev.compute_with_storage_grid_size(), mt)
     rmax = max(c for _, _, c in work)
     page = _FP32_TILE_BYTES // 2
-    fixed = (2 * rmax + 8 + 8 * rmax) * page  # x (double), masks, lanes
+    fixed = (2 * rmax + lanes + lanes * rmax) * page  # x (double), masks, lanes
     nc = next(
         (
             d
@@ -639,10 +649,18 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
         ),
         0,
     )
+    w_bufs = 2
+    # a single-buffered weight row when it cuts the column chunks: each chunk re-masks every x tile into its lanes
+    nc1 = next(
+        (d for d in range(nt, 0, -1) if nt % d == 0 and fixed + d * (rmax * _FP32_TILE_BYTES + page) <= _MM_L1_BYTES),
+        0,
+    )
+    if nc and nc1 and nt // nc1 < nt // nc:
+        nc, w_bufs = nc1, 1
     if not nc:
         return None
     sbw = 2 if nc % 2 == 0 else 1  # (2-row subblocks: 2 x sbw <= the 4 float32 DST tiles)
-    masks = _col_masks(dev)
+    masks = _col_masks(dev, lanes)
     y = ttnn.empty(s[:-1] + [ws[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     y2 = ttnn.empty(s[:-1] + [ws2[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
@@ -657,9 +675,9 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
 
     cbs = [
         cb(0, 2 * rmax, ttnn.bfloat16),
-        cb(1, 2 * nc, ttnn.bfloat16),
-        cb(2, 8, ttnn.bfloat16),
-        cb(3, 8 * rmax, ttnn.bfloat16),
+        cb(1, w_bufs * nc, ttnn.bfloat16),
+        cb(2, lanes, ttnn.bfloat16),
+        cb(3, lanes * rmax, ttnn.bfloat16),
         cb(_OUT_CB, rmax * nc, ttnn.float32),
     ]
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -684,7 +702,7 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
             + ttnn.TensorAccessorArgs(w).get_compile_time_args()
             + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
             + ttnn.TensorAccessorArgs(w2).get_compile_time_args()
-            + [kt, nt, nc, nt1],
+            + [kt, nt, nc, nt1, lanes],
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -692,7 +710,7 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3):
             kernel_source=_MM_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, nc, sbw, rmax],
+            compile_time_args=[kt, nt, nc, sbw, rmax, lanes],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
