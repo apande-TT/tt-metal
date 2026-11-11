@@ -1613,6 +1613,72 @@ def _demo_serving_hooks(checkout, slug):
     return {"module": module, "rows": rows, "kv": kv, "device_params": params, "serve_args": list(serve_args)}
 
 
+# A model whose output is not tokens (speech) or whose input the vLLM plugin cannot carry (audio) serves through its
+# OWN HTTP server, packaged as tt-model's http-server kind. One module of the demo package declares, as literals, the
+# command `tt serve` runs ({host}/{port} placeholders), the log line it prints once it serves, the device mesh it
+# opens and, optionally, the pip packages it needs beyond tt-metal's own install. The server must answer GET
+# /v1/models: that is how the serve gate knows it came up.
+_SERVING_HTTP_COMMAND = "SERVING_HTTP_COMMAND"
+_SERVING_HTTP_READY = "SERVING_HTTP_READY_LINE"
+_SERVING_HTTP_MESH = "SERVING_HTTP_MESH"
+_SERVING_HTTP_PACKAGES = "SERVING_HTTP_PACKAGES"
+_HTTP_SERVER_KIND = "http-server"
+
+
+def _demo_http_server_hooks(demo_dir):
+    """The demo's own-HTTP-server hooks, read from source (never imported), or None when no module of the demo
+    package (its top level or tt/) assigns SERVING_HTTP_COMMAND.
+
+    Returns {"module", "command", "ready_line", "mesh", "packages"}, or {"module", "problem"} when they are
+    incomplete: the command must be a literal list of strings naming {port}, the ready line a non-empty string, the
+    mesh a "(rows, cols)" string and the packages, when present, a literal list of strings."""
+    import ast
+    import re as _re
+
+    demo_dir = Path(demo_dir).resolve()
+    checkout = _checkout_of(demo_dir)
+    hits = []
+    for pf in sorted(list(demo_dir.glob("*.py")) + list((demo_dir / "tt").glob("*.py"))):
+        try:
+            tree = ast.parse(pf.read_text(errors="replace"))
+        except (SyntaxError, ValueError):
+            continue
+        consts = _literal_assignments(tree)
+        if _SERVING_HTTP_COMMAND in consts:
+            hits.append((".".join(pf.relative_to(checkout).with_suffix("").parts), consts))
+    if not hits:
+        return None
+    module, consts = hits[0]
+    if len(hits) > 1:
+        return {
+            "module": module,
+            "problem": "%s is assigned in %s" % (_SERVING_HTTP_COMMAND, ", ".join(m for m, _ in hits)),
+        }
+    command, ready, mesh = (consts.get(k) for k in (_SERVING_HTTP_COMMAND, _SERVING_HTTP_READY, _SERVING_HTTP_MESH))
+    packages = consts.get(_SERVING_HTTP_PACKAGES, [])
+    if not (
+        isinstance(command, (list, tuple))
+        and all(isinstance(a, str) and a for a in command)
+        and any("{port}" in a for a in command)
+    ):
+        problem = "%s is not a literal list of strings naming {port} (got %r)" % (_SERVING_HTTP_COMMAND, command)
+    elif not (isinstance(ready, str) and ready.strip()):
+        problem = "%s is not a non-empty string (got %r)" % (_SERVING_HTTP_READY, ready)
+    elif not (isinstance(mesh, str) and _re.fullmatch(r"\(\s*\d+\s*,\s*\d+\s*\)", mesh)):
+        problem = '%s is not a "(rows, cols)" string (got %r)' % (_SERVING_HTTP_MESH, mesh)
+    elif not (isinstance(packages, (list, tuple)) and all(isinstance(p, str) and p for p in packages)):
+        problem = "%s is not a literal list of strings (got %r)" % (_SERVING_HTTP_PACKAGES, packages)
+    else:
+        return {
+            "module": module,
+            "command": list(command),
+            "ready_line": ready,
+            "mesh": mesh,
+            "packages": list(packages),
+        }
+    return {"module": module, "problem": problem}
+
+
 def _rendered_rows_adapter(bundle_dir) -> bool:
     try:
         return _ROWS_ADAPTER_MARK in (Path(bundle_dir) / "adapter.py").read_text(errors="replace")
@@ -2785,6 +2851,12 @@ def _served_speed_gate(args, state: dict, staged) -> tuple:
         if model is None:
             print("  [publish-hf] serve gate: the built package did not start serving:\n" + _logs()[-1500:])
             return False, None
+        if (mani.get("container") or {}).get("kind") == _HTTP_SERVER_KIND:
+            print(
+                f"  [publish-hf] serve gate: PASS -- the package's own HTTP server serves {model}; it streams no "
+                "tokens, so there is no decode speed to time."
+            )
+            return True, None
         print(f"  [publish-hf] serve gate: serving {model}; timing 1 user, then {seqs} at once …")
         _time_served_decode(base, model, 1, osl=16)  # first request: one-time compiles and trace capture
         one = _time_served_decode(base, model, 1)
@@ -3225,11 +3297,155 @@ def _ensure_plugin_novel_arch_support(plugin_path) -> bool:
         return False
 
 
+def _pinned_packages(checkout, packages) -> list:
+    """Each bare package name pinned to the version installed in the checkout's python env (the env the model was
+    validated in); a requirement that already names a version, or a package that env lacks, is kept as given."""
+    import re as _re
+
+    py = Path(checkout) / "python_env" / "bin" / "python"
+    bare = [p for p in packages if _re.fullmatch(r"[A-Za-z0-9_.-]+", p)]
+    found = {}
+    if bare and py.is_file():
+        code = (
+            "import importlib.metadata as m, json, sys\n"
+            "out = {}\n"
+            "for p in sys.argv[1:]:\n"
+            "    try:\n"
+            "        out[p] = m.version(p)\n"
+            "    except m.PackageNotFoundError:\n"
+            "        pass\n"
+            "print(json.dumps(out))\n"
+        )
+        try:
+            found = json.loads(subprocess.run([str(py), "-c", code, *bare], capture_output=True, text=True).stdout)
+        except (OSError, ValueError):
+            found = {}
+    return [f"{p}=={found[p].split('+')[0]}" if p in found else p for p in packages]
+
+
+def _write_http_server_yaml(
+    path: Path,
+    *,
+    state: dict,
+    slug: str,
+    repo_id: str,
+    checkout: str,
+    demo_rel: str,
+    weights: str | None,
+    box: str | None,
+    arch: str | None,
+    hardware: str | None,
+    http: dict,
+    packages: list,
+    commit: str | None,
+) -> None:
+    """A schema-5.1 tt-model.yaml for a demo served by its own HTTP server (tt-model's http-server kind): the
+    hooks' command and ready line, the packages it needs and the mesh it opens; no vLLM engine, adapter or KV
+    settings. Raises ValueError when there is no serve target."""
+    target = _serve_hardware(state, box, arch, hardware, http["mesh"])
+    arch, hardware, mesh_device = target["arch"], target["hardware"], target["mesh_device"]
+    hw_phrase = target["hw_phrase"]
+    lines = [
+        'schema: "5.1"',
+        f"repo: {repo_id}",
+        f"name: {slug}",
+        f"weights: {weights or 'REPLACE/with-base-weights-repo'}",
+        f"kind: {_HTTP_SERVER_KIND}",
+        f"arch: {arch}",
+        "",
+        "source:",
+        f"  tt_metal: {checkout}",
+        "  code:",
+        "    - models/common",
+        *[f"    - {d}" for d in ([d for d in TTT_DIRS if (Path(checkout) / d).is_dir()] or [ttt_dir(checkout)])],
+        f"    - {demo_rel}",
+        '  ubuntu: "22.04"',
+        '  python: "3.12"',
+        "",
+        "runtime:",
+        f"  command: {json.dumps(http['command'])}",
+        f"  ready_line: {json.dumps(http['ready_line'])}",
+        *([f"  packages: {json.dumps(packages)}"] if packages else []),
+        "",
+        "serve:",
+        "  port: 8000",
+        f"  hardware: {hardware}",
+        f"  mesh_device: {mesh_device}",
+        "  env:",
+        f"    ARCH_NAME: {arch}",
+        "",
+        "verify:",
+        f"  - {json.dumps('import ' + http['module'])}",
+        "",
+        "card:",
+        "  description: >",
+        f"    {slug}, brought up and optimized on {hw_phrase}, served by its own HTTP server.",
+        "  performance: >",
+        "    measured on Tenstorrent; see the card.",
+        "  limitations: >",
+        f"    Validated on {hw_phrase}.",
+        f"  architecture: autoport ({slug})",
+        "  status: Experimental community bring-up",
+        "  license:",
+        "    id: apache-2.0",
+    ]
+    if weights:
+        lines.append(f"  base_model: [{weights}]")
+    if commit:
+        lines.append(f"  related: tt-metal commit {commit}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _run_http_server_container(args, state: dict, slug: str, demo_dir, commit: str | None, http: dict) -> int:
+    """Package a demo that declares its own HTTP server (the SERVING_HTTP_* hooks) as tt-model's http-server kind:
+    no vLLM adapter is scaffolded and no engine is installed; `tt serve` runs the demo's server."""
+    import tempfile
+
+    if http.get("problem"):
+        print(f"  [publish-hf] NOT publishing: {http['module']} declares its own HTTP server, but {http['problem']}.")
+        return 2
+    checkout = _checkout_of(demo_dir)
+    demo_rel = Path(demo_dir).resolve().relative_to(checkout).as_posix()
+    packages = _pinned_packages(checkout, http["packages"])
+    print(
+        f"  [publish-hf] {http['module']} serves the model over its own HTTP server: packaging it as tt-model's "
+        f"{_HTTP_SERVER_KIND} kind, `tt serve` runs `{' '.join(http['command'])}` (no vLLM adapter)"
+    )
+    yaml_path = Path(tempfile.mkdtemp(prefix="tt_ttmodel_")) / "tt-model.yaml"
+    try:
+        _write_http_server_yaml(
+            yaml_path,
+            state=state,
+            slug=slug,
+            repo_id=args.repo,
+            checkout=str(checkout),
+            demo_rel=demo_rel,
+            weights=getattr(args, "weights", None),
+            box=getattr(args, "box", None),
+            arch=getattr(args, "arch", None),
+            hardware=getattr(args, "hardware", None),
+            http=http,
+            packages=packages,
+            commit=commit,
+        )
+    except ValueError as exc:
+        print(f"  [publish-hf] {exc}")
+        return 2
+    ttm = getattr(args, "tt_model_bin", None) or "tt-model"
+    out = getattr(args, "out", None) or str(Path.home() / "tt-model-builds")
+    return _package_and_publish(
+        args, state, slug, checkout, demo_dir, yaml_path, ttm, out, True, http["mesh"], http["ready_line"]
+    )
+
+
 def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -> int:
     """Build + push a real v5.1 container bundle via tt-model (exactly like the published TT repos):
     generate tt-model.yaml, then `tt-model package --container` (2.5-4h OCI build) and `tt-model push`."""
-    import subprocess
     import tempfile
+
+    http = _demo_http_server_hooks(demo_dir)
+    if http is not None:
+        return _run_http_server_container(args, state, slug, demo_dir, commit, http)
 
     def _has_submodules(root: Path) -> bool:
         return (Path(root) / "tt_metal/third_party/umd/CMakeLists.txt").is_file()
@@ -3443,6 +3659,14 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
     except ValueError as exc:
         print(f"  [publish-hf] {exc}")
         return 2
+    return _package_and_publish(args, state, slug, checkout, demo_dir, yaml_path, ttm, out, servable, mesh_override)
+
+
+def _package_and_publish(
+    args, state, slug, checkout, demo_dir, yaml_path, ttm, out, servable, mesh_override, ready_line=None
+) -> int:
+    """Validate the written tt-model.yaml, build the container, serve it through the gate, then upload it and
+    finish its card. `ready_line` is the log line an own-HTTP-server package prints once it serves (None for vLLM)."""
     print(f"  [publish-hf] tt-model.yaml -> {yaml_path}")
     print("  " + "-" * 60)
     for ln in yaml_path.read_text().splitlines():
@@ -3586,25 +3810,27 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
     if served:
         _upload_card_section(args, _SERVED_TITLE, _served_card_body(served))
     # Card speed: a package that serves shows what `tt serve` measured above; only one that cannot serve
-    # falls back to the perf test's sweep (a bring-up measurement, run at the model's full depth).
-    if not getattr(args, "no_bench", False):
+    # falls back to the perf test's sweep (a bring-up measurement, run at the model's full depth). An own-HTTP-server
+    # package gets neither: it serves no tokens, so a tokens-per-second sweep does not describe what customers get.
+    if not getattr(args, "no_bench", False) and ready_line is None:
         cfg = state.get("config") or {}
         if served:
             py = str(Path(checkout) / "python_env" / "bin" / "python")
             _enrich_card_with_accuracy(args, checkout, Path(demo_dir), py, cfg.get("pcc_test"))
         else:
             _enrich_card_with_benchmarks(args, slug, checkout, demo_dir, cfg.get("perf_test"), cfg.get("pcc_test"))
-    _verify_published_package(args, slug, servable)
+    _verify_published_package(args, slug, servable, ready_line)
     return 0
 
 
 _VERIFY_TITLE = "Published-package verification"
 
 
-def _verify_published_package(args, slug: str, servable: bool) -> None:
+def _verify_published_package(args, slug: str, servable: bool, ready_line: str | None = None) -> None:
     """Pull THE JUST-PUBLISHED package back and run its own quickstart, so the page is proven, not
     asserted. `tt model pull` must succeed; `tt serve` must then reach either `Application startup
-    complete` (a servable package) or the documented scaffold stop (`initialize_vllm_model` missing)
+    complete` (a servable package; `ready_line` for one that serves through its own HTTP server) or the
+    documented scaffold stop (`initialize_vllm_model` missing)
     for a not-yet-servable one. The VERIFIED outcome is written into the card and printed; a result
     that CONTRADICTS the card's serve claim is flagged loudly. Best-effort: skips (the publish
     stands) when the `tt` CLI or docker is absent, and never raises."""
@@ -3656,6 +3882,9 @@ def _verify_published_package(args, slug: str, servable: bool) -> None:
             if cname:
                 r = subprocess.run([docker, "logs", cname], capture_output=True, text=True)
                 low = ((r.stdout or "") + (r.stderr or "")).lower()
+                if ready_line and ready_line.lower() in low:
+                    outcome, detail = "ready", ready_line
+                    break
                 if "application startup complete" in low:
                     eager = _eager_serve_lines((r.stdout or "") + (r.stderr or ""))
                     if eager:
@@ -3690,7 +3919,7 @@ def _verify_published_package(args, slug: str, servable: bool) -> None:
     if not pull_ok:
         verdict = "FAIL (the published package did not pull)"
     elif servable and outcome == "ready":
-        verdict = "PASS (pulled + served: Application startup complete)"
+        verdict = f"PASS (pulled + served: {detail})"
     elif outcome == "eager":
         verdict = f"MISMATCH (served, but decodes without its trace -- several times slower: {detail})"
     elif (not servable) and outcome == "scaffold_stop":
