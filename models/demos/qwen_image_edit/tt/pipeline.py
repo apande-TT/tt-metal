@@ -136,8 +136,8 @@ def bmm_config_2d(p, q, transpose_b=False):
         batch *= d
     grid = q.device().compute_with_storage_grid_size()
     # (K up to 32 tiles: the K-stacked exact-lane QK^T, 8 lanes x 128, takes it too -- a narrower K block keeps its
-    # 3 x 38-tile blocks within L1)
-    if kt > 32 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
+    # 3 x 38-tile blocks within L1; and up to 64: the unguarded QK^T's lanes + trailing limbs, 8 x 128 + 5 x 128)
+    if kt > 64 or batch > 8 or mt < grid.y or nt < 4 * grid.x:
         return None
     key = (mt, kt, nt, grid.x, grid.y)
     if key not in _BMM_2D:
