@@ -61,6 +61,35 @@ def _current_repo_id(repo_id: str, token: str | None) -> str:
         return repo_id
 
 
+def _upstream_card_terms(weights: str | None, token: str | None) -> dict:
+    """The base model's licence and pipeline tag as its HF card states them. The package inherits both, so they are
+    read from upstream, not assumed. Empty when there is no base model or HF cannot be reached."""
+    if not weights:
+        return {}
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi(token=token).model_info(weights)
+    except Exception:  # noqa: BLE001
+        return {}
+    card = info.card_data or {}
+    terms = {k: card.get(k) for k in ("license", "license_name", "license_link")}
+    terms["pipeline_tag"] = info.pipeline_tag or card.get("pipeline_tag")
+    return {k: v for k, v in terms.items() if isinstance(v, str) and v}
+
+
+def _card_terms_lines(terms: dict, default_tag: str | None) -> list:
+    """tt-model.yaml's card licence and pipeline-tag lines: upstream's terms, apache-2.0 when upstream states no
+    licence, and ``default_tag`` when it names no pipeline."""
+    lines = ["  license:", f"    id: {terms.get('license') or 'apache-2.0'}"]
+    if terms.get("license") == "other":
+        lines += [
+            f"    {k}: {json.dumps(terms[f'license_{k}'])}" for k in ("name", "link") if terms.get(f"license_{k}")
+        ]
+    tag = terms.get("pipeline_tag") or default_tag
+    return lines + ([f"  pipeline_tag: {tag}"] if tag else [])
+
+
 # box (planner) -> (arch, hardware, mesh_device) for the tt-model.yaml serve block. hardware and
 # mesh_device must be values the vLLM plugin's closed table accepts; override with --hardware/--mesh.
 _BOX_TARGET = {
@@ -367,6 +396,7 @@ def _write_tt_model_yaml(
     vllm_path: str | None = None,
     plugin_path: str | None = None,
     overrides: list[str] | None = None,
+    card_terms: dict | None = None,
 ) -> None:
     """Emit a schema-5.1 tt-model.yaml describing how to build+serve this optimized model as a
     v5.1 container package. Fields the run can't provide (the vLLM adapter dir, plugin) are stated
@@ -492,9 +522,7 @@ def _write_tt_model_yaml(
         f"    Validated on {hw_phrase}.",
         f"  architecture: autoport ({slug})",
         f"  status: Experimental community bring-up",
-        "  license:",
-        "    id: apache-2.0",
-        "  pipeline_tag: text-generation",
+        *_card_terms_lines(card_terms or {}, "text-generation"),
     ]
     if weights:
         lines.append(f"  base_model: [{weights}]")
@@ -2906,9 +2934,11 @@ def _served_headline(served: dict, perf_hw: str) -> str:
     """The card's one-line speed from the serve gate's rows: what `tt serve` measured on this package."""
     rows = sorted(served["rows"], key=lambda r: r[0], reverse=True)
     parts = [
-        f"{per_user:.1f} tok/s/user with 1 user"
-        if users == 1
-        else f"{per_user:.1f} tok/s/user with {users} users at once ({total:,.0f} tok/s total)"
+        (
+            f"{per_user:.1f} tok/s/user with 1 user"
+            if users == 1
+            else f"{per_user:.1f} tok/s/user with {users} users at once ({total:,.0f} tok/s total)"
+        )
         for users, _isl, _osl, _ttft, _tpot, per_user, total in rows
     ]
     _u, isl, osl, *_ = rows[0]
@@ -3338,6 +3368,7 @@ def _write_http_server_yaml(
     http: dict,
     packages: list,
     commit: str | None,
+    card_terms: dict | None = None,
 ) -> None:
     """A schema-5.1 tt-model.yaml for a demo served by its own HTTP server (tt-model's http-server kind): the
     hooks' command and ready line, the packages it needs and the mesh it opens; no vLLM engine, adapter or KV
@@ -3386,8 +3417,7 @@ def _write_http_server_yaml(
         f"    Validated on {hw_phrase}.",
         f"  architecture: autoport ({slug})",
         "  status: Experimental community bring-up",
-        "  license:",
-        "    id: apache-2.0",
+        *_card_terms_lines(card_terms or {}, None),
     ]
     if weights:
         lines.append(f"  base_model: [{weights}]")
@@ -3427,6 +3457,7 @@ def _run_http_server_container(args, state: dict, slug: str, demo_dir, commit: s
             http=http,
             packages=packages,
             commit=commit,
+            card_terms=_upstream_card_terms(getattr(args, "weights", None), _hf_token(args)),
         )
     except ValueError as exc:
         print(f"  [publish-hf] {exc}")
@@ -3655,6 +3686,7 @@ def _run_container(args, state: dict, slug: str, demo_dir, commit: str | None) -
             vllm_path=getattr(args, "vllm_path", None),
             plugin_path=getattr(args, "plugin_path", None),
             overrides=overrides,
+            card_terms=_upstream_card_terms(getattr(args, "weights", None), _hf_token(args)),
         )
     except ValueError as exc:
         print(f"  [publish-hf] {exc}")
