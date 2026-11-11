@@ -26,7 +26,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs.token_embed import TtToken
 
 # PCC-bounded partial: the layer slots whose exact linears run their input-lane products at LOW_LANE_FIDELITY (slot i
 # = layer i, and layer n/2 + i on row 1 when row-staged); the rest keep the default
-LOW_LANE_SLOTS = frozenset(range(8, 14))
+LOW_LANE_SLOTS = frozenset(range(4, 14))
 LOW_LANE_FIDELITY = ttnn.MathFidelity.HiFi3
 
 
