@@ -369,9 +369,14 @@ class TtQwenImageEditPipeline:
     def vae_encode(self, up):
         # (its 1x1 shortcut linears run the text encoder's exact split_linear: their narrow 96 -> 192 products
         # take linear_program_config's 1D full-grid config, and the bit-identical fused hooks apply to them too)
+        # (and the precise convs' exact-lane sums without their vote: no plain / negated conv runs, no vote tail)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
+        ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
+            _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._fused_tail(
+            exact_only=True
+        ):
             return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):
@@ -507,9 +512,14 @@ class TtQwenImageEditPipeline:
         h, w = up.latent_hw
         # (the encoder's bit-identical hooks: the precise convs' bf16 rounding in one pass, the shortcut linears'
         # small-weight kernel and fused product hooks)
+        # (and the precise convs' exact-lane sums without their vote: no plain / negated conv runs, no vote tail)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
+        ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
+            _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._fused_tail(
+            exact_only=True
+        ):
             return self.vae.decode(latents, h, w)
 
     # ---- the chained forward -------------------------------------------------------------------------
