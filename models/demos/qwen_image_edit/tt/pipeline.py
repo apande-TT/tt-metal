@@ -356,7 +356,17 @@ class TtQwenImageEditPipeline:
             _te_attention, "B_LANE_KSTACK", True
         ), self._hook(_vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None), self._hook(
             _te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None
-        ), self._fused_tail(), self._encoder_extras():
+        ), self._fused_tail(), self._encoder_extras(), self._hook(
+            # (and its QK^T as the denoiser's ONE unguarded K-stacked product -- trailing limbs along K, no dense check
+            # product, no guard tail -- at the encoders' HiFi4; the LM's stays guarded: with it the e2e PCC is 0.9858)
+            _te_attention,
+            "QK_NO_GUARD",
+            True,
+        ), self._hook(
+            _te_attention, "REST_KCAT", True
+        ), self._hook(
+            _te_attention, "QK_NO_GUARD_HIFI4", True
+        ):
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
