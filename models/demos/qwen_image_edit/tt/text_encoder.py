@@ -149,6 +149,7 @@ class TtQwenTextEncoder:
         _te_attention.BMM_SPLIT_M = True
         # as one product over the limbs concatenated along K ([ah | ah | al] @ [bh ; bl ; bh]), not three + two adds
         _te_attention.BMM_CONCAT_K = True
+        _te_attention.BMM_CONCAT_L1_BYTES = 9 * 1024 * 1024  # its stacked operands (Q side 8.3 MB) in L1
         # and P @ V rather as one C++ limb_bmm program (limb_bmm.fused_limb_bmm, full grid) where it fits
         _te_attention.LIMB_BMM_FN = lambda ah, al, bh, bl, k_tiles=None: fused_limb_bmm(
             ah, al, bh, bl, ttnn.DRAM_MEMORY_CONFIG, k_tiles=k_tiles
