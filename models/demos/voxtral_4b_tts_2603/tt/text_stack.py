@@ -402,6 +402,11 @@ class TextStack:
         batch = int(ids.shape[0])
         real = int(ids.shape[-1])
         start = int((ids == ids[:1]).all(dim=0).long().cumprod(0).sum())
+        # The tail always holds the text body and what follows it, so rows that repeat one text
+        # still split at the tuned shape instead of falling back to the whole-prompt prefill.
+        body = (ids[0] == common._NEXT_AUDIO_TEXT_ID).nonzero().flatten()
+        if body.numel():
+            start = min(start, int(body[0]) + 1)
         tail = real - start
         tail_slots = _tile_ceil(tail)
         rows = _tile_ceil(start)
@@ -475,6 +480,8 @@ class TextStack:
                     )
                     for t in (cos, sin)
                 ),
+                # The host copy a padded batch closes its pad columns in (`_split_pad_masks`).
+                "mask_host": mask,
                 # SDPA re-reads the whole mask for every one of the 32 heads; only 0 and -inf are in
                 # it, which bfloat4_b holds exactly, at 576 B a tile instead of 2048.
                 "mask": ttnn.from_torch(
@@ -515,7 +522,7 @@ class TextStack:
         real_len = seq if real_len is None else int(real_len)
         split = voice.get("prefix")
         if split is not None and position_ids_tt is None and split["real"] == real_len:
-            return self._prefill_split(input_ids_tt, split, need_hidden)
+            return self._prefill_split(input_ids_tt, split, need_hidden, pad_mask=pad_mask)
         padded = _tile_ceil(seq)
         if padded != seq:
             # The same tile-aligned tail `prefill` adds: causal attention hides it and `real_len`
@@ -687,12 +694,34 @@ class TextStack:
         ttnn.deallocate(kept)
         return voiced
 
-    def _prefill_split(self, input_ids_tt, split, need_hidden):
+    def _split_pad_masks(self, split, pad_mask, batch):
+        """The split prefill's masks with every row's pad columns closed, and decode's pad columns.
+
+        A pad is always in the tail: rows that shared a pad column would be identical up to the
+        suffix, and identical rows stage no split. Tail position i of sample b is compact column
+        `rows + b * tail + i` of the prefill mask and KV slot `start + i + gap` in decode.
+        """
+        rows, start, tail, real = split["rows"], split["start"], split["tail"], split["real"]
+        pm = pad_mask.to(torch.bool)[:, :real]
+        if int(pm.shape[0]) != batch or bool(pm[:, :start].any()):
+            raise ValueError(f"pad_mask {tuple(pm.shape)} does not fit the staged split (batch {batch}, start {start})")
+        mask = split["mask_host"].clone()
+        mask[..., rows + torch.nonzero(pm[:, start:].reshape(-1)).flatten()] = float("-inf")
+        bf4 = dict(dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=self.device)
+        prefix_mask = ttnn.from_torch(mask.to(torch.bfloat16).contiguous(), **bf4)
+        mask_last = ttnn.from_torch(mask[:, :, tail - 1 :: tail].to(torch.bfloat16).contiguous(), **bf4)
+        padcol = torch.zeros(batch, int(self.kv_capacity), dtype=torch.float32)
+        padcol[:, start + split["gap"] : real + split["gap"]].masked_fill_(pm[:, start:], -1e9)
+        pad_cols = ttnn.from_torch(padcol, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+        return prefix_mask, mask_last, pad_cols
+
+    def _prefill_split(self, input_ids_tt, split, need_hidden, pad_mask=None):
         """The voiced prefill with the shared prefix run ONCE -- see `_stage_prefix` for the layout.
 
         Every attention layer is called twice: "stash" (row 0's P prefix rows at batch 1) keeps its
         post-RoPE k/v, and "extend" (the T tail rows at the full batch) puts that k/v in front of
-        its own for every row and seeds the cache with the P + T slots.
+        its own for every row and seeds the cache with the P + T slots. A `pad_mask` with pads in it
+        closes them for the tail's prefill and for every decode step (`_split_pad_masks`).
         """
         batch = int(input_ids_tt.shape[0])
         rows, start, tail, real = split["rows"], split["start"], split["tail"], split["real"]
@@ -701,6 +730,10 @@ class TextStack:
         if batch != split["batch"]:
             raise ValueError(f"batch {batch} != the staged compact tail's {split['batch']}")
         self._arm_cache(batch, rows + split["tail_slots"])
+        prefix_mask, mask_last, self._pad_cols = split["mask"], split.get("mask_last"), None
+        padded = pad_mask is not None and bool(pad_mask.any())
+        if padded:
+            prefix_mask, mask_last, self._pad_cols = self._split_pad_masks(split, pad_mask, batch)
         # The prefix chain's linears are SHORT (5 tile rows): the stubs' `_lin` gives them a 1D
         # in0-multicast config with 16-tile K blocks (`_short_cfg`) at their own HiFi4 + float32
         # DEST, where ttnn's default streamed K two tiles at a time (the wide gate/up keeps it).
@@ -721,12 +754,12 @@ class TextStack:
         # With no hidden state asked for, the prefix's last block is read only for its k/v (its
         # attention stashes them), and the tail's only for each sample's last row.
         pre_trim = None if need_hidden else _keep_none
-        tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, split.get("mask_last"))
+        tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, mask_last)
         try:
             pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None), trim=pre_trim)
             for block in self.blocks:
                 block.kv["prefix_phase"] = "extend"
-                block.kv["prefix_mask"] = split["mask"]
+                block.kv["prefix_mask"] = prefix_mask
                 block.kv["prefix_compact"] = (batch, tail, split["tail_slots"])
                 block.kv["tail_fill"] = split["tail_fill"]
             tail_out = self._run_chain(tail_in, split["rope_tail"], trim=tail_trim)
@@ -740,6 +773,9 @@ class TextStack:
                 block.kv["slot_offset"] = split["gap"]
             ttnn.deallocate(pre_in)
             ttnn.deallocate(tail_in)
+            if padded:
+                ttnn.deallocate(prefix_mask)
+                ttnn.deallocate(mask_last)
         self.filled = real
         self._slot_gap = split["gap"]
         self._slot_mask = split["slot_mask"]

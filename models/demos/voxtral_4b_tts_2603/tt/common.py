@@ -304,8 +304,9 @@ def build_voice_prompt(
 
     Every row carries the same voice, so the placeholder block is the same width on each and the
     batch stays rectangular. With `pad=False` the text bodies must already tokenize to one common
-    width (the graduated, unpadded batch). With `pad=True` a RAGGED batch is right-padded: each
-    body is extended to the batch's max body width with `_PAD_ID`, and the pad columns are reported
+    width (the graduated, unpadded batch). With `pad=True` a RAGGED batch is padded: each body
+    gets `_PAD_ID`s in front of its text up to the batch's max body width (in front, so the text,
+    the suffix and the generated audio keep contiguous positions), and the pad columns are reported
     through `pad_mask` so the prefill/decode attention masks can close them -- so a pad token is
     never attended and its id is irrelevant. When `return_pad_mask=True` a 4th value `pad_mask
     [B, S]` (True on the padded body columns of the full prompt) is appended to the tuple.
@@ -346,10 +347,10 @@ def build_voice_prompt(
     rows, pads = [], []
     for body in bodies:
         npad = width - len(body)
-        padded_body = list(body) + [_PAD_ID] * npad
+        padded_body = [_PAD_ID] * npad + list(body)
         rows.append(prefix + padded_body + suffix)
-        # pad columns live at the END of the body region, [body_start + len(body), body_start + width)
-        pad_row = [False] * (body_start + len(body)) + [True] * npad + [False] * len(suffix)
+        # pad columns open the body region, [body_start, body_start + npad)
+        pad_row = [False] * body_start + [True] * npad + [False] * (len(body) + len(suffix))
         pads.append(pad_row)
     input_ids = torch.tensor(rows, dtype=torch.long)
     audio_mask = input_ids == _AUDIO_ID

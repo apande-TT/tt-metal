@@ -232,6 +232,7 @@ class VoxtralTTSPipeline:
         collect=False,
         voice=None,
         pad_mask=None,
+        live_rows=None,
     ):
         """THE REAL TASK: tokenized text -> a 24 kHz waveform, all on device.
 
@@ -244,7 +245,8 @@ class VoxtralTTSPipeline:
         there is no python loop over samples anywhere.
 
         Stops on the model's OWN stop signal (`AudioSpecialTokens.end_audio`, read off the
-        reference) once every row has emitted it, bounded by a derived safety cap.
+        reference) once every row has emitted it, bounded by a derived safety cap. With `live_rows`
+        only the first `live_rows` rows are waited for: the rest fill the batch tile and are discarded.
         """
         if self.text is None or self.acoustic is None or self.vocode is None:
             raise RuntimeError("pipeline was built without the text_to_speech head")
@@ -348,10 +350,18 @@ class VoxtralTTSPipeline:
             # `vocode.audio_token_embedding(codes)` below. Indexing the flag on the host instead
             # (`[0]`, `.to(bool)`) fires `aten.select` / `aten._to_copy` inside the forward.
             live_frames = ttnn.add(live_frames, ttnn.rsub(finished_flag, 1.0))
-            n_finished = int(ttnn.to_torch(ttnn.sum(finished_flag)))
-            if n_finished >= batch:
-                stop_reason = f"every row emitted end_audio (id {self.stop_token_id}) at frame {step}"
-                break
+            if live_rows is None:
+                n_finished = int(ttnn.to_torch(ttnn.sum(finished_flag)))
+                if n_finished >= batch:
+                    stop_reason = f"every row emitted end_audio (id {self.stop_token_id}) at frame {step}"
+                    break
+            else:
+                n_finished = int(ttnn.to_torch(ttnn.sum(ttnn.slice(finished_flag, [0, 0], [live_rows, 1]))))
+                if n_finished >= live_rows:
+                    stop_reason = (
+                        f"the {live_rows} live rows emitted end_audio (id {self.stop_token_id}) at frame {step}"
+                    )
+                    break
             if step + 1 == max_frames:
                 break
 

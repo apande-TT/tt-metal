@@ -12,12 +12,14 @@ The prompt is the model's own speech-request layout with a preset voice (Source 
 `voice_embedding/<id>.pt`) substituted into its `[AUDIO]` placeholders. Decoding stops on the
 model's own `end_audio` token, per row; each WAV is cut at its own row's end.
 """
+
 from __future__ import annotations
 
 import argparse
 import os
 import sys
 
+import torch
 import ttnn
 from models.demos.voxtral_4b_tts_2603.tt import common, pipeline
 
@@ -59,13 +61,25 @@ def main(argv=None):
             texts += [line.strip() for line in handle if line.strip()]
     if not texts:
         texts = list(common.SPEECH_TEXTS[: args.batch])
-    if len(texts) < common.DEFAULT_BATCH:
-        # The decode step runs at the model's batch tile of 32; a shorter request is filled by
-        # repeating its own prompts, and only the requested rows are written out.
-        requested = len(texts)
-        texts = (texts * common.DEFAULT_BATCH)[: common.DEFAULT_BATCH]
-    else:
-        requested = len(texts)
+
+    # One row per <= `width`-token body: the stubs' L1 placement is tuned for the SPEECH_TEXTS body
+    # width, so a longer text is split across rows (joined back in order) and a shorter body is
+    # padded, its pad columns closed by `pad_mask`. The decode step runs at the batch tile of 32; a
+    # shorter batch is filled by repeating its own rows, and only the requested texts are written out.
+    tok = common.load_tokenizer()
+    width = len(tok.encode(common.SPEECH_TEXTS[0], bos=False))
+    bodies, owner = [], []
+    for i, text in enumerate(texts):
+        ids = tok.encode(text, bos=False)
+        for start in range(0, len(ids), width):
+            bodies.append(ids[start : start + width])
+            owner.append(i)
+    if len(bodies) > common.DEFAULT_BATCH:
+        parser.error(f"{len(bodies)} rows of <= {width} tokens; the batch holds {common.DEFAULT_BATCH}")
+    rows = (bodies * common.DEFAULT_BATCH)[: common.DEFAULT_BATCH]
+    # An unpadded batch runs exactly as validated, every row decoded to its own end; a padded one
+    # waits only for the requested rows.
+    padded = any(len(body) < width for body in bodies)
 
     common.use_all_cpu_threads()
     hf_model = common.load_reference_model()
@@ -81,13 +95,15 @@ def main(argv=None):
         num_command_queues=1,
     )
     try:
-        input_ids, audio_mask, voice_embedding = common.build_voice_prompt(texts, args.voice)
+        input_ids, audio_mask, voice_embedding, pad_mask = common.build_voice_prompt(
+            ["x"] * len(rows), args.voice, bodies=rows, pad=True, pad_to=width, return_pad_mask=True
+        )
         pipe = pipeline.build_pipeline(
             device,
             model=hf_model,
             heads=("text_to_speech",),
             layers=args.layers,
-            batch=len(texts),
+            batch=len(rows),
             kv_capacity=pipeline.tts_kv_capacity(input_ids.shape[-1], max_frames),
         )
         voice = pipe.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
@@ -96,25 +112,34 @@ def main(argv=None):
             f"prompt_tokens={input_ids.shape[1]}"
         )
 
-        result = pipe.run_text_to_speech(input_ids=input_ids, max_frames=max_frames, voice=voice)
+        result = pipe.run_text_to_speech(
+            input_ids=input_ids,
+            max_frames=max_frames,
+            voice=voice,
+            pad_mask=pad_mask if padded else None,
+            live_rows=len(bodies) if padded else None,
+        )
         print(f"frames decoded: {result['frames_decoded']}  ({result['stop_reason']})")
 
         os.makedirs(args.out_dir, exist_ok=True)
-        waves = pipeline.trim_to_end(result)
-        for i in range(requested):
+        rows_out = pipeline.trim_to_end(result)
+        waves = [
+            torch.cat([rows_out[r].reshape(-1) for r in range(len(bodies)) if owner[r] == i]) for i in range(len(texts))
+        ]
+        for i, wave in enumerate(waves):
             path = os.path.join(args.out_dir, f"sample_{i:02d}.wav")
-            n = write_wav(path, waves[i], result["sampling_rate"])
+            n = write_wav(path, wave, result["sampling_rate"])
             print(f"  {path}  {n / result['sampling_rate']:.2f} s  <- {texts[i][:60]!r}")
 
         if args.score:
             from models.demos.voxtral_4b_tts_2603.reference import quality
 
-            scores = quality.score(waves[:requested], result["sampling_rate"], texts[:requested])
-            for i in range(requested):
+            scores = quality.score(waves, result["sampling_rate"], texts)
+            for i in range(len(texts)):
                 print(
                     f"  [{i:02d}] WER={scores['wer'][i]:.3f} MOS={scores['mos'][i]:.2f}  {scores['transcripts'][i]!r}"
                 )
-            print(f"corpus WER={scores['corpus_wer']:.4f}  mean MOS={sum(scores['mos']) / requested:.3f}")
+            print(f"corpus WER={scores['corpus_wer']:.4f}  mean MOS={sum(scores['mos']) / len(texts):.3f}")
         return 0
     finally:
         ttnn.close_device(device)
