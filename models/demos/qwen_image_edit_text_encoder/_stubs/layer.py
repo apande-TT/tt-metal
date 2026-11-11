@@ -118,6 +118,30 @@ def mask_k_tiles(mask):
     return per_row.reshape(B, R // 32, 32).max(axis=-1).astype(np.int64).clip(1, nt)
 
 
+# with SOFTMAX_FUSED_EXP: exp(scores - max) written height-sharded in L1 (each core's whole rows; read by the row sum
+# and the divide) instead of L1 interleaved
+SOFTMAX_EXP_SHARDED = False
+
+
+def _height_shard(t):
+    """A height-sharded L1 config of t ([..., R, C] TILE: whole rows per core, the most cores dividing R's tile
+    rows), or None where it does not fit."""
+    dims = [int(d) for d in t.padded_shape]
+    rows, cols = math.prod(dims[:-1]), dims[-1]
+    if rows % 32:
+        return None
+    grid = t.device().compute_with_storage_grid_size()
+    rt = rows // 32
+    n = max(c for c in range(1, min(rt, grid.x * grid.y) + 1) if rt % c == 0)
+    return ttnn.create_sharded_memory_config(
+        (rows // n, cols),
+        ttnn.num_cores_to_corerangeset(n, grid, row_wise=True),
+        ttnn.ShardStrategy.HEIGHT,
+        ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+
 def _t(lin):
     return lin.weight.detach().float().t().contiguous()
 
@@ -340,7 +364,8 @@ class TtTextAttention:
             scores = ttnn.add(ttnn.multiply(scores, self.scale), tt_mask, memory_config=io)
         mx = ttnn.max(scores, dim=-1, keepdim=True)
         if SOFTMAX_FUSED_EXP:
-            e = ttnn.subtract(scores, mx, activations=[ttnn.UnaryOpType.EXP], memory_config=sm)
+            esm = _height_shard(scores) if SOFTMAX_EXP_SHARDED and sm is not None else None
+            e = ttnn.subtract(scores, mx, activations=[ttnn.UnaryOpType.EXP], memory_config=esm or sm)
         else:
             e = ttnn.exp(ttnn.subtract(scores, mx, memory_config=sm), memory_config=sm)
         probs = ttnn.divide(e, ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=cfg), memory_config=io)
