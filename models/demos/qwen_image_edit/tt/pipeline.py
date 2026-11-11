@@ -131,6 +131,10 @@ CFG_BATCH = True
 CFG_PAD_TILED_L1 = True
 
 
+# the hoisted txt_in(txt_norm(.)) of the prompt and the negative embeddings as one call over both (_step_txt_pair)
+TXT_PAIR = True
+
+
 def _replicated(device, t, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(
         t.contiguous(), dtype=dtype, layout=layout, device=device, mesh_mapper=ttnn.ReplicateTensorToMesh(device)
@@ -465,6 +469,25 @@ class QwenImageEditTT:
         """The denoise steps' text input: the prompt embeddings, or their txt_in(txt_norm(.)) when hoisted."""
         return self.transformer.embed_txt(pe) if self.hoist_txt else pe
 
+    def _step_txt_pair(self, pe, neg):
+        """_step_txt of the prompt and the negative embeddings ([B, Lp, C], [B, Ln, C]) as ONE embed_txt over both
+        (the shorter zero-padded to the longer, batched along dim 0, then each sliced back to its own rows): txt_in's
+        weight streamed once on twice the rows instead of twice; txt_norm / txt_in are per row, so the same values."""
+        if not (TXT_PAIR and self.hoist_txt) or neg is None:
+            return self._step_txt(pe), (self._step_txt(neg) if neg is not None else None)
+        (b, lp, c), (bn, ln, cn) = ([int(d) for d in t.shape] for t in (pe, neg))
+        if b != bn or c != cn or len(pe.shape) != 3:
+            return self._step_txt(pe), self._step_txt(neg)
+        L = max(lp, ln)
+        pad = lambda t, n: t if n == L else ttnn.pad(t, [(0, 0), (0, L - n), (0, 0)], 0.0)  # noqa: E731
+        both = ttnn.concat([pad(pe, lp), pad(neg, ln)], dim=0)
+        y = self.transformer.embed_txt(both)
+        ttnn.deallocate(both)
+        e = int(y.shape[-1])
+        out = ttnn.slice(y, [0, 0, 0], [b, lp, e]), ttnn.slice(y, [b, 0, 0], [2 * b, ln, e])
+        ttnn.deallocate(y)
+        return out
+
     def denoise_step(self, p, i, latents, image_latents, pe, neg_pe, rope_c, rope_u, t=None, dt=None):
         """One FlowMatch-Euler step with true CFG on this column's B/dp samples (every tensor here is
         DP-split over mesh axis 1). t / dt default to step i's persistent buffers."""
@@ -573,7 +596,7 @@ class QwenImageEditTT:
         n = p.num_steps if num_steps is None else num_steps
         # denoise: the batch is split over mesh axis 1 (DP), the transformer is TP over axis 0
         pe_l, neg_l, img_lat_l = self.dp_split(pe), self.dp_split(neg_pe), self.dp_split(image_latents)
-        pe_l, neg_l = self._step_txt(pe_l), self._step_txt(neg_l)
+        pe_l, neg_l = self._step_txt_pair(pe_l, neg_l)
         latents = self._denoise_loop(p, n, p.latents_dp, img_lat_l, pe_l, neg_l, rope_c, rope_u, on_step)
         latents = self.dp_gather(latents)  # the whole batch on every chip for the decode
         self.last_latents = latents
@@ -663,8 +686,8 @@ class QwenImageEditTT:
         lat_img = self.vae_encode(p)
         self._ts["denoise"] = {
             "p": p,
-            "pe": self._step_txt(self.dp_split(pe)),  # the step runs on DP-split inputs, as in run_image_edit
-            "neg": self._step_txt(self.dp_split(neg)),
+            # the step runs on DP-split inputs, as in run_image_edit
+            **dict(zip(("pe", "neg"), self._step_txt_pair(self.dp_split(pe), self.dp_split(neg)))),
             "img_lat": self.dp_split(lat_img),
             "rope_c": self.rope(p, pe.shape[1]),  # RoPE tables: shape-dependent constants, pre-uploaded
             "rope_u": self.rope(p, neg.shape[1]),
