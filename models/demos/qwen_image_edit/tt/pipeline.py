@@ -413,6 +413,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_NO_NN", True),
             # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
+            # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
+            (_te_attention, "LINEAR_NO_GUARD", True),
             # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
