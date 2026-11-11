@@ -663,7 +663,13 @@ def split_linear(
         for t in staged:
             ttnn.deallocate(t)
     else:
-        y = LIMB_LINEAR_FN(parts[0], parts[1], w) if LIMB_LINEAR_FN is not None and len(parts) == 2 else None
+        y = None
+        if LIMB_LINEAR_FN is not None and len(parts) == 2:
+            # LIMB_OUT_L1_WITH_BIAS: the product in L1 too when the bias add writes L1 (freed after the add)
+            l1y = LIMB_OUT_L1_WITH_BIAS and bias is not None and bias_out_mem is not None
+            l1y = l1y and bias_out_mem.buffer_type == ttnn.BufferType.L1
+            kw = {"mem": ttnn.L1_MEMORY_CONFIG} if l1y else {}
+            y = LIMB_LINEAR_FN(parts[0], parts[1], w, **kw)
         pc = _block_config(x, w) if y is None and LINEAR_BLOCK and LINEAR_CORE_GRID is not None else None
         kw = dict(program_config=pc) if pc is not None else dict(core_grid=LINEAR_CORE_GRID)
         out_bytes = 4 * math.prod([int(d) for d in x.padded_shape][:-1]) * int(w.padded_shape[-1])
@@ -766,6 +772,9 @@ def _bmm_split_m_config(a, b, transpose_b):
 
 # split_matmul's plain products on _bmm_split_m_config (M split over the grid) instead of BMM_CORE_GRID alone
 BMM_SPLIT_M = False
+# split_linear: LIMB_LINEAR_FN's float32 product written to L1 (LIMB_LINEAR_FN(..., mem=)) when its separate bias add
+# writes L1 (bias_out_mem), and freed after that add
+LIMB_OUT_L1_WITH_BIAS = False
 # BMM_CONCAT_K: each stacked operand ([ah | ah | al], [bh ; bl ; bh]) concatenated into L1 when it takes at most
 # this many bytes (0: the concat's default placement)
 BMM_CONCAT_L1_BYTES = 0
