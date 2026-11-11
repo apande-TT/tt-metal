@@ -993,6 +993,11 @@ def bmm_program_config(p, q, transpose_b=False):
     return _BMM_CONFIGS[key]
 
 
+# split_matmul with b_rep > 1 and no batched kernel: a's b_rep entries per b entry as ONE entry of b_rep x M rows
+# against b's entry (no repeat of b). Off by default; the pipeline's hooks switch it on.
+B_REP_FOLD = False
+
+
 def _repeat_entries(t, rep):
     """[E, 1, R, C] -> [E * rep, 1, R, C]: each entry rep times in a row (entry e of the result is entry e // rep)."""
     e, _, r, c = t.shape
@@ -1025,6 +1030,28 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = BMM_KERNEL(p, q, transpose_b) if b_rep == 1 else BMM_KERNEL(p, q, transpose_b, b_rep=b_rep)
         if y is not None:
             return y
+        if b_rep > 1 and B_REP_FOLD:
+            # a's b_rep consecutive entries share b's entry: view them as ONE entry of b_rep x M rows (a free view for
+            # tile-aligned M) against b's entry itself -- no b_rep-fold copy of b
+            sp, sq = list(p.shape), list(q.shape)
+            if (
+                len(sp) == 4
+                and len(sq) == 4
+                and sp[1] == 1
+                and sq[1] == 1
+                and sp[0] == sq[0] * b_rep
+                and sp[2] % 32 == 0
+            ):
+                pf = ttnn.reshape(p, (sq[0], 1, b_rep * sp[2], sp[3]))
+                yf = ttnn.matmul(
+                    pf,
+                    q,
+                    transpose_b=transpose_b,
+                    compute_kernel_config=cfg,
+                    dtype=ttnn.float32,
+                    program_config=None if BMM_CONFIG is None else BMM_CONFIG(pf, q, transpose_b),
+                )
+                return ttnn.reshape(yf, (sp[0], 1, sp[2], yf.shape[-1]))
         if b_rep > 1:
             ent = reps.get(id(q))
             if ent is None or ent[0] is not q:
