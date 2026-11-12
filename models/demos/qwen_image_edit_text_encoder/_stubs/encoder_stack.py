@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _att
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     SegmentPlan,
     TtVisionAttention,
@@ -139,7 +140,8 @@ class TtVisionMLP:
         # precise: gate/up/product in float32, down projection out in float32 with an exact TP reduce.
         self.precise = False
 
-    def __call__(self, x):
+    def __call__(self, x, resid=None):
+        """down(...)(x), or with resid: resid + down(...)(x) (the block's residual update, see _scattered)."""
         if self.precise:
             cfg = self.compute_cfg
             L = getattr(self, "limbs", 2)
@@ -148,10 +150,16 @@ class TtVisionMLP:
             )
             h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)])
             out = split_linear(h, self.w_down, compute_kernel_config=cfg, limbs=L)
+            if resid is not None and VISION_SCATTER and self.tp >= 4:
+                y = self._scattered(out, resid)
+                if y is not None:
+                    return y
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             # float32 bias (a bf16 operand rounds the float32 sum to bf16)
-            return ttnn.add(out, ttnn.typecast(self.b_down, ttnn.float32)) if self.b_down is not None else out
+            if self.b_down is not None:
+                out = ttnn.add(out, ttnn.typecast(self.b_down, ttnn.float32))
+            return out if resid is None else ttnn.add(resid, out)
         gate = ttnn.linear(x, self.w_gate, bias=self.b_gate, compute_kernel_config=self.compute_cfg)
         up = ttnn.linear(x, self.w_up, bias=self.b_up, compute_kernel_config=self.compute_cfg)
         h = ttnn.multiply(ttnn.silu(gate), up)
@@ -160,7 +168,52 @@ class TtVisionMLP:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
         if self.b_down is not None:
             out = ttnn.add(out, self.b_down)
-        return out
+        return out if resid is None else ttnn.add(resid, _fp32(out))
+
+    def _scattered(self, out, resid):
+        """resid + (exact TP sum of the down partials + bias) with the sum, the bias and the residual add on this
+        chip's 1/tp column slice: an all_to_all hands each chip every partial's slice of its columns (3/4 fewer link
+        bytes than gathering whole partials), SUM_PARTS adds them in the same chip order as exact_all_reduce, the
+        bias and residual adds run 1/tp wide, and the UPDATED RESIDUAL is gathered. Bit-identical per element.
+        None where it does not apply (the caller keeps the exact_all_reduce spelling)."""
+        sum_parts = _att.SUM_PARTS
+        shape = list(out.shape)
+        if sum_parts is None or shape[-1] % (32 * self.tp) or out.layout != ttnn.TILE_LAYOUT:
+            return None
+        if out.dtype != ttnn.float32 or resid.dtype != ttnn.float32 or list(resid.shape) != shape:
+            return None
+        g = ttnn.experimental.all_to_all_async_generic(
+            ttnn.reshape(out, [1] + shape),
+            in_dim=0,
+            out_dim=len(shape),
+            num_links=1,
+            topology=ttnn.Topology.Linear,
+            cluster_axis=1,
+        )
+        part = sum_parts(g, self.tp)
+        ttnn.deallocate(g)
+        if part is None:
+            return None
+        dim = len(shape) - 1
+        if self.b_down is not None:
+            b_s = ttnn.mesh_partition(ttnn.typecast(self.b_down, ttnn.float32), len(self.b_down.shape) - 1, 1)
+            t = ttnn.add(part, b_s)
+            ttnn.deallocate(part)
+            ttnn.deallocate(b_s)
+        else:
+            t = part
+        r_s = ttnn.mesh_partition(resid, dim, 1)
+        y_s = ttnn.add(r_s, t)
+        ttnn.deallocate(r_s)
+        ttnn.deallocate(t)
+        y = ttnn.all_gather(y_s, dim=dim, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+        ttnn.deallocate(y_s)
+        return y
+
+
+# The vision MLP's exact reduce as all_to_all + slice sum, its bias and the block's residual add on the slice, the
+# updated residual gathered (TtVisionMLP._scattered).
+VISION_SCATTER = True
 
 
 class TtVisionBlock:
@@ -176,7 +229,8 @@ class TtVisionBlock:
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
         a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
         x = ttnn.add(x, _fp32(a))
-        return ttnn.add(x, _fp32(self.mlp(cast(self.norm2(x)))))
+        # (the residual add inside the MLP call: on its reduce's column slice when VISION_SCATTER applies)
+        return self.mlp(cast(self.norm2(x)), resid=x)
 
 
 class TtPatchMerger:
