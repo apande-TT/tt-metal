@@ -52,6 +52,7 @@ from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_pretrained_model as _vision_tower
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _dit_ccl
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
@@ -378,7 +379,12 @@ class TtQwenImageEditPipeline:
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
         # (and its MLP's gate / up as ONE column-parallel exact linear: _stubs/layer.py MLP_GATE_UP_FOLD)
         # (slots 4-13's input-lane products at HiFi3: _stubs/v_l_text_model.py LOW_LANE_SLOTS)
-        with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
+        # (and every layer's MLP down projection's input-lane products at HiFi3: _stubs/layer.py DOWN_LANE_FIDELITY)
+        with self._hook(
+            _te_attention, "BMM_KERNEL", self.bmm_kernel
+        ), self._fused_tail(), self._encoder_extras(), self._hook(
+            _te_layer, "DOWN_LANE_FIDELITY", ttnn.MathFidelity.HiFi3
+        ):
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):

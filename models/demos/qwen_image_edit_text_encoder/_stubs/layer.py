@@ -265,6 +265,8 @@ class TtTextAttention:
 # The gate and up projections as ONE column-parallel weight: each chip's [gate shard | up shard] side by side, so the
 # (exact) linear runs its products once at N = 2 x inter / TP instead of twice, and the halves are sliced apart.
 MLP_GATE_UP_FOLD = True
+# Optional math fidelity of the MLP down projection's input-lane products alone (None: the stack's own)
+DOWN_LANE_FIDELITY = None
 
 
 def _gate_up(gate_t, up_t, tp):
@@ -330,7 +332,17 @@ class TtTextMLP:
             else:
                 gate, up = split_linears(x, [self.w_gate, self.w_up], compute_kernel_config=cfg, exact=ex)
             h = ttnn.multiply(gate, up, input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SILU)])
-            out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
+            if DOWN_LANE_FIDELITY is not None:
+                from models.demos.qwen_image_edit_text_encoder._stubs import attention as _att
+
+                prev = _att.INPUT_LANE_FIDELITY
+                _att.INPUT_LANE_FIDELITY = DOWN_LANE_FIDELITY
+                try:
+                    out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
+                finally:
+                    _att.INPUT_LANE_FIDELITY = prev
+            else:
+                out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
             return out
