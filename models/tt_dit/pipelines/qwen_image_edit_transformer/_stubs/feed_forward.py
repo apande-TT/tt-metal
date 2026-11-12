@@ -64,7 +64,12 @@ class TtQwenFeedForward:
             packer_l1_acc=False,
         )
 
-    def __call__(self, hidden_states, **_unused):
+    def __call__(self, hidden_states, resid=None, gate=None, **_unused):
+        """self(x) = the FF output; self(x, resid=r, gate=g) = r + g * FF(x) (the block's gated residual update).
+        For the latter, with SCATTER_RESID and the hierarchical exact reduce, the bias add and the gated update run on
+        this device's 1/n column slice of the reduced output (the same per-element ops, so bit-identical) and the
+        UPDATED RESIDUAL is gathered instead of the FF output: the gather moves the same bytes, and the two
+        full-width float32 passes after it shrink to 1/n."""
         x = hidden_states
         if not isinstance(x, ttnn.Tensor):
             x = _replicated(x.to(torch.float32), self.device, ttnn.bfloat16)
@@ -72,8 +77,11 @@ class TtQwenFeedForward:
             h = ttnn.gelu(_precise.linear(x, self.w1, bias=self.b1), variant=self.variant)
             y = _precise.linear(h, self.w2)
             if self.tp > 1:
+                r = _ccl.all_reduce_scattered(y, self.device) if SCATTER_RESID and resid is not None else None
+                if r is not None:
+                    return self._scattered_residual(r, resid, gate)
                 y = _ccl.all_reduce(y, self.device)
-            return ttnn.add(y, self.b2)
+            return self._residual(ttnn.add(y, self.b2), resid, gate)
         if x.dtype != ttnn.bfloat16:
             x = ttnn.typecast(x, ttnn.bfloat16)
         h = ttnn.linear(x, self.w1, bias=self.b1, dtype=ttnn.float32, compute_kernel_config=self.hifi)
@@ -81,7 +89,30 @@ class TtQwenFeedForward:
         y = ttnn.linear(ttnn.typecast(h, ttnn.bfloat16), self.w2, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
             y = _ccl.all_reduce(y, self.device)
-        return ttnn.add(y, self.b2)
+        return self._residual(ttnn.add(y, self.b2), resid, gate)
+
+    @staticmethod
+    def _residual(y, resid, gate):
+        return y if resid is None else ttnn.addcmul(resid, gate, y)
+
+    def _scattered_residual(self, r, resid, gate):
+        s, ax = r
+        dim = len(s.shape) - 1
+        b_s = ttnn.mesh_partition(self.b2, len(self.b2.shape) - 1, ax)
+        g_s = ttnn.mesh_partition(gate, len(gate.shape) - 1, ax)
+        r_s = ttnn.mesh_partition(resid, len(resid.shape) - 1, ax)
+        yb = ttnn.add(s, b_s)
+        ttnn.deallocate(s)
+        out_s = ttnn.addcmul(r_s, g_s, yb)
+        for t in (yb, r_s, g_s, b_s):
+            ttnn.deallocate(t)
+        out = ttnn.all_gather(out_s, dim=dim, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
+        ttnn.deallocate(out_s)
+        return out
+
+
+# The gated residual update on the reduced output's column slice before the gather (TtQwenFeedForward.__call__ with resid / gate).
+SCATTER_RESID = True
 
 
 def build(device, torch_module=None):
