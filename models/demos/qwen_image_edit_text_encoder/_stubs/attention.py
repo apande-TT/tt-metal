@@ -275,6 +275,15 @@ def split_bf16(x, limbs=2, memory_config=None):
 # deterministic in the data). The position moves when the lane assignment is rotated per 32-group, so
 # the product is formed with three 8-spaced partitions (lane = k%8, (k%8 + g)%8, (k%8 + 3g)%8 for
 # group g) and the elementwise median of the three is taken: a glitch in one is outvoted by two.
+def _f32(t):
+    return t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+
+
+# The vision attention's bias + residual adds on its out-projection column slice before the gather
+# (TtVisionAttention._resid_cols).
+RESID_COLS = True
+
+
 EXACT_LANES = 8
 LANE_PATTERNS = ("strided", "rot1", "rot3")
 _LANE_MASKS = {}
@@ -1452,13 +1461,17 @@ class TtVisionAttention:
             o = ttnn.pad(o, [(0, 0), (0, 0), (0, s_pad - rows), (0, 0)], 0.0)
         return o
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         """x: [N, 1, s_pad, C] replicated (N independent images) -> [N, 1, s_pad, C] (bias included).
-        tt_cos / tt_sin [1, 1, s_pad, D] and tt_mask [1, 1, s_pad, s_pad] broadcast over N."""
+        tt_cos / tt_sin [1, 1, s_pad, D] and tt_mask [1, 1, s_pad, s_pad] broadcast over N.
+        With resid: resid + that (the block's residual update; on the out-projection's column slice, see
+        _resid_cols)."""
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         if self.precise:
-            return self._forward_precise(x, tt_cos, tt_sin, tt_mask)
+            return self._forward_precise(x, tt_cos, tt_sin, tt_mask, resid=resid)
+        if resid is not None:
+            return ttnn.add(resid, _f32(self.forward_padded(x, tt_cos, tt_sin, tt_mask)))
         # column-parallel qkv on local heads: [1, 1, S, 3*hp*D]
         qkv = ttnn.linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=self.compute_cfg)
         loc = hp * D
@@ -1512,7 +1525,7 @@ class TtVisionAttention:
             self._tables_p[key] = (tt_cos, tt_sin, out[0], out[1])  # (the sources kept: their ids stay unique)
         return self._tables_p[key][2:]
 
-    def _forward_precise_padded(self, x, tt_cos, tt_sin, tt_mask):
+    def _forward_precise_padded(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         """_forward_precise with every head's columns zero-padded to Dp (see __init__)."""
         D, Dp, hp = self.head_dim, self.head_dim_pad, self.local_heads
         cfg = self.compute_cfg
@@ -1572,14 +1585,35 @@ class TtVisionAttention:
         if self.tp > 1:
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
             out = split_linear(o, self.wproj_cols_p, compute_kernel_config=cfg, limbs=L)
+            if resid is not None and RESID_COLS:
+                return self._resid_cols(out, resid)
             out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
         else:
             out = split_linear(o, self.wproj_p, compute_kernel_config=cfg, limbs=L)
-        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        out = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        return out if resid is None else ttnn.add(resid, out)
 
-    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
+    def _resid_cols(self, out_s, resid):
+        """resid + (gather(out_s) + bias) with the bias and residual adds on this chip's out-projection column slice
+        out_s (ttnn.mesh_partition cuts the matching slices) and the UPDATED RESIDUAL gathered: the same gather
+        bytes, the two full-width float32 adds 1/tp wide, the same per-element ops (bit-identical)."""
+        dim = len(out_s.shape) - 1
+        b32 = ttnn.typecast(self.bproj, ttnn.float32)
+        b_s = ttnn.mesh_partition(b32, len(b32.shape) - 1, 1)
+        t = ttnn.add(out_s, b_s)
+        ttnn.deallocate(out_s)
+        ttnn.deallocate(b_s)
+        r_s = ttnn.mesh_partition(_f32(resid), dim, 1)
+        y_s = ttnn.add(r_s, t)
+        ttnn.deallocate(r_s)
+        ttnn.deallocate(t)
+        y = ttnn.all_gather(y_s, dim=dim, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+        ttnn.deallocate(y_s)
+        return y
+
+    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         if self.head_pad and self.head_dim % 32:
-            return self._forward_precise_padded(x, tt_cos, tt_sin, tt_mask)
+            return self._forward_precise_padded(x, tt_cos, tt_sin, tt_mask, resid=resid)
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         loc = hp * D
@@ -1622,11 +1656,14 @@ class TtVisionAttention:
             # the heads gathered (exact data movement), this chip's output columns over the whole K, gathered back
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
             out = split_linear(o, self.wproj_cols, compute_kernel_config=cfg, limbs=L)
+            if resid is not None and RESID_COLS:
+                return self._resid_cols(out, resid)
             out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
         else:
             out = split_linear(o, self.wproj, compute_kernel_config=cfg, limbs=L)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)
-        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        out = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        return out if resid is None else ttnn.add(resid, out)
 
     def __call__(self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
         s = hidden_states.shape[0]

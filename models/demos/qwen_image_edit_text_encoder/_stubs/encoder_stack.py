@@ -227,8 +227,8 @@ class TtVisionBlock:
         """x: fp32 residual stream; the branches are accumulated back in fp32. With precise_inputs the
         normalised activations enter the branch matmuls in fp32 instead of being rounded to bf16 first."""
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
-        a = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask)
-        x = ttnn.add(x, _fp32(a))
+        # (the residual adds inside the branch calls: on their column slices before the gathers where TP applies)
+        x = self.attn.forward_padded(cast(self.norm1(x)), tt_cos, tt_sin, tt_mask, resid=x)
         # (the residual add inside the MLP call: on its reduce's column slice when VISION_SCATTER applies)
         return self.mlp(cast(self.norm2(x)), resid=x)
 
