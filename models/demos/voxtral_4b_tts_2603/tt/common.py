@@ -370,18 +370,21 @@ def build_voice_prompt(
     return input_ids, audio_mask, emb
 
 
-def build_mixed_voice_prompt(voices, bodies, model_id: str = HF_MODEL_ID, pad_to: int = None):
+def build_mixed_voice_prompt(voices, bodies, model_id: str = HF_MODEL_ID, pad_to: int = None, voice_slots: int = None):
     """`(input_ids [B, S], pad_mask [B, S] bool, embeddings {voice: [N, hidden]})` for rows of
     DIFFERENT voices (`voices[b]` speaks `bodies[b]`, token ids).
 
     Each row is `build_voice_prompt`'s for its own voice, its body front-padded to `pad_to` (or the
     batch's widest body) as there, and the whole row then front-padded with `_PAD_ID`s to the
-    batch's longest prompt -- so every row's text, suffix and generated audio sit at the same
-    positions and decode keeps one shared position. `pad_mask` is True on both kinds of pad.
+    prompt of a `voice_slots`-token voice (default: the longest preset) -- so every row's text,
+    suffix and generated audio sit at the same positions whatever voices the batch mixes (the
+    text stack's voice bank layout) and decode keeps one shared position. `pad_mask` is True on
+    both kinds of pad.
     """
     if len(voices) != len(bodies):
         raise ValueError(f"{len(voices)} voices for {len(bodies)} bodies")
     width = int(pad_to) if pad_to is not None else max(len(b) for b in bodies)
+    slots = max(available_voices(model_id).values()) if voice_slots is None else int(voice_slots)
     rows, pads, embeddings = [None] * len(bodies), [None] * len(bodies), {}
     for voice in dict.fromkeys(voices):
         members = [b for b, v in enumerate(voices) if v == voice]
@@ -397,7 +400,10 @@ def build_mixed_voice_prompt(voices, bodies, model_id: str = HF_MODEL_ID, pad_to
         embeddings[voice] = emb
         for i, b in enumerate(members):
             rows[b], pads[b] = ids[i], pm[i]
-    seq = max(int(r.shape[0]) for r in rows)
+    # [BOS] [BEGIN_AUDIO] voice [NEXT_AUDIO_TEXT] body [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]
+    seq = slots + 3 + width + 2
+    if max(int(r.shape[0]) for r in rows) > seq:
+        raise ValueError(f"a voice is longer than voice_slots={slots}")
     front = [seq - int(r.shape[0]) for r in rows]
     input_ids = torch.stack([torch.cat([torch.full((n,), _PAD_ID, dtype=r.dtype), r]) for n, r in zip(front, rows)])
     pad_mask = torch.stack([torch.cat([torch.ones(n, dtype=torch.bool), p]) for n, p in zip(front, pads)])

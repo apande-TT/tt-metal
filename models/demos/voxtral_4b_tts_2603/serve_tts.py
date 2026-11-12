@@ -15,10 +15,12 @@ concatenated back in order. A forward stops once its real rows have emitted end_
 rows are not waited for. Every preset voice is served, by one pipeline whose KV cache is sized for
 the longest voice's prompt.
 
-CONCURRENT REQUESTS SHARE A BATCH. One worker thread owns the device and runs every forward; the
+CONCURRENT REQUESTS SHARE A BATCH. The main thread owns the device and runs every forward; the
 HTTP threads only tokenize, queue their chunks and wait. Each forward takes up to 32 queued chunks,
 from as many requests as are waiting and in whatever voices they asked for (each row carries its
-own), so N concurrent requests cost about one batch wall instead of N.
+own), so N concurrent requests cost about one batch wall instead of N. Every prompt layout runs
+once before the server answers, so no request compiles; SIGTERM finishes the running batch, fails
+the queued ones and closes the device.
 
     TT_METAL_HOME=... python -m models.demos.voxtral_4b_tts_2603.serve_tts --port 20000
     curl -s -X POST localhost:20000/v1/audio/speech -d '{"input":"Hello from Tenstorrent."}' -o out.wav
@@ -30,6 +32,7 @@ import argparse
 import collections
 import io
 import json
+import signal
 import threading
 import time
 import wave
@@ -126,10 +129,23 @@ def _chunk_bodies(text: str):
     return [ids[i : i + WIDTH] for i in range(0, len(ids), WIDTH)]
 
 
+def _warmup_batches():
+    """What runs before the server answers, so no request compiles: the tuned one-voice path once per
+    prompt layout the presets bring (it follows the voice's tile-rounded prefix), then one batch of
+    every voice at once, which also builds the voice bank every mixed batch reads."""
+    warm = _chunk_bodies(WARMUP_TEXT)
+    counts = common.available_voices()
+    layouts = {}
+    for voice in [common.DEFAULT_VOICE] + sorted(counts):
+        layouts.setdefault(-(-(counts[voice] + 3) // ttnn.TILE_SIZE), voice)
+    voices = sorted(counts)
+    return [(warm, [voice] * len(warm)) for voice in layouts.values()] + [([warm[0]] * len(voices), voices)]
+
+
 def _run_batch(bodies, voices):
     """ONE batch-32 forward over up to BATCH bodies, `voices[i]` speaking `bodies[i]`; one waveform
     per body, in order. Rows of one voice take the tuned shared-prefix path; mixed voices share the
-    forward too, each voice's prefix run once (`stage_voices`)."""
+    forward too, against the voice bank (`stage_voices`)."""
     nreal = len(bodies)
     chunk = [list(b) for b in bodies] + [list(_STATE["filler"])] * (BATCH - nreal)  # dummy rows -> discarded
     row_voices = list(voices) + [voices[0]] * (BATCH - nreal)
@@ -161,15 +177,22 @@ class _Request:
 
 
 class _Batcher:
-    """The device thread: opens the device, then runs every forward, each over the queued chunks."""
+    """Opens the device and runs every forward, each over the queued chunks, on the thread that calls
+    `run`: the main thread, because tt-metal's chip lock is released at exit by whichever thread
+    exits, and only the thread that took it (the one that opened the device) may release it."""
 
     def __init__(self, device_id: int):
         self._device_id = device_id
         self._cv = threading.Condition()
         self._queue = collections.deque()  # (request, chunk index), in arrival order
-        self.ready = threading.Event()
-        self.init_error = None
-        threading.Thread(target=self._loop, name="voxtral-device", daemon=True).start()
+        self._closing = False
+
+    def stop(self) -> None:
+        """Stop once the batch running now finishes (warm-up too): queued chunks fail, then `run`
+        closes the device and returns. Does not wait; safe from a signal handler."""
+        with self._cv:
+            self._closing = True
+            self._cv.notify_all()
 
     def submit(self, bodies, voice) -> _Request:
         req = _Request(bodies, voice)
@@ -181,29 +204,47 @@ class _Batcher:
     def _take(self):
         """Up to BATCH queued chunks, oldest first, whatever their voices (each row has its own)."""
         with self._cv:
-            while not self._queue:
+            while not self._queue and not self._closing:
                 self._cv.wait()
+            if self._closing:
+                return None
             # Clients that start together arrive over a few hundred ms; let them fill one batch.
             deadline = time.time() + GATHER_S
-            while len(self._queue) < BATCH and time.time() < deadline:
+            while len(self._queue) < BATCH and time.time() < deadline and not self._closing:
                 self._cv.wait(deadline - time.time())
             picked = [self._queue.popleft() for _ in range(min(BATCH, len(self._queue)))]
         return picked
 
-    def _loop(self) -> None:
+    def run(self, on_ready) -> None:
+        """Open the device, warm up, call `on_ready`, then serve until `stop`; the device is closed on the way out."""
         try:
             _init(self._device_id)
             t0 = time.time()
-            warm = _chunk_bodies(WARMUP_TEXT)
-            _run_batch(warm, [common.DEFAULT_VOICE] * len(warm))  # compile + build before serving
+            for bodies, voices in _warmup_batches():
+                if self._closing:
+                    return
+                _run_batch(bodies, voices)  # compile + build before serving
             print(f"[serve_tts] warm-up synthesis done in {time.time() - t0:.1f}s", flush=True)
-        except Exception as e:  # noqa: BLE001
-            self.init_error = e
-            self.ready.set()
-            raise
-        self.ready.set()
+            if not self._closing:
+                on_ready()
+                self._serve()
+        finally:
+            with self._cv:
+                left, self._closing = list(self._queue), True
+                self._queue.clear()
+            for req, _ in left:
+                req.error = req.error or RuntimeError("the server is stopping")
+                req.left -= 1
+                if req.left == 0:
+                    req.done.set()
+            if _STATE.get("device") is not None:
+                ttnn.close_device(_STATE.pop("device"))
+
+    def _serve(self) -> None:
         while True:
             picked = self._take()
+            if picked is None:
+                return
             try:
                 waves = _run_batch([req.bodies[i] for req, i in picked], [req.voice for req, _ in picked])
             except Exception as e:  # noqa: BLE001
@@ -292,16 +333,27 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     print("[serve_tts] loading model + opening device (first start compiles kernels)…", flush=True)
     # ttnn/tt-metal is not thread-safe and the device is bound to the thread that opened it, so the
-    # batcher's thread opens it and runs every forward; the HTTP threads never touch ttnn.
+    # main thread opens it, runs every forward and closes it; the HTTP threads never touch ttnn.
     batcher = _STATE["batcher"] = _Batcher(args.device_id)
-    batcher.ready.wait()
-    if batcher.init_error is not None:
-        raise SystemExit(f"[serve_tts] start-up failed: {batcher.init_error}")
-    print(
-        f"{SERVING_HTTP_READY_LINE} — POST http://{args.host}:{args.port}/v1/audio/speech  body {{'input': '…'}}",
-        flush=True,
-    )
-    _Server((args.host, args.port), _Handler).serve_forever()
+    # `tt model stop` / `docker stop` send SIGTERM, which the container's PID 1 would otherwise ignore
+    # until it is killed, leaving the chip to be reset.
+    signal.signal(signal.SIGTERM, lambda signum, frame: batcher.stop())
+
+    def _on_ready():
+        server = _STATE["server"] = _Server((args.host, args.port), _Handler)
+        threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
+        print(
+            f"{SERVING_HTTP_READY_LINE} — POST http://{args.host}:{args.port}/v1/audio/speech  body {{'input': '…'}}",
+            flush=True,
+        )
+
+    try:
+        batcher.run(_on_ready)
+    finally:
+        if _STATE.get("server") is not None:
+            _STATE["server"].shutdown()
+            _STATE["server"].server_close()
+    print("[serve_tts] stopped: device closed", flush=True)
     return 0
 
 

@@ -283,6 +283,8 @@ class TextStack:
         self._slot_gap = 0
         self._slot_mask = None
         self._pad_cols = None
+        # The voice bank mixed-voice batches attend to (`stage_voices`): its layout, and its device k/v once built.
+        self._bank = None
         # Positions for the decode gather, staged ONCE at build: row p is `[p] * max_batch`, so a
         # step selects its own row with a `ttnn.slice` and the forward makes no host call at all.
         self.max_batch = int(common.DEFAULT_BATCH)
@@ -528,18 +530,20 @@ class TextStack:
             }
         }
 
-    def stage_voices(self, input_ids, row_voices, embeddings):
+    def stage_voices(self, input_ids, row_voices, bank):
         """A batch whose rows carry DIFFERENT voices, staged as persistent device constants.
 
-        `input_ids [B, S]` is each row's own prompt FRONT-padded to one width
-        (`common.build_mixed_voice_prompt`), so every row's text starts at the same column and the
-        decode keeps one shared position; `row_voices[b]` names row b's voice and `embeddings` maps
-        each name to its `[N, 3072]` rows. A causal stack computes a voice's prefix the same for
-        every row carrying it, so `prefill_voiced` runs each distinct voice's prefix ONCE, at batch 1,
-        at its own shifted positions (RoPE only sees distances, so a shift changes nothing), then the
-        compact tail of every row once, against all those prefixes back to back: row b's mask opens
-        its own voice's prefix columns only. Each row's cache gets its own voice's prefix in its
-        first slots; no prefix is shared by every row, so decode reads each row's own copy.
+        `bank` maps EVERY voice a mixed batch may carry to its `[N, 3072]` rows: the voice bank. A
+        causal stack computes a voice's prefix `[BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT]` the
+        same whatever follows it, so the first mixed batch runs each bank voice's prefix ONCE, at
+        batch 1, and keeps its k/v on the device (`_bank_on_device`); every mixed batch then runs only
+        its rows' compact tail, against the whole bank back to back: row b's mask opens its own
+        voice's prefix columns only. The bank pins each voice to fixed positions -- `input_ids [B, S]`
+        has every row FRONT-padded so its text starts right after the longest bank voice's prefix
+        (`common.build_mixed_voice_prompt`) -- so every mix of voices runs the same shapes and
+        compiles nothing new, and decode keeps one shared position. Each row's cache gets its own
+        voice's prefix in its first slots; no prefix is shared by every row, so decode reads each
+        row's own copy.
         """
         import torch
 
@@ -550,27 +554,28 @@ class TextStack:
             raise ValueError(f"{len(row_voices)} row voices for a batch of {batch}")
         if batch != self.max_batch:
             raise ValueError(f"a mixed-voice batch runs at the batch tile {self.max_batch}, not {batch}")
-        groups = []
-        for name in dict.fromkeys(row_voices):
-            members = [b for b, v in enumerate(row_voices) if v == name]
-            emb = embeddings[name]
-            if emb.shape[-1] != self.hidden_size:
-                raise ValueError(f"voice {name!r} embedding is {tuple(emb.shape)}; last dim must be {self.hidden_size}")
-            row = ids[members[0]]
-            where = (row == common._AUDIO_ID).nonzero().flatten()
-            slots = int(where.numel())
-            if slots != int(emb.shape[0]):
-                raise ValueError(f"voice {name!r}: {slots} [AUDIO] placeholders but {emb.shape[0]} embedding rows")
-            first = int(where[0]) - 2  # the row's [BOS]: everything before it is front pad
-            own = slots + 3  # [BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT]
-            if first < 0 or int(row[first + own - 1]) != common._NEXT_AUDIO_TEXT_ID:
-                raise ValueError(f"voice {name!r}: the row is not [BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT] ...")
-            if not bool((ids[members, first : first + own] == row[first : first + own]).all()):
-                raise ValueError(f"voice {name!r}: its rows must carry the same prefix at the same columns")
-            groups.append({"name": name, "members": members, "first": first, "own": own, "rows": _tile_ceil(own), "emb": emb})
-        start = groups[0]["first"] + groups[0]["own"]
-        if any(g["first"] + g["own"] != start for g in groups):
-            raise ValueError("front-pad every row so each row's text starts at the same column")
+        layout = self._bank_layout(bank)
+        start, joined = layout["start"], layout["joined"]
+        row_voice, row_first, row_own = [], [], []
+        for b, name in enumerate(row_voices):
+            v = layout["voices"].get(name)
+            if v is None:
+                raise ValueError(f"voice {name!r} is not in the voice bank")
+            first, own = v["first"], v["own"]
+            if layout["bos"] is None:
+                layout["bos"] = int(ids[b, first])
+            want = torch.tensor(
+                [layout["bos"], common._BEGIN_AUDIO_ID] + [common._AUDIO_ID] * v["n"] + [common._NEXT_AUDIO_TEXT_ID],
+                dtype=ids.dtype,
+            )
+            if not bool((ids[b, first:start] == want).all()):
+                raise ValueError(
+                    f"row {b} ({name!r}) does not carry [BOS] [BEGIN_AUDIO] [AUDIO]*{v['n']} [NEXT_AUDIO_TEXT] "
+                    f"ending at column {start}: front-pad it to the voice bank's layout"
+                )
+            row_voice.append(v["index"])
+            row_first.append(first)
+            row_own.append(own)
         tail = real - start
         tail_slots = _tile_ceil(tail)
         rows = _tile_ceil(start)
@@ -579,41 +584,25 @@ class TextStack:
         gap = rows - start
 
         class _Rows:
-            shape = (1, max(real, max(g["first"] + g["rows"] for g in groups)), 1)
+            shape = (1, real, 1)
 
         cos, sin = (ttnn.to_torch(t).float().reshape(-1, int(t.shape[-1])) for t in self.rotary(_Rows()))
         bf16 = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
-        fp32 = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
         rm = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
-        # The joined prefix k/v: every voice's `rows_g` prefix rows back to back, in `groups` order.
-        offset, lo, hi, fill = 0, torch.zeros(batch, dtype=torch.long), torch.zeros(batch, dtype=torch.long), []
+        # Row b's voice is bank columns [lo, hi); its cache slot j holds that voice's prefix position j,
+        # so slots [own, P) are not its prompt.
+        by_index = {v["index"]: v for v in layout["voices"].values()}
+        lo = torch.tensor([by_index[i]["offset"] for i in row_voice])
+        hi = lo + torch.tensor(row_own)
         padcol = torch.zeros(batch, int(self.kv_capacity), dtype=torch.float32)
-        for g in groups:
-            span, first, own = g["rows"], g["first"], g["own"]
-            keep = torch.ones(1, 1, span, self.hidden_size, dtype=torch.float32)
-            placed = torch.zeros(1, 1, span, self.hidden_size, dtype=torch.float32)
-            keep[0, 0, 2 : own - 1] = 0.0
-            placed[0, 0, 2 : own - 1] = g.pop("emb").to(torch.float32)
-            g["keep"] = ttnn.from_torch(keep, **fp32)
-            g["placed"] = ttnn.from_torch(placed, **fp32)
-            # Positions [first, first + rows_g): the row's own, so its tail sits right after it.
-            # In DRAM until its chain runs (twenty voices' tables would crowd L1).
-            g["rope"] = tuple(ttnn.from_torch(t[first : first + span].reshape(1, 1, span, -1).to(torch.bfloat16).contiguous(), **bf16) for t in (cos, sin))
-            members = torch.tensor(g["members"])
-            lo[members], hi[members] = offset, offset + own
-            # Cache slot j of a row holds its voice's prefix position j: [own, P) is not its prompt.
-            padcol[members, own:rows] = -1e9
-            fill.append(
-                (
-                    offset,
-                    span,
-                    ttnn.from_torch(members.to(torch.int32).reshape(-1, 1).repeat(1, 16).contiguous(), dtype=ttnn.int32, **rm),
-                    ttnn.from_torch(torch.arange(len(g["members"]), dtype=torch.int32), dtype=ttnn.uint32, **rm),
-                    len(g["members"]),
-                )
-            )
-            offset += span
-        joined = offset
+        for b, own in enumerate(row_own):
+            padcol[b, own:rows] = -1e9
+        # The bank row each (row, kv head, cache slot < P) is filled from: the bank viewed as
+        # `[n_kv * joined, D]`, so (b, h) gathers head h's rows from its voice's offset on. Slots past
+        # the voice's own prefix take whatever follows it; `padcol` closes them.
+        slot = torch.arange(rows).reshape(1, 1, -1)
+        head = torch.arange(self.n_kv_heads).reshape(1, -1, 1)
+        bank_index = head * joined + torch.clamp(lo.reshape(-1, 1, 1) + slot, max=joined - 1)
         sample = torch.arange(batch * tail) // tail
         step = torch.arange(batch * tail) % tail
         cols = torch.arange(joined + batch * tail).reshape(1, -1)
@@ -639,8 +628,13 @@ class TextStack:
                 "batch": batch,
                 "gap": gap,
                 "joined": joined,
-                "groups": groups,
-                "fill": {"rows": rows, "fill": fill},
+                "bank": layout["key"],
+                "row_voice": row_voice,
+                "row_first": row_first,
+                "row_own": row_own,
+                "bank_index": ttnn.from_torch(
+                    bank_index.reshape(batch * self.n_kv_heads, rows).to(torch.int32).contiguous(), dtype=ttnn.uint32, **rm
+                ),
                 "tail_fill": (
                     ttnn.from_torch(block.reshape(-1, 1).repeat(1, 16).contiguous(), dtype=ttnn.int32, **rm),
                     ttnn.from_torch(index, dtype=ttnn.uint32, **rm),
@@ -661,6 +655,120 @@ class TextStack:
                 "slot_mask": ttnn.from_torch(slot_mask.to(torch.float32).contiguous(), dtype=ttnn.float32, **rm),
             },
         }
+
+    def _bank_layout(self, bank):
+        """The voice bank's host layout: each voice's prefix is `own = N + 3` positions ending where the
+        longest voice's does (`start`), run over `span = tile_ceil(own)` rows, its k/v at bank rows
+        `[offset, offset + span)`. A bank of other voices replaces the one built."""
+        key = tuple((name, int(emb.shape[0])) for name, emb in bank.items())
+        if self._bank is not None and self._bank["key"] == key:
+            return self._bank
+        for name, emb in bank.items():
+            if emb.dim() != 2 or int(emb.shape[-1]) != self.hidden_size:
+                raise ValueError(f"voice {name!r} embedding is {tuple(emb.shape)}; want [N, {self.hidden_size}]")
+        self._free_bank()
+        start = max(n for _, n in key) + 3
+        voices, offset = {}, 0
+        for name, n in key:
+            own = n + 3
+            voices[name] = {"index": len(voices), "n": n, "own": own, "first": start - own, "span": _tile_ceil(own), "offset": offset}
+            offset += voices[name]["span"]
+        self._bank = {"key": key, "voices": voices, "start": start, "joined": offset, "bos": None, "embeddings": dict(bank), "device": None}
+        return self._bank
+
+    def _bank_on_device(self, bank):
+        """Every bank voice's prefix through the stack ONCE, at batch 1 at its fixed positions; per layer
+        the k/v of all voices back to back (the mixed tail's SDPA reads it whole) and the same as rows
+        (what each row's cache prefix is gathered from), plus each voice's final hidden state. ~0.7 GB
+        of DRAM for the 20 presets."""
+        if bank["device"] is not None:
+            return bank["device"]
+        import torch
+
+        hidden = self.hidden_size
+        tallest = max(v["first"] + v["span"] for v in bank["voices"].values())
+
+        class _Rows:
+            shape = (1, tallest, 1)
+
+        cos, sin = (ttnn.to_torch(t).float().reshape(-1, int(t.shape[-1])) for t in self.rotary(_Rows()))
+        fp32 = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        rm = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+        parts = {id(block): [] for block in self.blocks}
+
+        def collect(block):
+            _stash_in_dram(block)
+            parts[id(block)].append(block.kv.pop("prefix_kv"))
+
+        heads = []
+        for block in self.blocks:
+            block.kv["prefix_phase"] = "stash"
+        try:
+            for name, v in bank["voices"].items():
+                span, own, first = v["span"], v["own"], v["first"]
+                ids = torch.zeros(1, span, dtype=torch.int32)
+                ids[0, :own] = torch.tensor(
+                    [bank["bos"], common._BEGIN_AUDIO_ID] + [common._AUDIO_ID] * v["n"] + [common._NEXT_AUDIO_TEXT_ID]
+                )
+                keep = torch.ones(1, 1, span, hidden, dtype=torch.float32)
+                placed = torch.zeros(1, 1, span, hidden, dtype=torch.float32)
+                keep[0, 0, 2 : own - 1] = 0.0
+                placed[0, 0, 2 : own - 1] = bank["embeddings"][name].to(torch.float32)
+                staged = [
+                    ttnn.from_torch(ids, dtype=ttnn.uint32, **rm),
+                    ttnn.from_torch(keep, **fp32),
+                    ttnn.from_torch(placed, **fp32),
+                ]
+                rope = tuple(
+                    ttnn.from_torch(
+                        t[first : first + span].reshape(1, 1, span, -1).to(torch.bfloat16).contiguous(),
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=self.device,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                    )
+                    for t in (cos, sin)
+                )
+                pre_in = self._voiced(*staged)
+                try:
+                    out = self._run_chain(pre_in, rope, after=collect)
+                finally:
+                    for t in (pre_in, *staged, *rope):
+                        ttnn.deallocate(t)
+                rows_major = ttnn.to_layout(out, ttnn.ROW_MAJOR_LAYOUT)
+                ttnn.deallocate(out)
+                own_rows = ttnn.slice(rows_major, [0, 0, 0, 0], [1, 1, own, hidden])
+                heads.append(ttnn.clone(own_rows, memory_config=ttnn.DRAM_MEMORY_CONFIG))
+                ttnn.deallocate(rows_major)
+        finally:
+            for block in self.blocks:
+                block.kv.pop("prefix_phase", None)
+                block.kv.pop("prefix_kv", None)
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        device = {"k": [], "v": [], "k_rows": [], "v_rows": [], "heads": heads}
+        for block in self.blocks:
+            stash = parts[id(block)]
+            for i, key in ((0, "k"), (1, "v")):
+                own = [p[i] for p in stash]
+                joined = ttnn.concat(own, dim=2, memory_config=dram)
+                for t in own:
+                    ttnn.deallocate(t)
+                device[key].append(joined)
+                # The same k/v as `[n_kv * J, D]` rows, head-major: the table each row's cache prefix
+                # is gathered out of (`_fill_prefix_groups`).
+                n_kv, n_rows, width = (int(joined.shape[d]) for d in (1, 2, 3))
+                device[key + "_rows"].append(
+                    ttnn.reshape(ttnn.to_layout(joined, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram), [n_kv * n_rows, width])
+                )
+        bank["device"] = device
+        return device
+
+    def _free_bank(self):
+        bank, self._bank = self._bank, None
+        device = (bank or {}).get("device") or {}
+        for key in ("k", "v", "k_rows", "v_rows", "heads"):
+            for t in device.get(key, ()):
+                ttnn.deallocate(t)
 
     def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None, need_hidden=True, pad_mask=None):
         """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows, ON DEVICE.
@@ -979,9 +1087,9 @@ class TextStack:
         pm = pad_mask.to(torch.bool)[:, :real]
         if int(pm.shape[0]) != batch:
             raise ValueError(f"pad_mask batch {int(pm.shape[0])} != {batch}")
-        for g in multi["groups"]:
-            if bool(pm[g["members"], g["first"] : g["first"] + g["own"]].any()):
-                raise ValueError(f"voice {g['name']!r}: pad_mask pads its prefix")
+        for b, (first, own) in enumerate(zip(multi["row_first"], multi["row_own"])):
+            if bool(pm[b, first : first + own].any()):
+                raise ValueError(f"row {b}: pad_mask pads its voice prefix")
         text = pm[:, start:]
         if not bool(text.any()):
             return multi["mask"], multi["mask_last"], multi["pad_cols"], False
@@ -996,58 +1104,33 @@ class TextStack:
         return prefix_mask, mask_last, pad_cols, True
 
     def _prefill_multi(self, input_ids_tt, multi, need_hidden, pad_mask=None):
-        """`_prefill_split` for rows of different voices -- see `stage_voices`. Each voice's prefix
-        chain stashes its k/v (in DRAM); every layer's tail attention then reads them all joined."""
+        """`_prefill_split` for rows of different voices -- see `stage_voices`. No prefix runs: every
+        layer's tail attention reads the voice bank's k/v whole, and each row's cache is filled with its
+        own voice's (the stubs' `_fill_prefix_groups`)."""
         batch = int(input_ids_tt.shape[0])
         rows, start, tail, real = multi["rows"], multi["start"], multi["tail"], multi["real"]
         if batch != multi["batch"]:
             raise ValueError(f"batch {batch} != the staged mixed-voice batch's {multi['batch']}")
+        bank = self._bank
+        if bank is None or bank["key"] != multi["bank"]:
+            raise ValueError("the batch was staged against another voice bank: stage it again")
         self._arm_cache(batch, rows + multi["tail_slots"])
+        bank_tt = self._bank_on_device(bank)
         prefix_mask, mask_last, pad_cols, rebuilt = self._multi_pad_masks(multi, pad_mask, batch)
-        stashes = {id(block): [] for block in self.blocks}
-
-        def collect(block):
-            _stash_in_dram(block)
-            stashes[id(block)].append(block.kv.pop("prefix_kv"))
-
-        heads, tail_in = [], None
+        tail_in = None
         try:
-            for block in self.blocks:
-                block.kv["prefix_phase"] = "stash"
-            for g in multi["groups"]:
-                first, span, member = g["first"], g["rows"], g["members"][0]
-                head_ids = ttnn.slice(input_ids_tt, [member, first], [member + 1, min(first + span, real)])
-                if first + span > real:
-                    head_ids = ttnn.pad(head_ids, [(0, 0), (0, first + span - real)], value=0)
-                pre_in = self._voiced(head_ids, g["keep"], g["placed"])
-                rope = tuple(ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG) for t in g["rope"])
-                try:
-                    pre_out = self._run_chain(pre_in, rope, trim=None if need_hidden else _keep_none, after=collect)
-                finally:
-                    ttnn.deallocate(pre_in)
-                    for t in rope:
-                        ttnn.deallocate(t)
-                if need_hidden:
-                    # This voice's rows' hidden state at [0, start): zeros under the front pad.
-                    own = ttnn.slice(ttnn.to_layout(pre_out, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, g["own"], self.hidden_size])
-                    if first:
-                        pad = ttnn.zeros([1, 1, first, self.hidden_size], dtype=own.dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
-                        own = ttnn.concat([pad, own], dim=2)
-                    heads.append(own)
-            for block in self.blocks:
-                parts = stashes[id(block)]
-                block.kv["prefix_kv"] = tuple(
-                    ttnn.concat([p[i] for p in parts], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG) for i in (0, 1)
-                )
-                for p in parts:
-                    for t in p:
-                        ttnn.deallocate(t)
-                parts.clear()
+            for i, block in enumerate(self.blocks):
+                block.kv["prefix_kv"] = (bank_tt["k"][i], bank_tt["v"][i])
                 block.kv["prefix_phase"] = "extend"
                 block.kv["prefix_mask"] = prefix_mask
                 block.kv["prefix_compact"] = (batch, tail, multi["tail_slots"])
                 block.kv["tail_fill"] = multi["tail_fill"]
-                block.kv["prefix_groups"] = multi["fill"]
+                block.kv["prefix_groups"] = {
+                    "rows": rows,
+                    "index": multi["bank_index"],
+                    "k": bank_tt["k_rows"][i],
+                    "v": bank_tt["v_rows"][i],
+                }
             tail_in = self.embed(ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail]))
             tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, mask_last)
             tail_out = self._run_chain(tail_in, multi["rope_tail"], trim=tail_trim)
@@ -1073,8 +1156,15 @@ class TextStack:
             ttnn.reshape(ttnn.slice(per_sample, [0, 0, tail - 1, 0], [batch, 1, tail, self.hidden_size]), [batch, self.hidden_size]),
             ttnn.TILE_LAYOUT,
         )
-        by_row = {b: i for i, g in enumerate(multi["groups"]) for b in g["members"]}
-        head = ttnn.concat([heads[by_row[b]] for b in range(batch)], dim=0)
+        # Each row's hidden state at [0, start): zeros under its front pad, then its voice's prefix.
+        heads = []
+        for v, first in zip(multi["row_voice"], multi["row_first"]):
+            own = bank_tt["heads"][v]
+            if first:
+                pad = ttnn.zeros([1, 1, first, self.hidden_size], dtype=own.dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+                own = ttnn.concat([pad, own], dim=2)
+            heads.append(own)
+        head = ttnn.concat(heads, dim=0)
         out = ttnn.concat([head, per_sample], dim=2)
         return ttnn.to_layout(out, ttnn.TILE_LAYOUT), last
 

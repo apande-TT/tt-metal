@@ -799,29 +799,30 @@ def _seed_split(kv, k, v):
             home = None
         if home is None:
             home = ttnn.zeros(full, dtype=_CACHE_DTYPE, layout=ttnn.TILE_LAYOUT, device=part.tail.device())
-        if _SHARED_PREFIX:
-            # structural: the prefix every user shares stays ONE copy (DRAM, the cache's dtype) -- the C++
-            # decode scores / P@V read their first rows from it (cpp_scores_dec / cpp_pv_dec `prefix`), so it is
-            # never written into all `batch` users' rows; any other cache read fills it in first.
-            narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        else:
-            narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
-        ttnn.deallocate(part.prefix)
         if groups is not None:
-            # Rows of DIFFERENT voices (the text stack's `stage_voices`): no prefix is every row's.
-            _fill_prefix_groups(home, narrow, groups)
-            ttnn.deallocate(narrow)
-        elif _SHARED_PREFIX and cpp_scores_dec.prefix_ok(home, narrow):
-            shared[key] = narrow
-        elif ttl_kv.supports(home, narrow):
-            # The tt-lang seed: each prefix tile row read once and written into every sample's rows.
-            ttl_kv.fill_prefix(home, narrow)
-            ttnn.deallocate(narrow)
+            # Rows of DIFFERENT voices (the text stack's voice bank): no prefix is every row's, and
+            # `part.prefix` is the bank itself, which the next mixed batch reads again.
+            _fill_prefix_groups(home, key, groups, rows_fill)
         else:
-            shared = ttnn.repeat(narrow, ttnn.Shape([batch, 1, 1, 1]))
-            ttnn.deallocate(narrow)
-            ttnn.experimental.paged_fill_cache(home, shared, rows_fill[0], batch_idx_tensor=rows_fill[1])
-            ttnn.deallocate(shared)
+            if _SHARED_PREFIX:
+                # structural: the prefix every user shares stays ONE copy (DRAM, the cache's dtype) -- the C++
+                # decode scores / P@V read their first rows from it (cpp_scores_dec / cpp_pv_dec `prefix`), so it is
+                # never written into all `batch` users' rows; any other cache read fills it in first.
+                narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            else:
+                narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
+            ttnn.deallocate(part.prefix)
+            if _SHARED_PREFIX and cpp_scores_dec.prefix_ok(home, narrow):
+                shared[key] = narrow
+            elif ttl_kv.supports(home, narrow):
+                # The tt-lang seed: each prefix tile row read once and written into every sample's rows.
+                ttl_kv.fill_prefix(home, narrow)
+                ttnn.deallocate(narrow)
+            else:
+                rep = ttnn.repeat(narrow, ttnn.Shape([batch, 1, 1, 1]))
+                ttnn.deallocate(narrow)
+                ttnn.experimental.paged_fill_cache(home, rep, rows_fill[0], batch_idx_tensor=rows_fill[1])
+                ttnn.deallocate(rep)
         tile_rows = ttnn.reshape(home, [batch * heads * capacity // tile, 1, tile, width])
         ttnn.experimental.paged_fill_cache(tile_rows, part.tail, tail_fill[0], batch_idx_tensor=tail_fill[1])
         ttnn.deallocate(part.tail)
@@ -842,13 +843,17 @@ def _seed_split(kv, k, v):
 _SHARED_PREFIX = os.environ.get("VOXTRAL_SHARED_PREFIX", "1") == "1"
 
 
-def _fill_prefix_groups(home, prefix, groups):
-    """Each voice's prefix into ITS rows' first slots. `prefix` is every voice's back to back and
-    `groups["fill"]` one `(offset, rows, page_table, batch_idx, count)` per voice."""
-    heads, width = int(prefix.shape[1]), int(prefix.shape[3])
-    for offset, rows, table, index, count in groups["fill"]:
-        own = ttnn.slice(prefix, [0, 0, offset, 0], [1, heads, offset + rows, width])
-        ttnn.experimental.paged_fill_cache(home, ttnn.repeat(own, ttnn.Shape([count, 1, 1, 1])), table, batch_idx_tensor=index)
+def _fill_prefix_groups(home, key, groups, rows_fill):
+    """Each row's own voice prefix into its first `groups["rows"]` cache slots, gathered out of the
+    voice bank: `groups[key]` is the bank's k or v as `[n_kv * J, D]` rows and `groups["index"]`
+    `[B * n_kv, rows]` the bank row each (row, head, slot) takes. One gather and one fill per layer,
+    the same shapes for every mix of voices."""
+    batch, heads, width = int(home.shape[0]), int(home.shape[1]), int(home.shape[3])
+    gathered = ttnn.embedding(groups["index"], groups[key], layout=ttnn.TILE_LAYOUT)
+    prefix = ttnn.typecast(ttnn.reshape(gathered, [batch, heads, groups["rows"], width]), _CACHE_DTYPE)
+    ttnn.deallocate(gathered)
+    ttnn.experimental.paged_fill_cache(home, prefix, rows_fill[0], batch_idx_tensor=rows_fill[1])
+    ttnn.deallocate(prefix)
 
 
 # The joined prefix + tail k/v SDPA streams sits in L1 up to one voice's prefix; several voices'

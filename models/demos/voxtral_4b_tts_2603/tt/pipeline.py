@@ -225,15 +225,18 @@ class VoxtralTTSPipeline:
             _fill_rows(audio_mask, self.rows), voice_embedding, input_ids=_fill_rows(input_ids, self.rows)
         )
 
-    def stage_voices(self, input_ids, row_voices, embeddings):
-        """`stage_voice` for rows of DIFFERENT voices (`common.build_mixed_voice_prompt`'s output):
-        each voice's prefix runs once and one tail pass serves every row. One voice is `stage_voice`."""
+    def stage_voices(self, input_ids, row_voices, embeddings=None):
+        """`stage_voice` for rows of DIFFERENT voices (`common.build_mixed_voice_prompt`'s output),
+        against the voice bank of every preset (`embeddings` adds voices to it): one tail pass serves
+        every row, whatever the mix. Rows of one voice that are not front-padded are `stage_voice`."""
         row_voices = list(row_voices)
-        if len(set(row_voices)) == 1:
+        bank = {name: common.load_voice_embedding(name) for name in common.available_voices()}
+        bank.update(embeddings or {})
+        if len(set(row_voices)) == 1 and bool((input_ids[:, 1] == common._BEGIN_AUDIO_ID).all()):
             (name,) = set(row_voices)
-            return self.stage_voice(input_ids == common._AUDIO_ID, embeddings[name], input_ids=input_ids)
+            return self.stage_voice(input_ids == common._AUDIO_ID, bank[name], input_ids=input_ids)
         filled = [row_voices[i % len(row_voices)] for i in range(max(self.rows, len(row_voices)))]
-        return self.text.stage_voices(_fill_rows(input_ids, self.rows), filled, embeddings)
+        return self.text.stage_voices(_fill_rows(input_ids, self.rows), filled, bank)
 
     def noise(self, max_frames: int, batch=None, seed: int = 0):
         """The flow-matching sampler's noise input, drawn ONCE on the host.
