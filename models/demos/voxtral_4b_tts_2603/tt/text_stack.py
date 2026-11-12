@@ -80,6 +80,11 @@ MIN_LAYERS = 4
 DEFAULT_PREFILL_CAPACITY = 64
 DEFAULT_DECODE_HEADROOM = 64
 
+# The tallest shared prefix whose stashed k/v stays in L1 across the whole stack. Past it (the
+# 208-218-token preset voices tile-round to 224), the 26 layers' stash leaves the fused SwiGLU's
+# whole-activation buffer no room, so each layer's stash moves to DRAM right after the layer.
+L1_STASH_ROWS = 192
+
 # The nine stubs this module owns, as the section's own contract.
 OWNED_STUBS = (
     "token_embed",
@@ -146,6 +151,22 @@ def _resid_memory(h):
     for d in list(h.shape)[:-1]:
         rows *= int(d)
     return ttnn.L1_MEMORY_CONFIG if rows <= 640 else None
+
+
+def _stash_in_dram(block):
+    """Move the prefix k/v a block stashed for the tail (`prefix_kv`) from L1 to DRAM."""
+    kv = block.kv or {}
+    stash = kv.get("prefix_kv")
+    if not stash:
+        return
+    moved = []
+    for t in stash:
+        if t is not None and t.memory_config().buffer_type == ttnn.BufferType.L1:
+            dram = ttnn.to_memory_config(t, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(t)
+            t = dram
+        moved.append(t)
+    kv["prefix_kv"] = tuple(moved)
 
 
 def _row_tile(row):
@@ -507,6 +528,140 @@ class TextStack:
             }
         }
 
+    def stage_voices(self, input_ids, row_voices, embeddings):
+        """A batch whose rows carry DIFFERENT voices, staged as persistent device constants.
+
+        `input_ids [B, S]` is each row's own prompt FRONT-padded to one width
+        (`common.build_mixed_voice_prompt`), so every row's text starts at the same column and the
+        decode keeps one shared position; `row_voices[b]` names row b's voice and `embeddings` maps
+        each name to its `[N, 3072]` rows. A causal stack computes a voice's prefix the same for
+        every row carrying it, so `prefill_voiced` runs each distinct voice's prefix ONCE, at batch 1,
+        at its own shifted positions (RoPE only sees distances, so a shift changes nothing), then the
+        compact tail of every row once, against all those prefixes back to back: row b's mask opens
+        its own voice's prefix columns only. Each row's cache gets its own voice's prefix in its
+        first slots; no prefix is shared by every row, so decode reads each row's own copy.
+        """
+        import torch
+
+        ids = input_ids
+        batch, real = (int(s) for s in ids.shape)
+        tile = ttnn.TILE_SIZE
+        if len(row_voices) != batch:
+            raise ValueError(f"{len(row_voices)} row voices for a batch of {batch}")
+        if batch != self.max_batch:
+            raise ValueError(f"a mixed-voice batch runs at the batch tile {self.max_batch}, not {batch}")
+        groups = []
+        for name in dict.fromkeys(row_voices):
+            members = [b for b, v in enumerate(row_voices) if v == name]
+            emb = embeddings[name]
+            if emb.shape[-1] != self.hidden_size:
+                raise ValueError(f"voice {name!r} embedding is {tuple(emb.shape)}; last dim must be {self.hidden_size}")
+            row = ids[members[0]]
+            where = (row == common._AUDIO_ID).nonzero().flatten()
+            slots = int(where.numel())
+            if slots != int(emb.shape[0]):
+                raise ValueError(f"voice {name!r}: {slots} [AUDIO] placeholders but {emb.shape[0]} embedding rows")
+            first = int(where[0]) - 2  # the row's [BOS]: everything before it is front pad
+            own = slots + 3  # [BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT]
+            if first < 0 or int(row[first + own - 1]) != common._NEXT_AUDIO_TEXT_ID:
+                raise ValueError(f"voice {name!r}: the row is not [BOS] [BEGIN_AUDIO] [AUDIO]*N [NEXT_AUDIO_TEXT] ...")
+            if not bool((ids[members, first : first + own] == row[first : first + own]).all()):
+                raise ValueError(f"voice {name!r}: its rows must carry the same prefix at the same columns")
+            groups.append({"name": name, "members": members, "first": first, "own": own, "rows": _tile_ceil(own), "emb": emb})
+        start = groups[0]["first"] + groups[0]["own"]
+        if any(g["first"] + g["own"] != start for g in groups):
+            raise ValueError("front-pad every row so each row's text starts at the same column")
+        tail = real - start
+        tail_slots = _tile_ceil(tail)
+        rows = _tile_ceil(start)
+        if tail < 1 or (batch * tail) % tile or rows + tail_slots > self.kv_capacity - 1:
+            raise ValueError(f"a {real}-token mixed-voice prompt does not fit the compact tail / KV capacity")
+        gap = rows - start
+
+        class _Rows:
+            shape = (1, max(real, max(g["first"] + g["rows"] for g in groups)), 1)
+
+        cos, sin = (ttnn.to_torch(t).float().reshape(-1, int(t.shape[-1])) for t in self.rotary(_Rows()))
+        bf16 = dict(dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device)
+        fp32 = dict(dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device)
+        rm = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+        # The joined prefix k/v: every voice's `rows_g` prefix rows back to back, in `groups` order.
+        offset, lo, hi, fill = 0, torch.zeros(batch, dtype=torch.long), torch.zeros(batch, dtype=torch.long), []
+        padcol = torch.zeros(batch, int(self.kv_capacity), dtype=torch.float32)
+        for g in groups:
+            span, first, own = g["rows"], g["first"], g["own"]
+            keep = torch.ones(1, 1, span, self.hidden_size, dtype=torch.float32)
+            placed = torch.zeros(1, 1, span, self.hidden_size, dtype=torch.float32)
+            keep[0, 0, 2 : own - 1] = 0.0
+            placed[0, 0, 2 : own - 1] = g.pop("emb").to(torch.float32)
+            g["keep"] = ttnn.from_torch(keep, **fp32)
+            g["placed"] = ttnn.from_torch(placed, **fp32)
+            # Positions [first, first + rows_g): the row's own, so its tail sits right after it.
+            # In DRAM until its chain runs (twenty voices' tables would crowd L1).
+            g["rope"] = tuple(ttnn.from_torch(t[first : first + span].reshape(1, 1, span, -1).to(torch.bfloat16).contiguous(), **bf16) for t in (cos, sin))
+            members = torch.tensor(g["members"])
+            lo[members], hi[members] = offset, offset + own
+            # Cache slot j of a row holds its voice's prefix position j: [own, P) is not its prompt.
+            padcol[members, own:rows] = -1e9
+            fill.append(
+                (
+                    offset,
+                    span,
+                    ttnn.from_torch(members.to(torch.int32).reshape(-1, 1).repeat(1, 16).contiguous(), dtype=ttnn.int32, **rm),
+                    ttnn.from_torch(torch.arange(len(g["members"]), dtype=torch.int32), dtype=ttnn.uint32, **rm),
+                    len(g["members"]),
+                )
+            )
+            offset += span
+        joined = offset
+        sample = torch.arange(batch * tail) // tail
+        step = torch.arange(batch * tail) % tail
+        cols = torch.arange(joined + batch * tail).reshape(1, -1)
+        own_tail = (cols >= joined) & (((cols - joined) // tail) == sample.reshape(-1, 1))
+        own_tail = own_tail & (((cols - joined) % tail) <= step.reshape(-1, 1))
+        voice_cols = (cols >= lo[sample].reshape(-1, 1)) & (cols < hi[sample].reshape(-1, 1))
+        mask = torch.where(voice_cols | own_tail, 0.0, float("-inf")).reshape(1, 1, batch * tail, joined + batch * tail)
+        cap = self.kv_capacity
+        pos = torch.arange(cap).reshape(-1, 1)
+        slot = torch.arange(cap).reshape(1, -1)
+        slot_mask = torch.where((slot < start) | ((slot >= rows) & (slot <= pos + gap)), 0.0, -1e9)
+        index = torch.arange(self.n_kv_heads * batch, dtype=torch.int32)
+        block = ((index % batch) * self.n_kv_heads + index // batch) * (cap // tile) + rows // tile
+        bf4 = dict(dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=self.device)
+        return {
+            "seq": real,
+            "multi": {
+                "real": real,
+                "rows": rows,
+                "start": start,
+                "tail": tail,
+                "tail_slots": tail_slots,
+                "batch": batch,
+                "gap": gap,
+                "joined": joined,
+                "groups": groups,
+                "fill": {"rows": rows, "fill": fill},
+                "tail_fill": (
+                    ttnn.from_torch(block.reshape(-1, 1).repeat(1, 16).contiguous(), dtype=ttnn.int32, **rm),
+                    ttnn.from_torch(index, dtype=ttnn.uint32, **rm),
+                ),
+                "rope_tail": tuple(
+                    ttnn.from_torch(
+                        t[start:real].repeat(batch, 1).reshape(1, 1, batch * tail, -1).to(torch.bfloat16).contiguous(),
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        **bf16,
+                    )
+                    for t in (cos, sin)
+                ),
+                "mask_host": mask,
+                "padcol_host": padcol,
+                "mask": ttnn.from_torch(mask.to(torch.bfloat16).contiguous(), **bf4),
+                "mask_last": ttnn.from_torch(mask[:, :, tail - 1 :: tail].to(torch.bfloat16).contiguous(), **bf4),
+                "pad_cols": ttnn.from_torch(padcol, dtype=ttnn.float32, **rm),
+                "slot_mask": ttnn.from_torch(slot_mask.to(torch.float32).contiguous(), dtype=ttnn.float32, **rm),
+            },
+        }
+
     def prefill_voiced(self, input_ids_tt, voice, position_ids_tt=None, real_len=None, need_hidden=True, pad_mask=None):
         """Prefill with the speaker's voice substituted into the prompt's `[AUDIO]` rows, ON DEVICE.
 
@@ -520,6 +675,11 @@ class TextStack:
         if seq != int(voice["seq"]):
             raise ValueError(f"prompt length {seq} != the staged voice layout's {voice['seq']}")
         real_len = seq if real_len is None else int(real_len)
+        multi = voice.get("multi")
+        if multi is not None:
+            if position_ids_tt is not None or real_len != multi["real"]:
+                raise ValueError("a mixed-voice batch prefills its own staged prompt, at its own positions")
+            return self._prefill_multi(input_ids_tt, multi, need_hidden, pad_mask=pad_mask)
         split = voice.get("prefix")
         if split is not None and position_ids_tt is None and split["real"] == real_len:
             return self._prefill_split(input_ids_tt, split, need_hidden, pad_mask=pad_mask)
@@ -637,11 +797,12 @@ class TextStack:
             out = ttnn.slice(out, [0, 0, 0, 0], [batch, 1, real, self.hidden_size])
         return out, last
 
-    def _run_chain(self, embeds, rope, trim=None):
+    def _run_chain(self, embeds, rope, trim=None, after=None):
         """Every block over `embeds`, then the final norm. `embeds` itself is never freed.
 
         `trim` goes to the LAST block only (see `TextBlock.__call__`): its FFN and the final norm run
-        on the rows `trim` keeps, and a `trim` that keeps none returns None without either."""
+        on the rows `trim` keeps, and a `trim` that keeps none returns None without either.
+        `after(block)` runs once each block has returned."""
         hidden = embeds
         last = len(self.blocks) - 1
         try:
@@ -650,6 +811,8 @@ class TextStack:
                 if hidden is not embeds:
                     ttnn.deallocate(hidden)
                 hidden = nxt
+                if after is not None:
+                    after(block)
             return None if hidden is None else self.final_norm(hidden)
         finally:
             if hidden is not None and hidden is not embeds:
@@ -746,7 +909,12 @@ class TextStack:
         # The tail's q and k are height-sharded over 80 cores for their fused RoPE (stubs' `_rope_rows_sharded`).
         # A decode step's norms take the FPU reduce path for their row mean (stubs' `_sq_mean`).
         # The prefix's down projection reads its activation width-sharded in its K blocks (stubs' `_down_short`).
-        pre_in = self._voiced(ttnn.slice(input_ids_tt, [0, 0], [1, rows]), split["keep_head"], split["placed_head"])
+        head_ids = ttnn.slice(input_ids_tt, [0, 0], [1, min(rows, real)])
+        if rows > real:
+            # A short voice's prefix tile-rounds past the prompt's end. Its rows from `start` on are
+            # closed to the tail, to decode and (causally) to the prefix itself, so any id fills them.
+            head_ids = ttnn.pad(head_ids, [(0, 0), (0, rows - real)], value=0)
+        pre_in = self._voiced(head_ids, split["keep_head"], split["placed_head"])
         tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
         for block in self.blocks:
@@ -755,8 +923,9 @@ class TextStack:
         # attention stashes them), and the tail's only for each sample's last row.
         pre_trim = None if need_hidden else _keep_none
         tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, mask_last)
+        pre_after = _stash_in_dram if rows > L1_STASH_ROWS else None
         try:
-            pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None), trim=pre_trim)
+            pre_out = self._run_chain(pre_in, self._prefill_rope(pre_in, None), trim=pre_trim, after=pre_after)
             for block in self.blocks:
                 block.kv["prefix_phase"] = "extend"
                 block.kv["prefix_mask"] = prefix_mask
@@ -799,6 +968,114 @@ class TextStack:
         head = ttnn.slice(ttnn.to_layout(pre_out, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, start, self.hidden_size])
         ttnn.deallocate(pre_out)
         out = ttnn.concat([ttnn.repeat(head, ttnn.Shape([batch, 1, 1, 1])), per_sample], dim=2)
+        return ttnn.to_layout(out, ttnn.TILE_LAYOUT), last
+
+    def _multi_pad_masks(self, multi, pad_mask, batch):
+        """`_split_pad_masks` for a mixed-voice batch: the staged masks unless a row pads its text,
+        in which case those tail columns are closed too. Front pads are the voices' own business."""
+        joined, start, tail, real, gap = (multi[k] for k in ("joined", "start", "tail", "real", "gap"))
+        if pad_mask is None:
+            return multi["mask"], multi["mask_last"], multi["pad_cols"], False
+        pm = pad_mask.to(torch.bool)[:, :real]
+        if int(pm.shape[0]) != batch:
+            raise ValueError(f"pad_mask batch {int(pm.shape[0])} != {batch}")
+        for g in multi["groups"]:
+            if bool(pm[g["members"], g["first"] : g["first"] + g["own"]].any()):
+                raise ValueError(f"voice {g['name']!r}: pad_mask pads its prefix")
+        text = pm[:, start:]
+        if not bool(text.any()):
+            return multi["mask"], multi["mask_last"], multi["pad_cols"], False
+        mask = multi["mask_host"].clone()
+        mask[..., joined + torch.nonzero(text.reshape(-1)).flatten()] = float("-inf")
+        bf4 = dict(dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT, device=self.device)
+        prefix_mask = ttnn.from_torch(mask.to(torch.bfloat16).contiguous(), **bf4)
+        mask_last = ttnn.from_torch(mask[:, :, tail - 1 :: tail].to(torch.bfloat16).contiguous(), **bf4)
+        padcol = multi["padcol_host"].clone()
+        padcol[:, start + gap : real + gap].masked_fill_(text, -1e9)
+        pad_cols = ttnn.from_torch(padcol, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+        return prefix_mask, mask_last, pad_cols, True
+
+    def _prefill_multi(self, input_ids_tt, multi, need_hidden, pad_mask=None):
+        """`_prefill_split` for rows of different voices -- see `stage_voices`. Each voice's prefix
+        chain stashes its k/v (in DRAM); every layer's tail attention then reads them all joined."""
+        batch = int(input_ids_tt.shape[0])
+        rows, start, tail, real = multi["rows"], multi["start"], multi["tail"], multi["real"]
+        if batch != multi["batch"]:
+            raise ValueError(f"batch {batch} != the staged mixed-voice batch's {multi['batch']}")
+        self._arm_cache(batch, rows + multi["tail_slots"])
+        prefix_mask, mask_last, pad_cols, rebuilt = self._multi_pad_masks(multi, pad_mask, batch)
+        stashes = {id(block): [] for block in self.blocks}
+
+        def collect(block):
+            _stash_in_dram(block)
+            stashes[id(block)].append(block.kv.pop("prefix_kv"))
+
+        heads, tail_in = [], None
+        try:
+            for block in self.blocks:
+                block.kv["prefix_phase"] = "stash"
+            for g in multi["groups"]:
+                first, span, member = g["first"], g["rows"], g["members"][0]
+                head_ids = ttnn.slice(input_ids_tt, [member, first], [member + 1, min(first + span, real)])
+                if first + span > real:
+                    head_ids = ttnn.pad(head_ids, [(0, 0), (0, first + span - real)], value=0)
+                pre_in = self._voiced(head_ids, g["keep"], g["placed"])
+                rope = tuple(ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG) for t in g["rope"])
+                try:
+                    pre_out = self._run_chain(pre_in, rope, trim=None if need_hidden else _keep_none, after=collect)
+                finally:
+                    ttnn.deallocate(pre_in)
+                    for t in rope:
+                        ttnn.deallocate(t)
+                if need_hidden:
+                    # This voice's rows' hidden state at [0, start): zeros under the front pad.
+                    own = ttnn.slice(ttnn.to_layout(pre_out, ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, g["own"], self.hidden_size])
+                    if first:
+                        pad = ttnn.zeros([1, 1, first, self.hidden_size], dtype=own.dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
+                        own = ttnn.concat([pad, own], dim=2)
+                    heads.append(own)
+            for block in self.blocks:
+                parts = stashes[id(block)]
+                block.kv["prefix_kv"] = tuple(
+                    ttnn.concat([p[i] for p in parts], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG) for i in (0, 1)
+                )
+                for p in parts:
+                    for t in p:
+                        ttnn.deallocate(t)
+                parts.clear()
+                block.kv["prefix_phase"] = "extend"
+                block.kv["prefix_mask"] = prefix_mask
+                block.kv["prefix_compact"] = (batch, tail, multi["tail_slots"])
+                block.kv["tail_fill"] = multi["tail_fill"]
+                block.kv["prefix_groups"] = multi["fill"]
+            tail_in = self.embed(ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail]))
+            tail_trim = None if need_hidden else self._last_tail_rows(batch, tail, mask_last)
+            tail_out = self._run_chain(tail_in, multi["rope_tail"], trim=tail_trim)
+        finally:
+            for block in self.blocks:
+                for key in ("prefix_phase", "prefix_mask", "prefix_kv", "prefix_compact", "tail_fill", "prefix_groups"):
+                    block.kv.pop(key, None)
+                block.kv["slot_offset"] = multi["gap"]
+            if tail_in is not None:
+                ttnn.deallocate(tail_in)
+            if rebuilt:
+                ttnn.deallocate(prefix_mask)
+                ttnn.deallocate(mask_last)
+        self.filled = real
+        self._slot_gap = multi["gap"]
+        self._slot_mask = multi["slot_mask"]
+        self._pad_cols = pad_cols
+        if not need_hidden:
+            return None, ttnn.reshape(tail_out, [batch, self.hidden_size])
+        per_sample = ttnn.reshape(ttnn.to_layout(tail_out, ttnn.ROW_MAJOR_LAYOUT), [batch, 1, tail, self.hidden_size])
+        ttnn.deallocate(tail_out)
+        last = ttnn.to_layout(
+            ttnn.reshape(ttnn.slice(per_sample, [0, 0, tail - 1, 0], [batch, 1, tail, self.hidden_size]), [batch, self.hidden_size]),
+            ttnn.TILE_LAYOUT,
+        )
+        by_row = {b: i for i, g in enumerate(multi["groups"]) for b in g["members"]}
+        head = ttnn.concat([heads[by_row[b]] for b in range(batch)], dim=0)
+        out = ttnn.concat([head, per_sample], dim=2)
         return ttnn.to_layout(out, ttnn.TILE_LAYOUT), last
 
     def _prefill_rope(self, embeds, position_ids_tt):

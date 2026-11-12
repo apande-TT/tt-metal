@@ -628,10 +628,10 @@ def _prefill_sdpa(q, k, v, kv_cache):
         # streams it whole, so it sits in L1 (~1.6 MB each); the mask SDPA insists on reading from DRAM.
         if cpp_kv_join.supports(pk, k, pv, v):
             # cpp: both joined operands written by ONE generic_op (tt/cpp_kv_join), tile for tile.
-            jk, jv = cpp_kv_join.join(pk, k, pv, v, memory_config=ttnn.L1_MEMORY_CONFIG)
+            jk, jv = cpp_kv_join.join(pk, k, pv, v, memory_config=_join_memory(pk))
         else:
-            jk = ttnn.concat([pk, k], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
-            jv = ttnn.concat([pv, v], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
+            jk = ttnn.concat([pk, k], dim=2, memory_config=_join_memory(pk))
+            jv = ttnn.concat([pv, v], dim=2, memory_config=_join_memory(pk))
         a = ttnn.transformer.scaled_dot_product_attention(
             q,
             jk,
@@ -805,6 +805,7 @@ def _seed_split(kv, k, v):
     capacity = int(kv["capacity"])
     resident = kv.pop("resident", None) or (None, None)
     rows_fill, tail_fill = kv["fill_tables"], kv["tail_fill"]
+    groups = kv.get("prefix_groups")
     tile = ttnn.TILE_SIZE
     _drop_shared_prefix(kv)
     shared = {}
@@ -825,7 +826,11 @@ def _seed_split(kv, k, v):
         else:
             narrow = ttnn.typecast(part.prefix, _CACHE_DTYPE)
         ttnn.deallocate(part.prefix)
-        if _SHARED_PREFIX and cpp_scores_dec.prefix_ok(home, narrow):
+        if groups is not None:
+            # Rows of DIFFERENT voices (the text stack's `stage_voices`): no prefix is every row's.
+            _fill_prefix_groups(home, narrow, groups)
+            ttnn.deallocate(narrow)
+        elif _SHARED_PREFIX and cpp_scores_dec.prefix_ok(home, narrow):
             shared[key] = narrow
         elif ttl_kv.supports(home, narrow):
             # The tt-lang seed: each prefix tile row read once and written into every sample's rows.
@@ -850,10 +855,28 @@ def _seed_split(kv, k, v):
         kv["prefix_shared"] = shared
         if len(shared) != 2:  # only one of k / v qualified: fill it in like the other
             _materialize_prefix(kv)
-    kv["filled"] = prefix_rows + k.slots
+    kv["filled"] = (prefix_rows if groups is None else groups["rows"]) + k.slots
 
 
 _SHARED_PREFIX = os.environ.get("VOXTRAL_SHARED_PREFIX", "1") == "1"
+
+
+def _fill_prefix_groups(home, prefix, groups):
+    """Each voice's prefix into ITS rows' first slots. `prefix` is every voice's back to back and
+    `groups["fill"]` one `(offset, rows, page_table, batch_idx, count)` per voice."""
+    heads, width = int(prefix.shape[1]), int(prefix.shape[3])
+    for offset, rows, table, index, count in groups["fill"]:
+        own = ttnn.slice(prefix, [0, 0, offset, 0], [1, heads, offset + rows, width])
+        ttnn.experimental.paged_fill_cache(home, ttnn.repeat(own, ttnn.Shape([count, 1, 1, 1])), table, batch_idx_tensor=index)
+
+
+# The joined prefix + tail k/v SDPA streams sits in L1 up to one voice's prefix; several voices'
+# prefixes back to back (`stage_voices`) are too tall for it.
+_L1_JOIN_ROWS = 256
+
+
+def _join_memory(pk):
+    return ttnn.L1_MEMORY_CONFIG if int(pk.shape[2]) <= _L1_JOIN_ROWS else ttnn.DRAM_MEMORY_CONFIG
 
 
 def _drop_shared_prefix(kv):

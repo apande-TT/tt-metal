@@ -269,7 +269,13 @@ _REPEAT_AUDIO_TEXT_ID = 35
 
 
 def load_voice_embedding(voice: str, model_id: str = HF_MODEL_ID):
-    """The speaker's voice embedding, `[N, hidden]`, from the checkpoint repo."""
+    """The speaker's voice embedding, `[N, hidden]`, from the checkpoint repo (read once per voice:
+    each `hf_hub_download` asks the Hub whether the file changed)."""
+    return _voice_embedding(voice, model_id).clone()
+
+
+@lru_cache(maxsize=None)
+def _voice_embedding(voice: str, model_id: str):
     from huggingface_hub import hf_hub_download
 
     path = hf_hub_download(model_id, f"voice_embedding/{voice}.pt")
@@ -281,6 +287,11 @@ def load_voice_embedding(voice: str, model_id: str = HF_MODEL_ID):
 
 def available_voices(model_id: str = HF_MODEL_ID) -> dict:
     """`{voice: n_audio_tokens}` as the tokenizer publishes it."""
+    return dict(_voice_token_counts(model_id))
+
+
+@lru_cache(maxsize=4)
+def _voice_token_counts(model_id: str) -> dict:
     from huggingface_hub import hf_hub_download
 
     with open(hf_hub_download(model_id, "tekken.json"), encoding="utf-8") as fh:
@@ -357,6 +368,40 @@ def build_voice_prompt(
     if return_pad_mask:
         return input_ids, audio_mask, emb, torch.tensor(pads, dtype=torch.bool)
     return input_ids, audio_mask, emb
+
+
+def build_mixed_voice_prompt(voices, bodies, model_id: str = HF_MODEL_ID, pad_to: int = None):
+    """`(input_ids [B, S], pad_mask [B, S] bool, embeddings {voice: [N, hidden]})` for rows of
+    DIFFERENT voices (`voices[b]` speaks `bodies[b]`, token ids).
+
+    Each row is `build_voice_prompt`'s for its own voice, its body front-padded to `pad_to` (or the
+    batch's widest body) as there, and the whole row then front-padded with `_PAD_ID`s to the
+    batch's longest prompt -- so every row's text, suffix and generated audio sit at the same
+    positions and decode keeps one shared position. `pad_mask` is True on both kinds of pad.
+    """
+    if len(voices) != len(bodies):
+        raise ValueError(f"{len(voices)} voices for {len(bodies)} bodies")
+    width = int(pad_to) if pad_to is not None else max(len(b) for b in bodies)
+    rows, pads, embeddings = [None] * len(bodies), [None] * len(bodies), {}
+    for voice in dict.fromkeys(voices):
+        members = [b for b, v in enumerate(voices) if v == voice]
+        ids, _, emb, pm = build_voice_prompt(
+            ["x"] * len(members),
+            voice,
+            model_id=model_id,
+            bodies=[bodies[b] for b in members],
+            pad=True,
+            pad_to=width,
+            return_pad_mask=True,
+        )
+        embeddings[voice] = emb
+        for i, b in enumerate(members):
+            rows[b], pads[b] = ids[i], pm[i]
+    seq = max(int(r.shape[0]) for r in rows)
+    front = [seq - int(r.shape[0]) for r in rows]
+    input_ids = torch.stack([torch.cat([torch.full((n,), _PAD_ID, dtype=r.dtype), r]) for n, r in zip(front, rows)])
+    pad_mask = torch.stack([torch.cat([torch.ones(n, dtype=torch.bool), p]) for n, p in zip(front, pads)])
+    return input_ids, pad_mask, embeddings
 
 
 def build_batch_inputs(batch: int = DEFAULT_BATCH, seq_len: int = DEFAULT_SEQ_LEN, model_id: str = HF_MODEL_ID):

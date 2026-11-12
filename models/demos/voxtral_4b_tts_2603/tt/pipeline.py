@@ -85,6 +85,13 @@ def _tile_ceil(value: int) -> int:
     return -(-int(value) // 32) * 32
 
 
+def _fill_rows(t, rows: int, dim: int = 0):
+    """`t` grown to `rows` along `dim` by repeating its own rows in order (3 rows -> 0 1 2 0 1 2 ...)."""
+    if t is None or int(t.shape[dim]) >= rows:
+        return t
+    return t.index_select(dim, torch.arange(rows) % int(t.shape[dim]))
+
+
 class VoxtralTTSPipeline:
     """The resident pipeline object: both task heads plus the per-stage trace contract.
 
@@ -118,7 +125,12 @@ class VoxtralTTSPipeline:
         self.vocode = vocode
         self.continuation = continuation
         self.counter = counter if counter is not None else common.InvocationCounter()
+        # `batch` is how many users a call serves; every stage runs at the batch tile `rows` it was
+        # tuned for, a smaller batch filled with repeats of its own rows that are dropped from the result.
         self.batch = common.DEFAULT_BATCH if batch is None else int(batch)
+        self.rows = common.DEFAULT_BATCH
+        if not 0 < self.batch <= self.rows:
+            raise ValueError(f"batch {self.batch} must lie in [1, {self.rows}]")
         self.tokenizer = common.load_tokenizer()
         self.trace_capacity = DEFAULT_TRACE_CAPACITY if trace_capacity is None else int(trace_capacity)
         self.vocode_capacity = DEFAULT_VOCODE_CAPACITY if vocode_capacity is None else int(vocode_capacity)
@@ -132,9 +144,9 @@ class VoxtralTTSPipeline:
         # wherever it runs, and the fully-on-device check watches the forward: building the
         # default there fired `aten.full.default` inside the observed region. It is a constant of
         # the pipeline, so it belongs with the weights.
-        self._default_cfg_host = torch.full((self.batch,), DEFAULT_CFG_ALPHA)
+        self._default_cfg_host = torch.full((self.rows,), DEFAULT_CFG_ALPHA)
         self._default_cfg_tt = ttnn.from_torch(
-            self._default_cfg_host.reshape(self.batch, 1),
+            self._default_cfg_host.reshape(self.rows, 1),
             dtype=ttnn.float32,
             layout=ttnn.TILE_LAYOUT,
             device=device,
@@ -209,7 +221,19 @@ class VoxtralTTSPipeline:
     def stage_voice(self, audio_mask, voice_embedding, input_ids=None):
         """Upload the voice once, as persistent device constants, OUTSIDE the forward. `input_ids`
         (host) lets the prefill run the prompt prefix every row shares once instead of per row."""
-        return self.text.stage_voice(audio_mask, voice_embedding, input_ids=input_ids)
+        return self.text.stage_voice(
+            _fill_rows(audio_mask, self.rows), voice_embedding, input_ids=_fill_rows(input_ids, self.rows)
+        )
+
+    def stage_voices(self, input_ids, row_voices, embeddings):
+        """`stage_voice` for rows of DIFFERENT voices (`common.build_mixed_voice_prompt`'s output):
+        each voice's prefix runs once and one tail pass serves every row. One voice is `stage_voice`."""
+        row_voices = list(row_voices)
+        if len(set(row_voices)) == 1:
+            (name,) = set(row_voices)
+            return self.stage_voice(input_ids == common._AUDIO_ID, embeddings[name], input_ids=input_ids)
+        filled = [row_voices[i % len(row_voices)] for i in range(max(self.rows, len(row_voices)))]
+        return self.text.stage_voices(_fill_rows(input_ids, self.rows), filled, embeddings)
 
     def noise(self, max_frames: int, batch=None, seed: int = 0):
         """The flow-matching sampler's noise input, drawn ONCE on the host.
@@ -258,6 +282,17 @@ class VoxtralTTSPipeline:
             max_frames, _ = common.resolve_max_frames(self.reference_model)
         if x0 is None:
             x0 = self.noise(max_frames, batch=batch)
+        users = batch
+        if users > self.rows:
+            raise ValueError(f"{users} rows exceed the batch tile {self.rows}")
+        if users < self.rows:
+            # Every stage runs at the batch tile it was tuned for. A filled row repeats a real one --
+            # its ids, noise and guidance -- so it ends with it, and is dropped from the result.
+            input_ids, pad_mask = _fill_rows(input_ids, self.rows), _fill_rows(pad_mask, self.rows)
+            x0 = _fill_rows(x0, self.rows, dim=1)
+            cfg_alpha = _fill_rows(cfg_alpha, self.rows)
+            live_rows = users if live_rows is None else min(int(live_rows), users)
+            batch = self.rows
 
         # ONE UPLOAD, THEN SLICE ON DEVICE. Indexing the `[F, B, 36]` noise per frame on the host
         # (`x0[i]`) fires `aten.select.int` once per frame INSIDE the forward, which the
@@ -276,7 +311,7 @@ class VoxtralTTSPipeline:
             )
             for i in range(max_frames)
         ]
-        if cfg_alpha is None and batch == self.batch:
+        if cfg_alpha is None and batch == self.rows:
             # Both forms were built at __init__; naming them here calls nothing.
             cfg_alpha, cfg_tt = self._default_cfg_host, self._default_cfg_tt
         else:
@@ -385,7 +420,7 @@ class VoxtralTTSPipeline:
 
         codes_host = ttnn.to_torch(codes_all).to(torch.int64)
         waveform = ttnn.to_torch(waveform_tt).to(torch.float32)
-        return {
+        result = {
             "input_ids": input_ids,
             "codes": codes_host,
             "waveform": waveform,
@@ -401,6 +436,14 @@ class VoxtralTTSPipeline:
             "max_frames": max_frames,
             "diagnostics": diagnostics,
         }
+        if users < batch:
+            for key in ("input_ids", "codes", "waveform", "prefill_hidden", "end_frame", "cfg_alpha"):
+                if result[key] is not None:
+                    result[key] = result[key][:users]
+            result["x0"] = x0[:, :users]
+            result["diagnostics"] = [{k: v[:users] for k, v in d.items()} for d in diagnostics]
+            result["batch"] = users
+        return result
 
     # ---- Call 2: text continuation -----------------------------------------------------
 
@@ -472,7 +515,9 @@ class VoxtralTTSPipeline:
         return {"input_ids": input_ids, "audio_mask": audio_mask, "voice_embedding": voice_embedding}
 
     def prefill_trace_setup(self, inputs):
-        input_ids = inputs["input_ids"]
+        users = int(inputs["input_ids"].shape[0])
+        input_ids = _fill_rows(inputs["input_ids"], self.rows)
+        audio_mask = _fill_rows(inputs["audio_mask"], self.rows)
         batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
         if real_len > self.trace_capacity:
             raise ValueError(f"prompt is {real_len} tokens, past the pinned capacity {self.trace_capacity}")
@@ -483,7 +528,7 @@ class VoxtralTTSPipeline:
         padded = torch.zeros(batch, capacity, dtype=input_ids.dtype)
         padded[:, :real_len] = input_ids
         mask = torch.zeros(batch, capacity, dtype=torch.bool)
-        mask[:, :real_len] = inputs["audio_mask"]
+        mask[:, :real_len] = audio_mask
         cos, sin = self._reference_rope(capacity)
 
         self._stage_buffers["prefill"] = {
@@ -510,7 +555,7 @@ class VoxtralTTSPipeline:
             ),
             "capacity": capacity,
             "real_len": real_len,
-            "batch": batch,
+            "batch": users,
         }
         return self._stage_buffers["prefill"]
 
@@ -540,8 +585,9 @@ class VoxtralTTSPipeline:
         (`is_encoder_decoder=False`), so this is the self-attn cache alone.
         """
         capacity = self.trace_capacity
-        input_ids = inputs["input_ids"]
-        batch, real_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+        users = int(inputs["input_ids"].shape[0])
+        input_ids = _fill_rows(inputs["input_ids"], self.rows)
+        real_len = int(input_ids.shape[1])
         self.text.reset_cache()
         ids_tt = self.prepare_prompt(input_ids)
         voice = self.stage_voice(inputs["audio_mask"], inputs["voice_embedding"], input_ids=input_ids)
@@ -551,14 +597,14 @@ class VoxtralTTSPipeline:
             "llm_hidden": last,
             "position": real_len,
             "capacity": capacity,
-            "batch": batch,
+            "batch": users,
             "real_len": real_len,
         }
         return self._stage_buffers["decode"]
 
     def decode_trace_setup(self, inputs):
         buf = self.decode_prefill(inputs)
-        batch = buf["batch"]
+        batch = self.rows
         # The step's input is an audio-token EMBEDDING, not a token id, so the persistent input
         # buffer is one frame's worth of codes put through the audio-token table OUTSIDE the
         # trace. Values come from the reference so the traced step matches the golden.
@@ -629,21 +675,20 @@ class VoxtralTTSPipeline:
         }
 
     def acoustic_trace_setup(self, inputs):
-        batch = int(inputs["llm_hidden"].shape[0])
+        users = int(inputs["llm_hidden"].shape[0])
+        llm_hidden, x0, cfg_alpha = (_fill_rows(inputs[k], self.rows) for k in ("llm_hidden", "x0", "cfg_alpha"))
         self._stage_buffers["acoustic"] = {
             "llm_hidden": ttnn.from_torch(
-                inputs["llm_hidden"].contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device
+                llm_hidden.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device
             ),
-            "x0": ttnn.from_torch(
-                inputs["x0"].contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device
-            ),
+            "x0": ttnn.from_torch(x0.contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.device),
             "cfg_alpha": ttnn.from_torch(
-                inputs["cfg_alpha"].reshape(batch, 1).contiguous(),
+                cfg_alpha.reshape(-1, 1).contiguous(),
                 dtype=ttnn.float32,
                 layout=ttnn.TILE_LAYOUT,
                 device=self.device,
             ),
-            "batch": batch,
+            "batch": users,
         }
         return self._stage_buffers["acoustic"]
 
@@ -686,8 +731,9 @@ class VoxtralTTSPipeline:
         return {"codes": codes}
 
     def vocode_trace_setup(self, inputs):
-        codes = inputs["codes"]
-        batch, rows, frames = (int(v) for v in codes.shape)
+        batch = int(inputs["codes"].shape[0])
+        codes = _fill_rows(inputs["codes"], self.rows)
+        frames = int(codes.shape[-1])
         capacity = self.vocode_capacity
         if frames > capacity:
             codes, frames = codes[:, :, :capacity], capacity

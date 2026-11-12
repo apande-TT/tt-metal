@@ -12,13 +12,13 @@ each request is tokenized and split into <=18-token chunks, the chunks are fanne
 rows (short chunks padded to 18, their pad columns closed in prefill AND decode, dummy rows filling
 the batch to 32), one batch-32 forward runs per 32 chunks, and each request's chunk waveforms are
 concatenated back in order. A forward stops once its real rows have emitted end_audio; the dummy
-rows are not waited for. The voice sets the prompt width too, so only the voices whose embedding is
-as long as the default's are served.
+rows are not waited for. Every preset voice is served, by one pipeline whose KV cache is sized for
+the longest voice's prompt.
 
 CONCURRENT REQUESTS SHARE A BATCH. One worker thread owns the device and runs every forward; the
-HTTP threads only tokenize, queue their chunks and wait. Each forward takes up to 32 queued chunks
-of one voice, from as many requests as are waiting, so N concurrent requests cost about one batch
-wall instead of N.
+HTTP threads only tokenize, queue their chunks and wait. Each forward takes up to 32 queued chunks,
+from as many requests as are waiting and in whatever voices they asked for (each row carries its
+own), so N concurrent requests cost about one batch wall instead of N.
 
     TT_METAL_HOME=... python -m models.demos.voxtral_4b_tts_2603.serve_tts --port 20000
     curl -s -X POST localhost:20000/v1/audio/speech -d '{"input":"Hello from Tenstorrent."}' -o out.wav
@@ -78,30 +78,27 @@ def _init(device_id: int = 0) -> None:
     tok = common.load_tokenizer(common.HF_MODEL_ID)
     # A filler body for the dummy rows that pad a partial batch up to 32 (its output is discarded).
     filler = tok.encode("Yes.", bos=False)[:WIDTH] or [0]
-    _STATE.update(hf=hf, max_frames=mf, device=dev, tok=tok, filler=filler, pipes={}, sr=None, voices=servable_voices())
+    _STATE.update(hf=hf, max_frames=mf, device=dev, tok=tok, filler=filler, pipe=None, sr=None, voices=servable_voices())
 
 
 def servable_voices() -> list:
-    """The presets whose embedding is as long as the default's: any other length changes the prompt
-    width the L1 placement was tuned for."""
-    voices = common.available_voices()
-    return sorted(v for v, n in voices.items() if n == voices[common.DEFAULT_VOICE])
+    return sorted(common.available_voices())
 
 
-def _pipe(prompt_len: int):
-    """A batch-32 pipeline for a given prompt length, cached (a voice's n_audio sets the length)."""
-    p = _STATE["pipes"].get(prompt_len)
-    if p is None:
-        p = pipeline.build_pipeline(
+def _pipe():
+    """The batch-32 pipeline, built once, its KV cache sized for the longest voice's prompt
+    (`[BOS] [BEGIN_AUDIO] voice [NEXT_AUDIO_TEXT] body [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]`)."""
+    if _STATE["pipe"] is None:
+        longest = max(common.available_voices().values()) + WIDTH + 5
+        _STATE["pipe"] = pipeline.build_pipeline(
             _STATE["device"],
             model=_STATE["hf"],
             heads=("text_to_speech",),
             layers=None,
             batch=BATCH,
-            kv_capacity=pipeline.tts_kv_capacity(prompt_len, _STATE["max_frames"]),
+            kv_capacity=pipeline.tts_kv_capacity(longest, _STATE["max_frames"]),
         )
-        _STATE["pipes"][prompt_len] = p
-    return p
+    return _STATE["pipe"]
 
 
 def _wav_bytes(samples, sr) -> bytes:
@@ -129,15 +126,22 @@ def _chunk_bodies(text: str):
     return [ids[i : i + WIDTH] for i in range(0, len(ids), WIDTH)]
 
 
-def _run_batch(bodies, voice):
-    """ONE batch-32 forward over up to BATCH bodies of one voice; one waveform per body, in order."""
+def _run_batch(bodies, voices):
+    """ONE batch-32 forward over up to BATCH bodies, `voices[i]` speaking `bodies[i]`; one waveform
+    per body, in order. Rows of one voice take the tuned shared-prefix path; mixed voices share the
+    forward too, each voice's prefix run once (`stage_voices`)."""
     nreal = len(bodies)
     chunk = [list(b) for b in bodies] + [list(_STATE["filler"])] * (BATCH - nreal)  # dummy rows -> discarded
-    input_ids, audio_mask, emb, pad_mask = common.build_voice_prompt(
-        ["x"] * BATCH, voice, bodies=chunk, pad=True, pad_to=WIDTH, return_pad_mask=True
-    )
-    pipe = _pipe(int(input_ids.shape[-1]))
-    v = pipe.stage_voice(audio_mask, emb, input_ids=input_ids)
+    row_voices = list(voices) + [voices[0]] * (BATCH - nreal)
+    pipe = _pipe()
+    if len(set(row_voices)) == 1:
+        input_ids, audio_mask, emb, pad_mask = common.build_voice_prompt(
+            ["x"] * BATCH, row_voices[0], bodies=chunk, pad=True, pad_to=WIDTH, return_pad_mask=True
+        )
+        v = pipe.stage_voice(audio_mask, emb, input_ids=input_ids)
+    else:
+        input_ids, pad_mask, embeddings = common.build_mixed_voice_prompt(row_voices, chunk, pad_to=WIDTH)
+        v = pipe.stage_voices(input_ids, row_voices, embeddings)
     result = pipe.run_text_to_speech(
         input_ids=input_ids, max_frames=_STATE["max_frames"], voice=v, pad_mask=pad_mask, live_rows=nreal
     )
@@ -175,7 +179,7 @@ class _Batcher:
         return req
 
     def _take(self):
-        """Up to BATCH queued chunks sharing the oldest chunk's voice (a batch carries one voice)."""
+        """Up to BATCH queued chunks, oldest first, whatever their voices (each row has its own)."""
         with self._cv:
             while not self._queue:
                 self._cv.wait()
@@ -183,19 +187,15 @@ class _Batcher:
             deadline = time.time() + GATHER_S
             while len(self._queue) < BATCH and time.time() < deadline:
                 self._cv.wait(deadline - time.time())
-            voice = self._queue[0][0].voice
-            picked, rest = [], collections.deque()
-            while self._queue:
-                item = self._queue.popleft()
-                (picked if len(picked) < BATCH and item[0].voice == voice else rest).append(item)
-            self._queue = rest
-        return voice, picked
+            picked = [self._queue.popleft() for _ in range(min(BATCH, len(self._queue)))]
+        return picked
 
     def _loop(self) -> None:
         try:
             _init(self._device_id)
             t0 = time.time()
-            _run_batch(_chunk_bodies(WARMUP_TEXT), common.DEFAULT_VOICE)  # compile + build before serving
+            warm = _chunk_bodies(WARMUP_TEXT)
+            _run_batch(warm, [common.DEFAULT_VOICE] * len(warm))  # compile + build before serving
             print(f"[serve_tts] warm-up synthesis done in {time.time() - t0:.1f}s", flush=True)
         except Exception as e:  # noqa: BLE001
             self.init_error = e
@@ -203,9 +203,9 @@ class _Batcher:
             raise
         self.ready.set()
         while True:
-            voice, picked = self._take()
+            picked = self._take()
             try:
-                waves = _run_batch([req.bodies[i] for req, i in picked], voice)
+                waves = _run_batch([req.bodies[i] for req, i in picked], [req.voice for req, _ in picked])
             except Exception as e:  # noqa: BLE001
                 import traceback
 
