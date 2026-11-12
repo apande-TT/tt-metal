@@ -140,6 +140,9 @@ VOTE_TAIL = None
 # ROUND_BF16(t) -> typecast(typecast(t, bf16), float32) in one pass, t untouched; None for a shape it does not
 # take.
 ROUND_BF16 = None
+# Mode "exact" without its vote (guarded, one operand, a stand-in weight): the exact-lane sum minus the bias count
+# alone -- no plain run, no negated run, no vote tail (the lanes' rare glitches are not voted out). Off by default.
+EXACT_NO_VOTE = False
 
 
 def _flat_rows(t):
@@ -208,6 +211,48 @@ def _weight_lane_masks(device, rows):
     return _WEIGHT_LANE_MASKS[key]
 
 
+def _exact_no_vote(run, x, device, bias, weight, run_w, to3, back, hi):
+    """precise_affine's guarded "exact" sum with no vote: sum_r conv(hi(x), W * m_r) + conv(lo(x), W) - (n - 1) b,
+    the same runs in the same order as the voted path's acc, returned as its e_x. None when it does not apply
+    (the caller then runs the voted path)."""
+    from models.demos.qwen_image_edit_text_encoder._stubs.attention import EXACT_MODE, _LaneAcc
+
+    if EXACT_MODE != "guarded" or weight is None or run_w is None:
+        return None
+    c = x.shape[-1]
+    lanes = min(8, c)
+    t = to3(x)
+    h = hi(t)
+    h_rm = back(h, x)
+    acc, n, meta = _LaneAcc(), 0, None
+    for wm in _weight_lane_masks(device, weight.shape[0])[:lanes]:
+        w_r = ttnn.multiply(weight, wm)
+        raw = run_w(h_rm, w_r)
+        ttnn.deallocate(w_r)
+        if meta is None:
+            meta = (list(raw.shape), raw.layout, _flat_rows(raw))
+        y = _flat(raw)
+        if y is None:
+            return None
+        acc.push(y)
+        n += 1
+    ttnn.deallocate(h_rm)
+    lo = ttnn.subtract(t, h)
+    ttnn.deallocate(h)
+    if x.layout != ttnn.TILE_LAYOUT:
+        ttnn.deallocate(t)
+    acc.push(_flat(run(back(lo, x), None)))
+    n += 1
+    ttnn.deallocate(lo)
+    acc = acc.value()
+    shape, layout, rows_layout = meta
+    b = _bias_flat(bias, shape, rows_layout=rows_layout)
+    if b is None:
+        b = _flat(run(back(ttnn.multiply(to3(x), 0.0), x), None))
+    res = ttnn.subtract(acc, ttnn.multiply(b, float(n - 1)))  # each run added the bias once
+    return ttnn.reshape(ttnn.to_layout(res, layout), shape)
+
+
 def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad=None, weight=None, run_w=None):
     """run(x, extra) -> output, affine in (x, extra) (a conv / linear with bias); channels on the last dim.
     Returns the output in run's own layout and shape, evaluated per `mode` (see above). `out`: run(x, extra)
@@ -267,6 +312,10 @@ def precise_affine(run, x, mode, device, extra=None, out=None, bias=None, prepad
         b = b if b is not None else _flat(raw([ttnn.multiply(t, 0.0) for t in ops]))
         return ttnn.reshape(ttnn.to_layout(ttnn.subtract(y, b), layout), shape)
 
+    if mode == "exact" and EXACT_NO_VOTE and out is None and extra is None and prepad is not None:
+        y = _exact_no_vote(run, x, device, bias, weight, run_w, to3, back, hi)
+        if y is not None:
+            return y
     out = run(x, extra) if out is None else out
     shape, layout = list(out.shape), out.layout
     f0 = _flat(out)

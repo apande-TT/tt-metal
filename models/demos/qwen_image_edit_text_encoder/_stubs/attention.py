@@ -395,6 +395,8 @@ GUARD_NO_NN = False
 # exact lanes ([lanes | rest a limbs] @ [K-repeated lead | rest b limbs]^T), so no dense lead product, no separate
 # trailing product and no guard tail are formed (the exact lanes' rare glitches are not voted out).
 QK_NO_GUARD = False
+# QK_NO_GUARD at the HiFi4 stack fidelity too (the encoders keep HiFi4; the one product's config is the same either way)
+QK_NO_GUARD_HIFI4 = False
 # The b-side exact lanes (B_LANE_SPLIT: the vision P @ V's lanes on V's rows) as ONE K-stacked product:
 # [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
 # the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
@@ -991,6 +993,11 @@ def bmm_program_config(p, q, transpose_b=False):
     return _BMM_CONFIGS[key]
 
 
+# split_matmul with b_rep > 1 and no batched kernel: a's b_rep entries per b entry as ONE entry of b_rep x M rows
+# against b's entry (no repeat of b). Off by default; the pipeline's hooks switch it on.
+B_REP_FOLD = False
+
+
 def _repeat_entries(t, rep):
     """[E, 1, R, C] -> [E * rep, 1, R, C]: each entry rep times in a row (entry e of the result is entry e // rep)."""
     e, _, r, c = t.shape
@@ -1023,6 +1030,28 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
             y = BMM_KERNEL(p, q, transpose_b) if b_rep == 1 else BMM_KERNEL(p, q, transpose_b, b_rep=b_rep)
         if y is not None:
             return y
+        if b_rep > 1 and B_REP_FOLD:
+            # a's b_rep consecutive entries share b's entry: view them as ONE entry of b_rep x M rows (a free view for
+            # tile-aligned M) against b's entry itself -- no b_rep-fold copy of b
+            sp, sq = list(p.shape), list(q.shape)
+            if (
+                len(sp) == 4
+                and len(sq) == 4
+                and sp[1] == 1
+                and sq[1] == 1
+                and sp[0] == sq[0] * b_rep
+                and sp[2] % 32 == 0
+            ):
+                pf = ttnn.reshape(p, (sq[0], 1, b_rep * sp[2], sp[3]))
+                yf = ttnn.matmul(
+                    pf,
+                    q,
+                    transpose_b=transpose_b,
+                    compute_kernel_config=cfg,
+                    dtype=ttnn.float32,
+                    program_config=None if BMM_CONFIG is None else BMM_CONFIG(pf, q, transpose_b),
+                )
+                return ttnn.reshape(yf, (sp[0], 1, sp[2], yf.shape[-1]))
         if b_rep > 1:
             ent = reps.get(id(q))
             if ent is None or ent[0] is not q:
@@ -1211,7 +1240,7 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
             and QK_NO_GUARD
             and REST_KCAT
             and len(rest) > 1
-            and QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4
+            and (QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4 or QK_NO_GUARD_HIFI4)
         ):
             return _unguarded_qk(stacked, pa0, pb0, rest, keep_b and pb0 is terms[0][1])
         if stacked is not None:

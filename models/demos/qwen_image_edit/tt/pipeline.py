@@ -19,6 +19,7 @@ the uploaded encoded inputs and the output image runs on device.
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 
 import torch
@@ -51,6 +52,7 @@ from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
 from models.demos.qwen_image_edit.tt.transformer import TtQwenImageTransformer
 from models.demos.qwen_image_edit.tt.vae import TtQwenVAE
 from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 from models.demos.qwen_image_edit_text_encoder._stubs import vision_transformer_pretrained_model as _vision_tower
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _dit_ccl
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
@@ -63,6 +65,9 @@ from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae
 # scheduler repeats.
 PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae_decode"]
 
+# The denoiser's masked-lane linears' column lanes of x: 4 lanes of 8 K terms per 32-group halve the lane products
+# of the 8-lane form (the encoders keep 8)
+DENOISE_MM_LANES = 4
 _SCHED_COLS = 32  # schedule table width: col 0 = t / 1000, col 1 = sigma_next - sigma
 
 
@@ -341,6 +346,11 @@ class TtQwenImageEditPipeline:
             _te_attention,
             "LINEAR_NO_GUARD",
             True,
+        ), self._hook(
+            # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
+            _te_attention,
+            "B_REP_FOLD",
+            True,
         ):
             yield
 
@@ -352,22 +362,42 @@ class TtQwenImageEditPipeline:
             _te_attention, "B_LANE_KSTACK", True
         ), self._hook(_vision_tower, "ROW_GATHER", row_gather if self.linear_kernel else None), self._hook(
             _te_attention, "HEADS_KERNEL", head_split if self.linear_kernel else None
-        ), self._fused_tail(), self._encoder_extras():
+        ), self._fused_tail(), self._encoder_extras(), self._hook(
+            # (and its QK^T as the denoiser's ONE unguarded K-stacked product -- trailing limbs along K, no dense check
+            # product, no guard tail -- at the encoders' HiFi4; the LM's stays guarded: with it the e2e PCC is 0.9858)
+            _te_attention,
+            "QK_NO_GUARD",
+            True,
+        ), self._hook(
+            _te_attention, "REST_KCAT", True
+        ), self._hook(
+            _te_attention, "QK_NO_GUARD_HIFI4", True
+        ):
             return self.text_encoder.encode_vision(up.te)
 
     def text_encode(self, up, image_embeds):
         # (the LM's per-head attention products: each entry's block in L1, all entries' rows over the whole grid)
         # (and its MLP's gate / up as ONE column-parallel exact linear: _stubs/layer.py MLP_GATE_UP_FOLD)
         # (slots 4-13's input-lane products at HiFi3: _stubs/v_l_text_model.py LOW_LANE_SLOTS)
-        with self._hook(_te_attention, "BMM_KERNEL", self.bmm_kernel), self._fused_tail(), self._encoder_extras():
+        # (and every layer's MLP down projection's input-lane products at HiFi3: _stubs/layer.py DOWN_LANE_FIDELITY)
+        with self._hook(
+            _te_attention, "BMM_KERNEL", self.bmm_kernel
+        ), self._fused_tail(), self._encoder_extras(), self._hook(
+            _te_layer, "DOWN_LANE_FIDELITY", ttnn.MathFidelity.HiFi3
+        ):
             return self.text_encoder.encode_text(up.te, image_embeds)
 
     def vae_encode(self, up):
         # (its 1x1 shortcut linears run the text encoder's exact split_linear: their narrow 96 -> 192 products
         # take linear_program_config's 1D full-grid config, and the bit-identical fused hooks apply to them too)
+        # (and the precise convs' exact-lane sums without their vote: no plain / negated conv runs, no vote tail)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
+        ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
+            _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._fused_tail(
+            exact_only=True
+        ):
             return self.vae.encode(up.vae_image)
 
     def denoise_setup_state(self, up, prompt_embeds, image_latents):
@@ -479,12 +509,14 @@ class TtQwenImageEditPipeline:
         ), self._hook(
             _te_attention, "LANE_NSTACK", lane_cols_sum if self.weight_lane_split else None
         ), self._hook(
-            _te_attention, "LANE_MASKED_MM", masked_lane_linear if self.weight_lane_split else None
+            _te_attention,
+            "LANE_MASKED_MM",
+            functools.partial(masked_lane_linear, lanes=DENOISE_MM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             # (and two weights sharing the input in one pass over it)
             _te_attention,
             "LANE_MASKED_MM2",
-            masked_lane_linear2 if self.weight_lane_split else None,
+            functools.partial(masked_lane_linear2, lanes=DENOISE_MM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             _dit_attention, "HEAD_SPLIT", head_split if self.linear_kernel else None
         ), self._fused_tail(), self._denoise_extras():
@@ -501,9 +533,14 @@ class TtQwenImageEditPipeline:
         h, w = up.latent_hw
         # (the encoder's bit-identical hooks: the precise convs' bf16 rounding in one pass, the shortcut linears'
         # small-weight kernel and fused product hooks)
+        # (and the precise convs' exact-lane sums without their vote: no plain / negated conv runs, no vote tail)
         with self._hook(_vae_resident, "VOTE_TAIL", self.vote_tail), self._hook(
             _vae_resident, "ROUND_BF16", self.round_bf16
-        ), self._hook(_te_attention, "LINEAR_KERNEL", self.linear_kernel), self._fused_tail(exact_only=True):
+        ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
+            _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._fused_tail(
+            exact_only=True
+        ):
             return self.vae.decode(latents, h, w)
 
     # ---- the chained forward -------------------------------------------------------------------------

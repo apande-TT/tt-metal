@@ -57,6 +57,10 @@ def unpack_latents(x, B, C, H, W):
     return ttnn.reshape(x, (B, C, H, W))
 
 
+# The encoder's precise convs: "exact" (8 weight-lane runs + the lo limb's run per conv) or "split" (the decoder's
+# mode: the hi and lo limbs' two dense runs)
+ENCODER_CONV_MODE = "split"
+
 class PointwiseConv32:
     """A 1x1x1 QwenImageCausalConv3d as a float32 channel matmul on [B, C, H, W]: exact-lane products
     (the dense 3-term split measured 2.4e-4 relative on the image latents here; exact-lane is ~float32)."""
@@ -216,7 +220,7 @@ class TtQwenVAE:
         self.encode_max_batch = enc_batch
         # encoder convs exact-lane (its image latents condition every denoising step); decoder convs the
         # exact-product split alone (two convs each instead of the median's four)
-        self.precise_convs = self._precise_ports(self.encoder, "encoder", hf_vae.encoder, conv_mode="exact")
+        self.precise_convs = self._precise_ports(self.encoder, "encoder", hf_vae.encoder, conv_mode=ENCODER_CONV_MODE)
         self.precise_convs += self._precise_ports(self.decoder, "decoder", hf_vae.decoder, conv_mode="split")
         if tracker is not None:
             tracker.track("qwen_image_encoder3d", self.encoder)
