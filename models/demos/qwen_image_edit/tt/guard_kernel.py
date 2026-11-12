@@ -408,11 +408,70 @@ def sum_parts(g, n):
     y = ttnn.empty(
         s[1:], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=g.device(), memory_config=g.memory_config()
     )
-    ins = [g] * n
-    program = _program(
-        ins, y, pages, compute=_SUM_COMPUTE, offs=[k * pages for k in range(n)] + [0] * (5 - n), compute_args=[n]
+    return ttnn.generic_op([g, y], _sum_blk_program(g, y, n, pages))
+
+
+_SUM_BLK_READER = f"{_DIR}/sum_blk_reader.cpp"
+_SUM_BLK_COMPUTE = f"{_DIR}/sum_blk_compute.cpp"
+_SUM_BLK = 4  # tiles per slab per barrier / per DST acquire (2 x 4 float32 tiles fill the 8-tile DST)
+
+
+def _sum_blk_program(g, y, n, pages):
+    """SUM_PARTS' program, blocked: the reader moves _SUM_BLK tiles of every slab per barrier and the compute sums
+    them under one DST acquire (each init once per block), the same adds in the same order per tile."""
+    grid = y.device().compute_with_storage_grid_size()
+    work = _cores(grid, pages)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb_desc(cb):
+        return ttnn.CBDescriptor(
+            total_size=2 * _SUM_BLK * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=cb, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+
+    cbs = [cb_desc(k) for k in range(n)] + [cb_desc(_OUT_CB)]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [g.buffer_address(), count, start, pages]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
     )
-    return ttnn.generic_op([g, y], program)
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    for k in range(n):
+        unpack[k] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_SUM_BLK_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(g).get_compile_time_args() + [n, _SUM_BLK],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_SUM_BLK_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[n, _SUM_BLK],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    return ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
 
 
 def sum_list(ts):
