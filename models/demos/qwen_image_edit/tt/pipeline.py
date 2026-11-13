@@ -486,10 +486,12 @@ class TtQwenImageEditPipeline:
         # lane_cols_sum in one pass over its column blocks)
         # (and the guard's dense lead-limb product, which only checks the exact-lane sum and breaks a glitch's tie, at
         # HiFi3, the exact lane products' fidelity: HiFi2 trips the guard's 2^-12 slack and takes PCC to 0.898)
+        # (and 128 MB score chunks: 1024-row x 3-head QK^T / softmax / P@V chunks, ~10 per layer instead of 21 at
+        # 96 MB; 192 MB was slower -- its larger float32 transients cost more than the dispatches saved)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
             _te_attention, "DN_FIDELITY", ttnn.MathFidelity.HiFi3 if self.weight_lane_split else ttnn.MathFidelity.HiFi4
         ), self._hook(_dit_precise, "LANE_REUSE", bool(self.weight_lane_split)), self._hook(
-            _dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024
+            _dit_precise, "CHUNK_ROWS_BYTES", 128 * 1024 * 1024
         ), self._hook(
             _te_attention, "NORM_BF16_SQUARE", True
         ), self._hook(
