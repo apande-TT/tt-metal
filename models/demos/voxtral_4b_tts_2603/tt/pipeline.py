@@ -74,6 +74,11 @@ DEFAULT_TRACE_CAPACITY = int(os.environ.get("VOXTRAL_TRACE_C", "256"))
 # inside the stub's prebuilt ALiBi mask.
 DEFAULT_VOCODE_CAPACITY = int(os.environ.get("VOXTRAL_TRACE_VOCODE_C", "32"))
 
+# A speech call's codes reach the codec padded up to a whole number of these frames (the last frame
+# repeated), so the codec meets only max_frames / 32 lengths and no new audio length compiles. Its
+# output differs from the exact length's at bfloat16 rounding, equally close to the reference codec.
+VOCODE_BUCKET = 32
+
 # Classifier-free guidance strength. `params.json` sets `p_uncond: 0.0` and ships no sampling
 # alpha, and the reference takes it as a per-batch `[B]` argument rather than reading a config
 # field, so the value is the caller's. 3.0 is this package's default and is applied IDENTICALLY to
@@ -151,6 +156,17 @@ class VoxtralTTSPipeline:
             layout=ttnn.TILE_LAYOUT,
             device=device,
         )
+        # With `live_rows=n` the stop test ORs in `_idle_rows[n]` (1 for rows n and up) and sums all
+        # rows, so its shape is the same for every n and no row count compiles its own program.
+        self._idle_rows = [
+            ttnn.from_torch(
+                (torch.arange(self.rows) >= n).to(torch.float32).reshape(self.rows, 1),
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+            )
+            for n in range(self.rows + 1)
+        ]
 
     # ---- structure ---------------------------------------------------------------------
 
@@ -260,6 +276,8 @@ class VoxtralTTSPipeline:
         voice=None,
         pad_mask=None,
         live_rows=None,
+        warm_decode=False,
+        warm_vocode=False,
     ):
         """THE REAL TASK: tokenized text -> a 24 kHz waveform, all on device.
 
@@ -274,6 +292,10 @@ class VoxtralTTSPipeline:
         Stops on the model's OWN stop signal (`AudioSpecialTokens.end_audio`, read off the
         reference) once every row has emitted it, bounded by a derived safety cap. With `live_rows`
         only the first `live_rows` rows are waited for: the rest fill the batch tile and are discarded.
+
+        A server warms up with `warm_decode` (one decode step at every attention span this prompt's
+        later frames could reach) and once with `warm_vocode` (the codec at every bucket length),
+        so no request compiles a program; neither changes this call's result.
         """
         if self.text is None or self.acoustic is None or self.vocode is None:
             raise RuntimeError("pipeline was built without the text_to_speech head")
@@ -394,8 +416,8 @@ class VoxtralTTSPipeline:
                     stop_reason = f"every row emitted end_audio (id {self.stop_token_id}) at frame {step}"
                     break
             else:
-                n_finished = int(ttnn.to_torch(ttnn.sum(ttnn.slice(finished_flag, [0, 0], [live_rows, 1]))))
-                if n_finished >= live_rows:
+                n_finished = int(ttnn.to_torch(ttnn.sum(ttnn.logical_or(finished_flag, self._idle_rows[live_rows]))))
+                if n_finished >= batch:
                     stop_reason = (
                         f"the {live_rows} live rows emitted end_audio (id {self.stop_token_id}) at frame {step}"
                     )
@@ -409,20 +431,27 @@ class VoxtralTTSPipeline:
             llm_hidden = self.text.decode_step(embeds, position)
             position += 1
 
-        # --- vocode: the whole code sequence -> the waveform
+        if warm_decode:
+            self.text.warm_decode_spans(
+                self.vocode.audio_token_embedding(ttnn.reshape(frames[-1], [batch, self.n_codebooks, 1])), position
+            )
+
+        # --- vocode: the whole code sequence -> the waveform, at the next bucket length
         framed = [ttnn.reshape(f, [batch, self.n_codebooks, 1]) for f in frames]
-        # `ttnn.concat` of a single tensor is not worth asking for: a run that stops on the very
-        # first frame is legal (every row emitting end_audio immediately) and must not crash here.
-        codes_all = framed[0] if len(framed) == 1 else ttnn.concat(framed, dim=-1)
-        waveform_tt = self.vocode.decode(codes_all)
+        n_frames = len(framed)
+        codes_all, waveform_tt = self._vocode_bucketed(framed)
+        if warm_vocode:
+            for length in sorted({self._vocode_length(n) for n in range(1, max_frames + 1)}):
+                self._vocode_bucketed(framed[-1:] * length)
 
         # Loop finished: one readback of the per-row counts. A row that never stopped reports -1.
         counts = ttnn.to_torch(live_frames).tolist()
         flags = ttnn.to_torch(finished_flag).tolist()
         end_frame = [int(round(c[0])) if f[0] > 0.5 else -1 for c, f in zip(counts, flags)]
 
-        codes_host = ttnn.to_torch(codes_all).to(torch.int64)
+        codes_host = ttnn.to_torch(codes_all).to(torch.int64)[..., :n_frames]
         waveform = ttnn.to_torch(waveform_tt).to(torch.float32)
+        waveform = waveform[..., : n_frames * (int(waveform.shape[-1]) // int(codes_all.shape[-1]))]
         result = {
             "input_ids": input_ids,
             "codes": codes_host,
@@ -447,6 +476,18 @@ class VoxtralTTSPipeline:
             result["diagnostics"] = [{k: v[:users] for k, v in d.items()} for d in diagnostics]
             result["batch"] = users
         return result
+
+    def _vocode_length(self, n_frames):
+        """The bucket length `n_frames` frames reach the codec at."""
+        return max(n_frames, min(-(-n_frames // VOCODE_BUCKET) * VOCODE_BUCKET, self.vocode.max_frames))
+
+    def _vocode_bucketed(self, framed):
+        """`[B, 37, 1]` frames -> (their codes at the bucket length, the codec's waveform for them)."""
+        framed = framed + framed[-1:] * (self._vocode_length(len(framed)) - len(framed))
+        # `ttnn.concat` of a single tensor is not worth asking for: a run that stops on the very
+        # first frame is legal (every row emitting end_audio immediately) and must not crash here.
+        codes_all = framed[0] if len(framed) == 1 else ttnn.concat(framed, dim=-1)
+        return codes_all, self.vocode.decode(codes_all)
 
     # ---- Call 2: text continuation -----------------------------------------------------
 

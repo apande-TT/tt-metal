@@ -986,6 +986,24 @@ class TextStack:
         pad_cols = ttnn.from_torch(padcol, dtype=ttnn.float32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.device)
         return prefix_mask, mask_last, pad_cols
 
+    def _split_ids(self, input_ids_tt, split):
+        """A split prefill's ids: row 0's first P (the prefix), then every row's tail from t0, packed."""
+        rows, start, tail, real = split["rows"], split["start"], split["tail"], split["real"]
+        head_ids = ttnn.slice(input_ids_tt, [0, 0], [1, min(rows, real)])
+        if rows > real:
+            # A short voice's prefix tile-rounds past the prompt's end. Its rows from `start` on are
+            # closed to the tail, to decode and (causally) to the prefix itself, so any id fills them.
+            head_ids = ttnn.pad(head_ids, [(0, 0), (0, rows - real)], value=0)
+        batch = int(input_ids_tt.shape[0])
+        return head_ids, ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
+
+    def warm_voice_ids(self, input_ids_tt, voice):
+        """Run only `_split_ids` for a staged voice: the one part of its prefill whose kernels follow the
+        voice's exact prefix length (t0's alignment and the prefix pad), not its tile-rounded layout."""
+        split = voice.get("prefix")
+        if split is not None:
+            self._split_ids(input_ids_tt, split)
+
     def _prefill_split(self, input_ids_tt, split, need_hidden, pad_mask=None):
         """The voiced prefill with the shared prefix run ONCE -- see `_stage_prefix` for the layout.
 
@@ -1017,13 +1035,8 @@ class TextStack:
         # The tail's q and k are height-sharded over 80 cores for their fused RoPE (stubs' `_rope_rows_sharded`).
         # A decode step's norms take the FPU reduce path for their row mean (stubs' `_sq_mean`).
         # The prefix's down projection reads its activation width-sharded in its K blocks (stubs' `_down_short`).
-        head_ids = ttnn.slice(input_ids_tt, [0, 0], [1, min(rows, real)])
-        if rows > real:
-            # A short voice's prefix tile-rounds past the prompt's end. Its rows from `start` on are
-            # closed to the tail, to decode and (causally) to the prefix itself, so any id fills them.
-            head_ids = ttnn.pad(head_ids, [(0, 0), (0, rows - real)], value=0)
+        head_ids, tail_ids = self._split_ids(input_ids_tt, split)
         pre_in = self._voiced(head_ids, split["keep_head"], split["placed_head"])
-        tail_ids = ttnn.reshape(ttnn.slice(input_ids_tt, [0, start], [batch, real]), [1, batch * tail])
         tail_in = self._voiced(tail_ids, split["keep_tail"], split["placed_tail"])
         for block in self.blocks:
             block.kv["prefix_phase"] = "stash"
@@ -1270,6 +1283,16 @@ class TextStack:
                 ttnn.deallocate(hidden)
         self.filled = max(self.filled, position + 1)
         return ttnn.reshape(out, [batch, self.hidden_size])
+
+    def warm_decode_spans(self, embeds, position):
+        """One `decode_step` at each attention span from `position` to the capacity, so the later frames
+        of a call with this prompt layout compile nothing. The slots it writes sit past every position
+        decoded so far, and each is written again before any later decode reads it."""
+        filled = self.filled
+        last = self.kv_capacity - self._slot_gap - 1
+        for step_position in list(range(position, last, ttnn.TILE_SIZE)) + [last]:
+            ttnn.deallocate(self.decode_step(embeds, step_position))
+        self.filled = filled
 
     def _decode_rope(self, batch, position):
         """`(cos, sin)` for `position`, `[1, B, 1, head_dim]` height-sharded one user per core.

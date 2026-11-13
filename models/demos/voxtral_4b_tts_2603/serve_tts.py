@@ -18,9 +18,10 @@ the longest voice's prompt.
 CONCURRENT REQUESTS SHARE A BATCH. The main thread owns the device and runs every forward; the
 HTTP threads only tokenize, queue their chunks and wait. Each forward takes up to 32 queued chunks,
 from as many requests as are waiting and in whatever voices they asked for (each row carries its
-own), so N concurrent requests cost about one batch wall instead of N. Every prompt layout runs
-once before the server answers, so no request compiles; SIGTERM finishes the running batch, fails
-the queued ones and closes the device.
+own), so N concurrent requests cost about one batch wall instead of N. The default voice runs at
+every length before the server answers, and every other prompt layout and the voice mix between the
+first requests, after which no request compiles; SIGTERM finishes the running batch, fails the
+queued ones and closes the device.
 
     TT_METAL_HOME=... python -m models.demos.voxtral_4b_tts_2603.serve_tts --port 20000
     curl -s -X POST localhost:20000/v1/audio/speech -d '{"input":"Hello from Tenstorrent."}' -o out.wav
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import io
 import json
 import signal
@@ -65,6 +67,7 @@ _STATE: dict = {}
 BATCH = int(common.DEFAULT_BATCH)  # 32 -- the tuned batch
 WIDTH = 18  # the tuned body width (SPEECH_TEXTS); every chunk is padded to this
 WARMUP_TEXT = "Hello from Tenstorrent."
+WARMUP_FRAMES = 2  # frames a warm-up batch after the first runs: the prefill and one decode step
 GATHER_S = 0.3  # how long an idle device waits for more requests to share a batch
 
 
@@ -129,23 +132,28 @@ def _chunk_bodies(text: str):
     return [ids[i : i + WIDTH] for i in range(0, len(ids), WIDTH)]
 
 
-def _warmup_batches():
-    """What runs before the server answers, so no request compiles: the tuned one-voice path once per
-    prompt layout the presets bring (it follows the voice's tile-rounded prefix), then one batch of
-    every voice at once, which also builds the voice bank every mixed batch reads."""
+def _warmup_steps():
+    """`(first, rest)`: what runs so that no request compiles. `first` runs before the server answers: the
+    default voice's batch whole, with every decode attention span and every codec length. `rest` runs
+    between requests, while none is queued: the tuned one-voice path once per other prompt layout the
+    presets bring (it follows the voice's tile-rounded prefix), one batch of every voice at once, which
+    also builds the voice bank every mixed batch reads, then every voice's prefill id split. Those
+    batches stop after WARMUP_FRAMES, since past the prefill only the span differs, and they sweep it."""
     warm = _chunk_bodies(WARMUP_TEXT)
     counts = common.available_voices()
     layouts = {}
     for voice in [common.DEFAULT_VOICE] + sorted(counts):
         layouts.setdefault(-(-(counts[voice] + 3) // ttnn.TILE_SIZE), voice)
     voices = sorted(counts)
-    return [(warm, [voice] * len(warm)) for voice in layouts.values()] + [([warm[0]] * len(voices), voices)]
+    first = functools.partial(_run_batch, warm, [common.DEFAULT_VOICE] * len(warm), warm_decode=True, warm_vocode=True)
+    batches = [(warm, [voice] * len(warm)) for voice in layouts.values() if voice != common.DEFAULT_VOICE]
+    batches.append(([warm[0]] * len(voices), voices))
+    rest = [functools.partial(_run_batch, b, v, warm_decode=True, max_frames=WARMUP_FRAMES) for b, v in batches]
+    return first, rest + [_warm_voice_ids]
 
 
-def _run_batch(bodies, voices):
-    """ONE batch-32 forward over up to BATCH bodies, `voices[i]` speaking `bodies[i]`; one waveform
-    per body, in order. Rows of one voice take the tuned shared-prefix path; mixed voices share the
-    forward too, against the voice bank (`stage_voices`)."""
+def _stage(bodies, voices):
+    """A batch's prompt `(input_ids, pad_mask)` and its staged voice, the bodies filled out to BATCH rows."""
     nreal = len(bodies)
     chunk = [list(b) for b in bodies] + [list(_STATE["filler"])] * (BATCH - nreal)  # dummy rows -> discarded
     row_voices = list(voices) + [voices[0]] * (BATCH - nreal)
@@ -154,12 +162,34 @@ def _run_batch(bodies, voices):
         input_ids, audio_mask, emb, pad_mask = common.build_voice_prompt(
             ["x"] * BATCH, row_voices[0], bodies=chunk, pad=True, pad_to=WIDTH, return_pad_mask=True
         )
-        v = pipe.stage_voice(audio_mask, emb, input_ids=input_ids)
-    else:
-        input_ids, pad_mask, embeddings = common.build_mixed_voice_prompt(row_voices, chunk, pad_to=WIDTH)
-        v = pipe.stage_voices(input_ids, row_voices, embeddings)
-    result = pipe.run_text_to_speech(
-        input_ids=input_ids, max_frames=_STATE["max_frames"], voice=v, pad_mask=pad_mask, live_rows=nreal
+        return input_ids, pad_mask, pipe.stage_voice(audio_mask, emb, input_ids=input_ids)
+    input_ids, pad_mask, embeddings = common.build_mixed_voice_prompt(row_voices, chunk, pad_to=WIDTH)
+    return input_ids, pad_mask, pipe.stage_voices(input_ids, row_voices, embeddings)
+
+
+def _warm_voice_ids():
+    """Every preset's one-voice prompt through the prefill's id split, whose kernels follow the voice's
+    exact prefix length, so a voice the layout batches did not run compiles nothing either."""
+    warm = _chunk_bodies(WARMUP_TEXT)
+    pipe = _pipe()
+    for voice in sorted(common.available_voices()):
+        input_ids, _, v = _stage(warm, [voice] * len(warm))
+        pipe.text.warm_voice_ids(pipe.prepare_prompt(input_ids), v)
+
+
+def _run_batch(bodies, voices, max_frames=None, **warm):
+    """ONE batch-32 forward over up to BATCH bodies, `voices[i]` speaking `bodies[i]`; one waveform
+    per body, in order. Rows of one voice take the tuned shared-prefix path; mixed voices share the
+    forward too, against the voice bank (`stage_voices`). `warm` passes warm-up flags to the pipeline."""
+    nreal = len(bodies)
+    input_ids, pad_mask, v = _stage(bodies, voices)
+    result = _pipe().run_text_to_speech(
+        input_ids=input_ids,
+        max_frames=_STATE["max_frames"] if max_frames is None else max_frames,
+        voice=v,
+        pad_mask=pad_mask,
+        live_rows=nreal,
+        **warm,
     )
     _STATE["sr"] = result["sampling_rate"]
     return pipeline.trim_to_end(result)[:nreal]
@@ -201,10 +231,13 @@ class _Batcher:
             self._cv.notify()
         return req
 
-    def _take(self):
-        """Up to BATCH queued chunks, oldest first, whatever their voices (each row has its own)."""
+    def _take(self, wait=True):
+        """Up to BATCH queued chunks, oldest first, whatever their voices (each row has its own);
+        `[]` at once when none is queued and not `wait`."""
         with self._cv:
             while not self._queue and not self._closing:
+                if not wait:
+                    return []
                 self._cv.wait()
             if self._closing:
                 return None
@@ -220,14 +253,12 @@ class _Batcher:
         try:
             _init(self._device_id)
             t0 = time.time()
-            for bodies, voices in _warmup_batches():
-                if self._closing:
-                    return
-                _run_batch(bodies, voices)  # compile + build before serving
+            first, rest = _warmup_steps()
+            first()
             print(f"[serve_tts] warm-up synthesis done in {time.time() - t0:.1f}s", flush=True)
             if not self._closing:
                 on_ready()
-                self._serve()
+                self._serve(rest)
         finally:
             with self._cv:
                 left, self._closing = list(self._queue), True
@@ -240,11 +271,18 @@ class _Batcher:
             if _STATE.get("device") is not None:
                 ttnn.close_device(_STATE.pop("device"))
 
-    def _serve(self) -> None:
+    def _serve(self, warmups) -> None:
+        """Run queued chunks until `stop`, and the `warmups` steps one at a time whenever none is queued."""
+        warmups, t0 = collections.deque(warmups), time.time()
         while True:
-            picked = self._take()
+            picked = self._take(wait=not warmups)
             if picked is None:
                 return
+            if not picked:
+                warmups.popleft()()
+                if not warmups:
+                    print(f"[serve_tts] background warm-up done in {time.time() - t0:.1f}s: every voice ready", flush=True)
+                continue
             try:
                 waves = _run_batch([req.bodies[i] for req, i in picked], [req.voice for req, _ in picked])
             except Exception as e:  # noqa: BLE001
