@@ -58,6 +58,7 @@ from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _dit_attention
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _dit_stack
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _batch_split as _vae_batch_split
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
@@ -543,6 +544,11 @@ class TtQwenImageEditPipeline:
             _vae_resident, "ROUND_BF16", self.round_bf16
         ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
             _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._hook(
+            # (the decoded image's spatial mesh gathers with one image row per CCL page, not one 3-channel pixel)
+            _vae_batch_split,
+            "SPATIAL_WIDE_GATHER",
+            True,
         ), self._fused_tail(
             exact_only=True
         ):
