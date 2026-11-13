@@ -444,6 +444,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_NO_NN", True),
             # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
+            # (with 4 exact lanes, the linears' count: K = 4 x 128 + the rest limbs, not 8 x 128 + them)
+            (_te_attention, "QK_LANES4", True),
             # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
             (_te_attention, "LINEAR_NO_GUARD", True),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)

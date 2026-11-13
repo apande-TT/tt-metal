@@ -406,6 +406,25 @@ GUARD_NO_NN = False
 QK_NO_GUARD = False
 # QK_NO_GUARD at the HiFi4 stack fidelity too (the encoders keep HiFi4; the one product's config is the same either way)
 QK_NO_GUARD_HIFI4 = False
+# QK_NO_GUARD with 4 exact lanes instead of 8 (lane r keeps the K columns j % 4 == r: 8 nonzero terms per 32-group,
+# the linears' DENOISE_MM_LANES count): K = 4 x D + the rest limbs instead of 8 x D + them
+QK_LANES4 = False
+_QK_MASKS4 = {}
+
+
+def _qk_masks4(device, k, dtype):
+    key = (id(device), k, dtype)
+    if key not in _QK_MASKS4:
+        masks = []
+        for r in range(4):
+            m = ttnn.Tensor(
+                [1.0 if i % 4 == r else 0.0 for i in range(k)], [1, k], ttnn.float32, ttnn.TILE_LAYOUT, device
+            )
+            masks.append(ttnn.typecast(m, dtype))
+        _QK_MASKS4[key] = masks
+    return _QK_MASKS4[key]
+
+
 # The b-side exact lanes (B_LANE_SPLIT: the vision P @ V's lanes on V's rows) as ONE K-stacked product:
 # [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
 # the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
@@ -1223,6 +1242,36 @@ def _unguarded_qk(stacked, pa0, pb0, rest, keep):
     return y
 
 
+def _unguarded_qk4(pa0, pb0, rest, keep):
+    """_unguarded_qk with 4 exact lanes: [4 lanes of a's lead | rest a limbs] @ [b's lead x4 along K | rest b]^T."""
+    lanes = [ttnn.multiply(pa0, m) for m in _qk_masks4(pa0.device(), pa0.shape[-1], pa0.dtype)]
+    rest_b = [pb for _, pb in rest]
+
+    def _kr_fold():
+        kr = LANE_STACK(pb0, 4)
+        y = ttnn.concat([kr] + rest_b, dim=-1)
+        ttnn.deallocate(kr)
+        return y
+
+    kr2, kr2_kept = _b_side(keep, "kr_fold4", [pb0] + rest_b, _kr_fold)
+    xs2 = ttnn.concat(lanes + [pa for pa, _ in rest], dim=-1)
+    for t in lanes:
+        ttnn.deallocate(t)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=False):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
@@ -1267,6 +1316,18 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         neg0 = None
     else:
         stacked = None
+        if (
+            QK_LANES4
+            and QK_NO_GUARD
+            and REST_KCAT
+            and LANE_STACK is not None
+            and transpose_b
+            and b_rep == 1
+            and len(rest) > 1
+            and pa0.shape[-1] % 32 == 0
+            and (QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4 or QK_NO_GUARD_HIFI4)
+        ):
+            return _unguarded_qk4(pa0, pb0, rest, keep_b and pb0 is terms[0][1])
         # (a repeated b -- b_rep > 1 -- takes the K-stack too when its product goes through mm, which repeats b once)
         if (
             LANE_KSTACK is not None
