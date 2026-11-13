@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _att
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import (
     MASK_NEG,
     exact_all_reduce,
@@ -323,7 +324,8 @@ class TtTextMLP:
         ttnn.deallocate(gu)
         return gate, up
 
-    def __call__(self, x):
+    def __call__(self, x, resid=None):
+        """down(silu(gate(x)) * up(x)); with resid: resid + that (the layer's residual update, see _a2a_resid)."""
         if getattr(self, "precise", False):
             cfg = self.compute_cfg
             ex = getattr(self, "exact", True)
@@ -343,9 +345,13 @@ class TtTextMLP:
                     _att.INPUT_LANE_FIDELITY = prev
             else:
                 out = split_linear(h, self.w_down, compute_kernel_config=cfg, exact=ex)
+            if resid is not None and LM_SCATTER and self.tp >= 4:
+                y = _a2a_resid(out, resid, self.tp)
+                if y is not None:
+                    return y
             if self.tp > 1:
                 out = exact_all_reduce(out, self.device)
-            return out
+            return out if resid is None else ttnn.add(resid, out)
         if self.w_gu is not None:
             gate, up = self._halves(ttnn.linear(x, self.w_gu, compute_kernel_config=self.compute_cfg))
         else:
@@ -354,7 +360,45 @@ class TtTextMLP:
         out = ttnn.linear(ttnn.multiply(ttnn.silu(gate), up), self.w_down, compute_kernel_config=self.compute_cfg)
         if self.tp > 1:
             out = ttnn.all_reduce(out, cluster_axis=1, topology=ttnn.Topology.Linear)
-        return out
+        return out if resid is None else ttnn.add(resid, _fp32(out))
+
+
+# The LM MLP's exact reduce as all_to_all + slice sum with the layer's residual add on the slice (_a2a_resid).
+LM_SCATTER = True
+
+
+def _a2a_resid(out, resid, tp):
+    """resid + (exact TP sum of the float32 partials `out`) with the sum and the residual add on this chip's 1/tp
+    column slice: an all_to_all hands each chip every partial's slice of its columns ((tp - 1) / tp fewer link bytes
+    than exact_all_reduce's gather of whole partials), SUM_PARTS adds them in the same chip order, the residual add
+    runs 1/tp wide (ttnn.mesh_partition), and the UPDATED RESIDUAL is gathered. Bit-identical per element. None where
+    it does not apply (out is left as it is)."""
+    sum_parts = _att.SUM_PARTS
+    shape = list(out.shape)
+    if sum_parts is None or shape[-1] % (32 * tp) or out.layout != ttnn.TILE_LAYOUT or out.dtype != ttnn.float32:
+        return None
+    if list(resid.shape) != shape:
+        return None
+    g = ttnn.experimental.all_to_all_async_generic(
+        ttnn.reshape(out, [1] + shape),
+        in_dim=0,
+        out_dim=len(shape),
+        num_links=1,
+        topology=ttnn.Topology.Linear,
+        cluster_axis=1,
+    )
+    part = sum_parts(g, tp)
+    ttnn.deallocate(g)
+    if part is None:
+        return None
+    dim = len(shape) - 1
+    r_s = ttnn.mesh_partition(_fp32(resid), dim, 1)
+    y_s = ttnn.add(r_s, part)
+    ttnn.deallocate(r_s)
+    ttnn.deallocate(part)
+    y = ttnn.all_gather(y_s, dim=dim, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+    ttnn.deallocate(y_s)
+    return y
 
 
 class TtTextDecoderLayer:
@@ -374,6 +418,9 @@ class TtTextDecoderLayer:
         cast = _fp32 if getattr(self, "precise_inputs", False) else _bf16
         a = self.self_attn.forward_padded(cast(self.input_layernorm(x)), tt_cos, tt_sin, tt_mask)
         x = ttnn.add(x, _fp32(a))
+        if isinstance(self.mlp, TtTextMLP):
+            # (the residual add inside the MLP call: on its reduce's column slice when LM_SCATTER applies)
+            return self.mlp(cast(self.post_attention_layernorm(x)), resid=x)
         return ttnn.add(x, _fp32(self.mlp(cast(self.post_attention_layernorm(x)))))
 
     def __call__(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
