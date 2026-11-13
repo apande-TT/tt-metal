@@ -562,6 +562,9 @@ LANE_MASKED_MM = None
 # Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
 # pass over x, or None: weights sharing an input taken in pairs.
 LANE_MASKED_MM2 = None
+# With LINEAR_NO_GUARD and a two-limb input: hand the trailing limb to LANE_MASKED_MM (x_lo=...) so its product runs as
+# one more lane of the masked kernel (same weight tiles, same float32 DST) instead of a separate product + float32 add
+LANE_MASKED_LO = False
 # The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
 # no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
 LINEAR_NO_GUARD = False
@@ -585,9 +588,10 @@ def _row_lane_masks(device, k, dtype):
     return _ROW_LANE_MASKS[key]
 
 
-def _weight_lane_sums(lead, ws):
+def _weight_lane_sums(lead, ws, lo=None, folded=None):
     """[sum_r lead @ (w masked to lane r's rows) for w in ws] (the exact-lane sums), or None when the weights
-    are not small beside the input."""
+    are not small beside the input. lo: the trailing limb to fold into the masked kernel (LANE_MASKED_LO); then
+    folded[0] is set True when every output already carries lo @ w."""
     if not WEIGHT_LANES or ws is None:
         return None
     rows = 1
@@ -604,7 +608,11 @@ def _weight_lane_sums(lead, ws):
                 if pair is not None:
                     return list(pair)
             for w in ws:
-                y = LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
+                y = (
+                    LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
+                    if lo is None
+                    else LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY, x_lo=lo)
+                )
                 if y is None:
                     for t in outs:
                         ttnn.deallocate(t)
@@ -612,7 +620,11 @@ def _weight_lane_sums(lead, ws):
                     break
                 outs.append(y)
             if outs is not None:
+                if lo is not None and folded is not None:
+                    folded[0] = True
                 return outs
+            if lo is not None:  # the kernel refused the lo fold: the plain path below, lo's product added by the caller
+                return _weight_lane_sums(lead, ws)
     accs = [_LaneAcc() for _ in ws]
     cache = LANE_CACHE if WEIGHT_LANE_SPLIT is not None else None
     if cache is not None:
@@ -691,7 +703,9 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
     lo_mms = lo_mms or mms
     nn_mms = nn_mms or mms
     lead = parts[0]
-    exs = _weight_lane_sums(lead, ws)
+    folded = [False]
+    fold_lo = LANE_MASKED_LO and LINEAR_NO_GUARD and len(parts) == 2
+    exs = _weight_lane_sums(lead, ws, parts[1] if fold_lo else None, folded)
     neg_lead = None
     if exs is None:
         accs = [_LaneAcc() for _ in mms]
@@ -710,7 +724,7 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
             acc = _LaneAcc()
             acc.push(exs[i])
             exs[i] = None
-            for part in parts[1:3]:
+            for part in parts[1:3] if not folded[0] else ():
                 acc.push(lo_mms[i](part))
             for part in parts[3:]:
                 acc.push(mm(part))
