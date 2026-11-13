@@ -565,6 +565,9 @@ LANE_MASKED_MM2 = None
 # With LINEAR_NO_GUARD and a two-limb input: hand the trailing limb to LANE_MASKED_MM (x_lo=...) so its product runs as
 # one more lane of the masked kernel (same weight tiles, same float32 DST) instead of a separate product + float32 add
 LANE_MASKED_LO = False
+# And the linear's bias: LANE_MASKED_MM(..., bias=b) pre-fills its float32 output blocks with the bias rows, so the
+# products accumulate onto it in L1 (no separate float32 bias add over the output). Single-weight linears only.
+LANE_MASKED_BIAS = False
 # The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
 # no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
 LINEAR_NO_GUARD = False
@@ -588,7 +591,7 @@ def _row_lane_masks(device, k, dtype):
     return _ROW_LANE_MASKS[key]
 
 
-def _weight_lane_sums(lead, ws, lo=None, folded=None):
+def _weight_lane_sums(lead, ws, lo=None, folded=None, bias=None):
     """[sum_r lead @ (w masked to lane r's rows) for w in ws] (the exact-lane sums), or None when the weights
     are not small beside the input. lo: the trailing limb to fold into the masked kernel (LANE_MASKED_LO); then
     folded[0] is set True when every output already carries lo @ w."""
@@ -607,6 +610,12 @@ def _weight_lane_sums(lead, ws, lo=None, folded=None):
                 pair = LANE_MASKED_MM2(lead, ws[0], ws[1], LANE_STACK_FIDELITY)
                 if pair is not None:
                     return list(pair)
+            if bias is not None and lo is not None and len(ws) == 1 and folded is not None:
+                y = LANE_MASKED_MM(lead, ws[0], LANE_STACK_FIDELITY, x_lo=lo, bias=bias)
+                if y is not None:
+                    folded[0] = True
+                    folded[1] = True
+                    return [y]
             for w in ws:
                 y = (
                     LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
@@ -694,7 +703,7 @@ def _weight_lane_sums(lead, ws, lo=None, folded=None):
     return [acc.value() for acc in accs]
 
 
-def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
+def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=None, bias_folded=None):
     """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
     The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
     one lane at a time; each weight's own sums run in the same order as alone, so every output is the one
@@ -703,9 +712,12 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
     lo_mms = lo_mms or mms
     nn_mms = nn_mms or mms
     lead = parts[0]
-    folded = [False]
+    folded = [False, False]
     fold_lo = LANE_MASKED_LO and LINEAR_NO_GUARD and len(parts) == 2
-    exs = _weight_lane_sums(lead, ws, parts[1] if fold_lo else None, folded)
+    fold_b = bias if (fold_lo and LANE_MASKED_BIAS and bias_folded is not None) else None
+    exs = _weight_lane_sums(lead, ws, parts[1] if fold_lo else None, folded, fold_b)
+    if bias_folded is not None:
+        bias_folded[0] = folded[1]
     neg_lead = None
     if exs is None:
         accs = [_LaneAcc() for _ in mms]
@@ -919,6 +931,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     limbs already split (x is then only its shape)."""
     parts = split_bf16(x, limbs) if parts is None else tuple(parts)
     mm = _linear_mm(x, w)
+    b_done = [False]
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sums(
             [_linear_mm(x, w, DN_FIDELITY)],
@@ -927,7 +940,11 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
             [_linear_mm(x, w, LO_FIDELITY)],
             [_linear_mm(x, w, NN_FIDELITY)],
             ws=[w],
+            bias=bias,
+            bias_folded=b_done,
         )[0]
+        if b_done[0]:
+            return y
     elif exact:
         y = _exact_sum(mm, parts)
     else:

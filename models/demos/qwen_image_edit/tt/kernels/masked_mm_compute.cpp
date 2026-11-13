@@ -31,12 +31,18 @@ void kernel_main() {
     // 1: c_0 carries [x, lo] per row and the mask tile `lanes` is all ones -- lo's product is lane `lanes`
     constexpr uint32_t extra = get_compile_time_arg_val(6);
     constexpr uint32_t S = 1 + extra, L = lanes + extra;
+    // 1: the reader pre-fills each output block with the bias (signalled on c_5): accumulate onto it from k = 0
+    constexpr uint32_t has_bias = get_compile_time_arg_val(7);
+    constexpr uint32_t cb_sig = 5;
     constexpr uint32_t cb_x = 0, cb_w = 1, cb_m = 2, cb_lane = 3, cb_out = 16;
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_lane, cb_w, cb_out);
     cb_wait_front(cb_m, L);
     for (uint32_t n0 = 0; n0 < nt; n0 += nc) {
         cb_reserve_back(cb_out, rows * nc);
+        if constexpr (has_bias) {
+            cb_wait_front(cb_sig, 1);
+        }
         for (uint32_t k = 0; k < kt; ++k) {
             cb_wait_front(cb_x, rows * S);
             cb_wait_front(cb_w, nc);
@@ -76,7 +82,7 @@ void kernel_main() {
             // so each lane tile is unpacked once per subblock row and each w tile once per subblock column
             cb_wait_front(cb_lane, rows * L);
             pack_reconfig_data_format(cb_out);
-            pack_reconfig_l1_acc(k > 0 ? 1 : 0);
+            pack_reconfig_l1_acc((k > 0 || has_bias) ? 1 : 0);
             for (uint32_t m0 = 0; m0 < rows; m0 += 2) {
                 const uint32_t rt = rows - m0 >= 2 ? 2 : 1;
                 matmul_block_init(cb_lane, cb_w, 0, sbw, rt, L);
@@ -100,6 +106,9 @@ void kernel_main() {
         }
         pack_reconfig_l1_acc(0);
         cb_push_back(cb_out, rows * nc);
+        if constexpr (has_bias) {
+            cb_pop_front(cb_sig, 1);
+        }
     }
     cb_pop_front(cb_m, L);
 }

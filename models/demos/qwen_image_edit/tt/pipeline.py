@@ -447,6 +447,9 @@ class TtQwenImageEditPipeline:
             (_te_attention, "LINEAR_NO_GUARD", True),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
+            # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;
+            # inputs too small for the weight-lane path keep the separate add)
+            (_te_attention, "LANE_MASKED_BIAS", True),
             # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)

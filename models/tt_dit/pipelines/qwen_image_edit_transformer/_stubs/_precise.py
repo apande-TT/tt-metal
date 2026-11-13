@@ -248,8 +248,18 @@ def linear(x, w, bias=None, compute_kernel_config=None):
     if EXACT_LINEAR == "guarded":
         y = _row_chunked(lambda c: _guarded_exact(c, w), x)
     elif EXACT_LINEAR:
+        from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_att
         from models.demos.qwen_image_edit_text_encoder._stubs.attention import split_linear
 
+        rows = 1
+        for d in list(x.padded_shape)[:-1]:
+            rows *= d
+        # (only where the weight-lane path can take it -- 2 N <= rows, its own condition; smaller inputs keep the
+        # add below exactly as before)
+        if _te_att.LANE_MASKED_BIAS and bias is not None and 2 * w.shape[-1] <= rows:
+            # (the bias goes into the linear: the masked-lane kernel starts its output blocks from it; otherwise
+            # split_linear adds it in float32 itself -- the same value as the add below)
+            return _chunked_unless_weight_lanes(lambda c: split_linear(c, w, bias, exact=True, limbs=2), x, [w])
         y = _chunked_unless_weight_lanes(lambda c: split_linear(c, w, exact=True, limbs=2), x, [w])
     else:
         y = None
