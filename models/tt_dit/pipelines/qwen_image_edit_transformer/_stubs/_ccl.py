@@ -148,6 +148,21 @@ def all_gather(y, device, dim=-1):
     return y
 
 
+def partition(y, device, col_major=False):
+    """This chip's last-dim block of a replicated y, the block all_gather (col_major=False) or all_gather_col_major
+    (col_major=True) puts back in place: ttnn.mesh_partition over the mesh axes in the reverse of the gather's order
+    (no fabric traffic)."""
+    axes = mesh_axes(device)
+    order = axes if col_major else list(reversed(axes))
+    out = y
+    for ax in order:
+        nxt = ttnn.mesh_partition(out, len(out.shape) - 1, ax)
+        if out is not y:
+            ttnn.deallocate(out)
+        out = nxt
+    return out
+
+
 def all_gather_col_major(y, device, dim=-1):
     """all_gather over the mesh axes in the OTHER order (axis 0 first, on the 1/C-wide shards): device (r, c)'s
     block lands at position c * R + r instead of r * C + c. The callers lay their weights out for that order."""
