@@ -242,6 +242,10 @@ class TtQwenImageEditPipeline:
         self.bmm_config = _te_attention.bmm_program_config if precise else None
         if precise:
             lanes_ttl.prepare(device)
+            # (and the 4-lane QK^T mask tiles of the denoiser (head dim 128) and the vision tower (96, padded from 80),
+            # made here so neither stage's first call allocates them in the middle of the run's DRAM layout)
+            for k in (128, 96):
+                _te_attention._qk_masks4(device, k, ttnn.bfloat16)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
         self.vote_tail = vote_tail if precise else None
         # and its hi limbs' bf16 rounding, one pass instead of two typecasts
@@ -373,6 +377,11 @@ class TtQwenImageEditPipeline:
             _te_attention, "REST_KCAT", True
         ), self._hook(
             _te_attention, "QK_NO_GUARD_HIFI4", True
+        ), self._hook(
+            # (with 4 exact lanes, as the denoiser's: K = 4 x 96 + the rest limbs, not 8 x 96 + them)
+            _te_attention,
+            "QK_LANES4",
+            True,
         ):
             return self.text_encoder.encode_vision(up.te)
 
