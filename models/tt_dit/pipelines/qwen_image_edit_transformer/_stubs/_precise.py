@@ -384,6 +384,9 @@ def _matmul3(a, b):
 
 # Optional fused kernel: EXP_SPLIT(s, m, approx) -> (exp(s - m), bf16 hi, bf16 lo of it) in one pass, or None.
 EXP_SPLIT = None
+# EXP_SPLIT(..., rowsum=True): the kernel returns the row sum's partial sums (per row and column chunk) instead of e,
+# so the float32 e is never written and read back just to be summed
+EXP_ROWSUM = False
 _V_SPLIT = [
     None
 ]  # (b, bh, bl, [bh | bl]): the last P @ V's value limbs, shared by every query-row chunk of one attention

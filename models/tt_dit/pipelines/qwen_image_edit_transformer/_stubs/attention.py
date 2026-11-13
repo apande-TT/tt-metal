@@ -339,11 +339,15 @@ class TtQwenJointAttention:
             and not _precise.EXACT_PV
         ):
             # exp(s - max) and its P @ V limbs in one pass: e is written once and only read back by the row sum
-            res = _precise.EXP_SPLIT(s, mx, _precise.SOFTMAX_EXP_APPROX)
+            res = (
+                _precise.EXP_SPLIT(s, mx, _precise.SOFTMAX_EXP_APPROX, rowsum=True)
+                if _precise.EXP_ROWSUM
+                else _precise.EXP_SPLIT(s, mx, _precise.SOFTMAX_EXP_APPROX)
+            )
             if res is not None:
                 ttnn.deallocate(s)
                 ttnn.deallocate(mx)
-                e, eh, el = res
+                e, eh, el = res  # (with EXP_ROWSUM, e = the partial row sums [.., Sq, S*32], not exp(s - max))
                 sm = ttnn.sum(e, dim=-1, keepdim=True, compute_kernel_config=self.hifi)
                 ttnn.deallocate(e)
                 o = _precise.matmul_presplit(eh, el, v)
