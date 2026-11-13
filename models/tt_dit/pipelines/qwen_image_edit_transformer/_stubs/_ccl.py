@@ -107,22 +107,35 @@ def _gather_sum(y, device, ax):
     return ttnn.concat(outs, dim=len(shape) - 2)
 
 
+def all_reduce_scattered(y, device):
+    """The hierarchical exact reduce stopped before its final all_gather: (s, ax) with s = this device's 1/n column
+    slice of the full sum (device c along mesh axis ax holds columns [c, c + 1) * D / n, the slice
+    ttnn.mesh_partition(.., -1, ax) cuts), or None where that path does not apply."""
+    axes = mesh_axes(device)
+    if not (A2A_REDUCE and len(axes) == 2):
+        return None
+    part = _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], scatter_only=True)
+    if part is None:
+        return None
+    part2 = _gather_sum(part, device, axes[1])
+    if part2 is not part:
+        ttnn.deallocate(part)
+    return part2, axes[0]
+
+
 def all_reduce(y, device):
     """Sum of the partials over every device of the mesh (exact float32, see module docstring)."""
     axes = mesh_axes(device)
-    if A2A_REDUCE and len(axes) == 2:
-        # hierarchical: the first axis's all_to_all + slice sum, the second axis's exact reduce on that 1/n slice,
-        # then ONE all_gather of the slices -- the same sums in the same order, the second axis carrying 1/n of it
-        part = _a2a_sum(y, axes[0], tuple(device.shape)[axes[0]], scatter_only=True)
-        if part is not None:
-            part2 = _gather_sum(part, device, axes[1])
-            if part2 is not part:
-                ttnn.deallocate(part)
-            out = ttnn.all_gather(
-                part2, dim=len(part2.shape) - 1, cluster_axis=axes[0], num_links=1, topology=ttnn.Topology.Linear
-            )
-            ttnn.deallocate(part2)
-            return out
+    # hierarchical: the first axis's all_to_all + slice sum, the second axis's exact reduce on that 1/n slice,
+    # then ONE all_gather of the slices -- the same sums in the same order, the second axis carrying 1/n of it
+    r = all_reduce_scattered(y, device)
+    if r is not None:
+        part2, ax = r
+        out = ttnn.all_gather(
+            part2, dim=len(part2.shape) - 1, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear
+        )
+        ttnn.deallocate(part2)
+        return out
     for ax in axes:
         y = _gather_sum(y, device, ax)
     return y
@@ -133,6 +146,21 @@ def all_gather(y, device, dim=-1):
     for ax in mesh_axes(device):
         y = ttnn.all_gather(y, dim=dim, cluster_axis=ax, num_links=1, topology=ttnn.Topology.Linear)
     return y
+
+
+def partition(y, device, col_major=False):
+    """This chip's last-dim block of a replicated y, the block all_gather (col_major=False) or all_gather_col_major
+    (col_major=True) puts back in place: ttnn.mesh_partition over the mesh axes in the reverse of the gather's order
+    (no fabric traffic)."""
+    axes = mesh_axes(device)
+    order = axes if col_major else list(reversed(axes))
+    out = y
+    for ax in order:
+        nxt = ttnn.mesh_partition(out, len(out.shape) - 1, ax)
+        if out is not y:
+            ttnn.deallocate(out)
+        out = nxt
+    return out
 
 
 def all_gather_col_major(y, device, dim=-1):

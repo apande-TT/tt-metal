@@ -58,6 +58,7 @@ from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _ccl as _
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import _precise as _dit_precise
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _dit_attention
 from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import encoder_stack as _dit_stack
+from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _batch_split as _vae_batch_split
 from models.tt_dit.pipelines.qwen_image_edit_vae._stubs import _resident as _vae_resident
 
 # Stages from the HF reference (model_index.json): the Qwen2.5-VL text_encoder is a vision tower + an
@@ -445,6 +446,11 @@ class TtQwenImageEditPipeline:
             (_te_attention, "QK_NO_GUARD", True),
             # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
             (_te_attention, "LINEAR_NO_GUARD", True),
+            # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
+            (_te_attention, "LANE_MASKED_LO", True),
+            # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;
+            # inputs too small for the weight-lane path keep the separate add)
+            (_te_attention, "LANE_MASKED_BIAS", True),
             # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
@@ -538,6 +544,11 @@ class TtQwenImageEditPipeline:
             _vae_resident, "ROUND_BF16", self.round_bf16
         ), self._hook(_vae_resident, "EXACT_NO_VOTE", True), self._hook(
             _te_attention, "LINEAR_KERNEL", self.linear_kernel
+        ), self._hook(
+            # (the decoded image's spatial mesh gathers with one image row per CCL page, not one 3-channel pixel)
+            _vae_batch_split,
+            "SPATIAL_WIDE_GATHER",
+            True,
         ), self._fused_tail(
             exact_only=True
         ):

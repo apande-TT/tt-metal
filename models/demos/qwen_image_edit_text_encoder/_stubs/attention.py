@@ -275,6 +275,15 @@ def split_bf16(x, limbs=2, memory_config=None):
 # deterministic in the data). The position moves when the lane assignment is rotated per 32-group, so
 # the product is formed with three 8-spaced partitions (lane = k%8, (k%8 + g)%8, (k%8 + 3g)%8 for
 # group g) and the elementwise median of the three is taken: a glitch in one is outvoted by two.
+def _f32(t):
+    return t if t.dtype == ttnn.float32 else ttnn.typecast(t, ttnn.float32)
+
+
+# The vision attention's bias + residual adds on its out-projection column slice before the gather
+# (TtVisionAttention._resid_cols).
+RESID_COLS = True
+
+
 EXACT_LANES = 8
 LANE_PATTERNS = ("strided", "rot1", "rot3")
 _LANE_MASKS = {}
@@ -553,6 +562,12 @@ LANE_MASKED_MM = None
 # Optional two-weight form: LANE_MASKED_MM2(x, w, w2, fidelity) -> (LANE_MASKED_MM(x, w), LANE_MASKED_MM(x, w2)) in ONE
 # pass over x, or None: weights sharing an input taken in pairs.
 LANE_MASKED_MM2 = None
+# With LINEAR_NO_GUARD and a two-limb input: hand the trailing limb to LANE_MASKED_MM (x_lo=...) so its product runs as
+# one more lane of the masked kernel (same weight tiles, same float32 DST) instead of a separate product + float32 add
+LANE_MASKED_LO = False
+# And the linear's bias: LANE_MASKED_MM(..., bias=b) pre-fills its float32 output blocks with the bias rows, so the
+# products accumulate onto it in L1 (no separate float32 bias add over the output). Single-weight linears only.
+LANE_MASKED_BIAS = False
 # The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
 # no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
 LINEAR_NO_GUARD = False
@@ -576,9 +591,10 @@ def _row_lane_masks(device, k, dtype):
     return _ROW_LANE_MASKS[key]
 
 
-def _weight_lane_sums(lead, ws):
+def _weight_lane_sums(lead, ws, lo=None, folded=None, bias=None):
     """[sum_r lead @ (w masked to lane r's rows) for w in ws] (the exact-lane sums), or None when the weights
-    are not small beside the input."""
+    are not small beside the input. lo: the trailing limb to fold into the masked kernel (LANE_MASKED_LO); then
+    folded[0] is set True when every output already carries lo @ w."""
     if not WEIGHT_LANES or ws is None:
         return None
     rows = 1
@@ -594,8 +610,18 @@ def _weight_lane_sums(lead, ws):
                 pair = LANE_MASKED_MM2(lead, ws[0], ws[1], LANE_STACK_FIDELITY)
                 if pair is not None:
                     return list(pair)
+            if bias is not None and lo is not None and len(ws) == 1 and folded is not None:
+                y = LANE_MASKED_MM(lead, ws[0], LANE_STACK_FIDELITY, x_lo=lo, bias=bias)
+                if y is not None:
+                    folded[0] = True
+                    folded[1] = True
+                    return [y]
             for w in ws:
-                y = LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
+                y = (
+                    LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY)
+                    if lo is None
+                    else LANE_MASKED_MM(lead, w, LANE_STACK_FIDELITY, x_lo=lo)
+                )
                 if y is None:
                     for t in outs:
                         ttnn.deallocate(t)
@@ -603,7 +629,11 @@ def _weight_lane_sums(lead, ws):
                     break
                 outs.append(y)
             if outs is not None:
+                if lo is not None and folded is not None:
+                    folded[0] = True
                 return outs
+            if lo is not None:  # the kernel refused the lo fold: the plain path below, lo's product added by the caller
+                return _weight_lane_sums(lead, ws)
     accs = [_LaneAcc() for _ in ws]
     cache = LANE_CACHE if WEIGHT_LANE_SPLIT is not None else None
     if cache is not None:
@@ -673,7 +703,7 @@ def _weight_lane_sums(lead, ws):
     return [acc.value() for acc in accs]
 
 
-def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
+def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=None, bias_folded=None):
     """EXACT_MODE "guarded" for linears of ONE input: mms[i](p) = p @ w_i; parts = the input's bf16 limbs.
     The input side (each lane, the negated lead limb, its row norms) is formed once for all the weights,
     one lane at a time; each weight's own sums run in the same order as alone, so every output is the one
@@ -682,7 +712,12 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
     lo_mms = lo_mms or mms
     nn_mms = nn_mms or mms
     lead = parts[0]
-    exs = _weight_lane_sums(lead, ws)
+    folded = [False, False]
+    fold_lo = LANE_MASKED_LO and LINEAR_NO_GUARD and len(parts) == 2
+    fold_b = bias if (fold_lo and LANE_MASKED_BIAS and bias_folded is not None) else None
+    exs = _weight_lane_sums(lead, ws, parts[1] if fold_lo else None, folded, fold_b)
+    if bias_folded is not None:
+        bias_folded[0] = folded[1]
     neg_lead = None
     if exs is None:
         accs = [_LaneAcc() for _ in mms]
@@ -701,7 +736,7 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None):
             acc = _LaneAcc()
             acc.push(exs[i])
             exs[i] = None
-            for part in parts[1:3]:
+            for part in parts[1:3] if not folded[0] else ():
                 acc.push(lo_mms[i](part))
             for part in parts[3:]:
                 acc.push(mm(part))
@@ -896,6 +931,7 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
     limbs already split (x is then only its shape)."""
     parts = split_bf16(x, limbs) if parts is None else tuple(parts)
     mm = _linear_mm(x, w)
+    b_done = [False]
     if exact and EXACT_MODE == "guarded":
         y = _guarded_sums(
             [_linear_mm(x, w, DN_FIDELITY)],
@@ -904,7 +940,11 @@ def split_linear(x, w, bias=None, compute_kernel_config=None, exact=True, limbs=
             [_linear_mm(x, w, LO_FIDELITY)],
             [_linear_mm(x, w, NN_FIDELITY)],
             ws=[w],
+            bias=bias,
+            bias_folded=b_done,
         )[0]
+        if b_done[0]:
+            return y
     elif exact:
         y = _exact_sum(mm, parts)
     else:
@@ -1452,13 +1492,17 @@ class TtVisionAttention:
             o = ttnn.pad(o, [(0, 0), (0, 0), (0, s_pad - rows), (0, 0)], 0.0)
         return o
 
-    def forward_padded(self, x, tt_cos, tt_sin, tt_mask):
+    def forward_padded(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         """x: [N, 1, s_pad, C] replicated (N independent images) -> [N, 1, s_pad, C] (bias included).
-        tt_cos / tt_sin [1, 1, s_pad, D] and tt_mask [1, 1, s_pad, s_pad] broadcast over N."""
+        tt_cos / tt_sin [1, 1, s_pad, D] and tt_mask [1, 1, s_pad, s_pad] broadcast over N.
+        With resid: resid + that (the block's residual update; on the out-projection's column slice, see
+        _resid_cols)."""
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         if self.precise:
-            return self._forward_precise(x, tt_cos, tt_sin, tt_mask)
+            return self._forward_precise(x, tt_cos, tt_sin, tt_mask, resid=resid)
+        if resid is not None:
+            return ttnn.add(resid, _f32(self.forward_padded(x, tt_cos, tt_sin, tt_mask)))
         # column-parallel qkv on local heads: [1, 1, S, 3*hp*D]
         qkv = ttnn.linear(x, self.wqkv, bias=self.bqkv, compute_kernel_config=self.compute_cfg)
         loc = hp * D
@@ -1512,7 +1556,7 @@ class TtVisionAttention:
             self._tables_p[key] = (tt_cos, tt_sin, out[0], out[1])  # (the sources kept: their ids stay unique)
         return self._tables_p[key][2:]
 
-    def _forward_precise_padded(self, x, tt_cos, tt_sin, tt_mask):
+    def _forward_precise_padded(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         """_forward_precise with every head's columns zero-padded to Dp (see __init__)."""
         D, Dp, hp = self.head_dim, self.head_dim_pad, self.local_heads
         cfg = self.compute_cfg
@@ -1572,14 +1616,35 @@ class TtVisionAttention:
         if self.tp > 1:
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
             out = split_linear(o, self.wproj_cols_p, compute_kernel_config=cfg, limbs=L)
+            if resid is not None and RESID_COLS:
+                return self._resid_cols(out, resid)
             out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
         else:
             out = split_linear(o, self.wproj_p, compute_kernel_config=cfg, limbs=L)
-        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        out = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        return out if resid is None else ttnn.add(resid, out)
 
-    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask):
+    def _resid_cols(self, out_s, resid):
+        """resid + (gather(out_s) + bias) with the bias and residual adds on this chip's out-projection column slice
+        out_s (ttnn.mesh_partition cuts the matching slices) and the UPDATED RESIDUAL gathered: the same gather
+        bytes, the two full-width float32 adds 1/tp wide, the same per-element ops (bit-identical)."""
+        dim = len(out_s.shape) - 1
+        b32 = ttnn.typecast(self.bproj, ttnn.float32)
+        b_s = ttnn.mesh_partition(b32, len(b32.shape) - 1, 1)
+        t = ttnn.add(out_s, b_s)
+        ttnn.deallocate(out_s)
+        ttnn.deallocate(b_s)
+        r_s = ttnn.mesh_partition(_f32(resid), dim, 1)
+        y_s = ttnn.add(r_s, t)
+        ttnn.deallocate(r_s)
+        ttnn.deallocate(t)
+        y = ttnn.all_gather(y_s, dim=dim, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
+        ttnn.deallocate(y_s)
+        return y
+
+    def _forward_precise(self, x, tt_cos, tt_sin, tt_mask, resid=None):
         if self.head_pad and self.head_dim % 32:
-            return self._forward_precise_padded(x, tt_cos, tt_sin, tt_mask)
+            return self._forward_precise_padded(x, tt_cos, tt_sin, tt_mask, resid=resid)
         D, hp = self.head_dim, self.local_heads
         n, s_pad = x.shape[0], x.shape[-2]
         loc = hp * D
@@ -1622,11 +1687,14 @@ class TtVisionAttention:
             # the heads gathered (exact data movement), this chip's output columns over the whole K, gathered back
             o = ttnn.all_gather(o, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
             out = split_linear(o, self.wproj_cols, compute_kernel_config=cfg, limbs=L)
+            if resid is not None and RESID_COLS:
+                return self._resid_cols(out, resid)
             out = ttnn.all_gather(out, dim=3, cluster_axis=1, num_links=1, topology=ttnn.Topology.Linear)
         else:
             out = split_linear(o, self.wproj, compute_kernel_config=cfg, limbs=L)
         # float32 bias: adding a bf16 tensor to a float32 one rounds the SUM to bf16 (~4e-4 relative)
-        return ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        out = ttnn.add(out, ttnn.typecast(self.bproj, ttnn.float32))
+        return out if resid is None else ttnn.add(resid, out)
 
     def __call__(self, hidden_states, cu_seqlens=None, position_embeddings=None, **kwargs):
         s = hidden_states.shape[0]

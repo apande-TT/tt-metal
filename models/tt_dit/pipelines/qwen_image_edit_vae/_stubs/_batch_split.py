@@ -19,6 +19,10 @@ H_AXIS = 0
 W_AXIS = 1
 
 
+# the spatial (W / H) output gathers with one image row per CCL page, like the batch-axis gathers below
+SPATIAL_WIDE_GATHER = True
+
+
 def mesh_shape(device):
     try:
         shape = tuple(device.shape)
@@ -152,10 +156,23 @@ class BatchSplit:
     def gather(self, out, ccl_manager, B, pad_b):
         """This chip's BTHWC part -> the replicated [B, ...] whole."""
         pc = self.parallel_config
-        if pc.width_parallel.factor > 1:
-            out = ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
-        if pc.height_parallel.factor > 1:
-            out = ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
+        spatial = pc.width_parallel.factor > 1 or pc.height_parallel.factor > 1
+        if SPATIAL_WIDE_GATHER and spatial and len(out.shape) == 5 and out.layout == ttnn.ROW_MAJOR_LAYOUT:
+            # the same wide-page relayout for the spatial gathers: this chip's [B, T, h, w, C] as [B*T, h, w*C]
+            # rows, W-slices gathered along the w*C axis (C is innermost, so W-slice j's rows land at columns
+            # j*w*C..) and H-slices along h -- the same bytes in the same order, one image row per CCL page
+            ob, ot, oh, ow, oc = out.shape
+            out = ttnn.reshape(out, (ob * ot, oh, ow * oc))
+            if pc.width_parallel.factor > 1:
+                out = ccl_manager.all_gather(out, dim=2, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
+            if pc.height_parallel.factor > 1:
+                out = ccl_manager.all_gather(out, dim=1, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
+            out = ttnn.reshape(out, (ob, ot, out.shape[1], out.shape[2] // oc, oc))
+        else:
+            if pc.width_parallel.factor > 1:
+                out = ccl_manager.all_gather(out, dim=3, mesh_axis=pc.width_parallel.mesh_axis, use_hyperparams=False)
+            if pc.height_parallel.factor > 1:
+                out = ccl_manager.all_gather(out, dim=2, mesh_axis=pc.height_parallel.mesh_axis, use_hyperparams=False)
         if self.axes:
             # a narrow row-major output (the decoder's 3-channel image: 12-byte pages; the encoder's 32-channel
             # moments: 128-byte pages) is gathered as wide pages

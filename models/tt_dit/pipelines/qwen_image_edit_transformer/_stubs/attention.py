@@ -58,6 +58,8 @@ def _replicated(t, device, dtype=ttnn.float32):
 
 # The column-parallel out-projections' two gathers axis 0 first (see TtQwenJointAttention.__init__)
 OUT_GATHER_COL_MAJOR = True
+# The column-parallel out-projections' bias + gated residual update on the chip's output columns before the gather.
+ATTN_SCATTER_RESID = True
 
 
 def _sharded(t, device, dim, dtype=ttnn.bfloat16):
@@ -377,19 +379,38 @@ class TtQwenJointAttention:
             )  # [B, Hl, Sq, D]
         return o
 
-    def _out(self, x, wb):  # row-parallel + all_reduce, bias once (or column-parallel, see __init__)
+    def _out(self, x, wb, resid=None, gate=None):
+        """row-parallel + all_reduce, bias once (or column-parallel, see __init__); with resid / gate: the block's
+        gated residual update resid + gate * out -- for the column-parallel out-projection on this chip's output
+        columns before the gather (ATTN_SCATTER_RESID: the bias add and the addcmul 1/n wide, the same per-element
+        ops; the gather carries the updated residual, the same bytes)."""
         w, b = wb
         if self.out_cols:
-            gather = _ccl.all_gather_col_major if self.out_order is not None else _ccl.all_gather
+            col_major = self.out_order is not None
+            gather = _ccl.all_gather_col_major if col_major else _ccl.all_gather
             y = _precise.linear(gather(x, self.device, dim=-1), w)
-            return ttnn.add(gather(y, self.device, dim=-1), b)
+            if resid is not None and ATTN_SCATTER_RESID:
+                b_s = _ccl.partition(b, self.device, col_major)
+                g_s = _ccl.partition(gate, self.device, col_major)
+                r_s = _ccl.partition(resid, self.device, col_major)
+                yb = ttnn.add(y, b_s)
+                ttnn.deallocate(y)
+                out_s = ttnn.addcmul(r_s, g_s, yb)
+                for t in (yb, r_s, g_s, b_s):
+                    ttnn.deallocate(t)
+                out = gather(out_s, self.device, dim=-1)
+                ttnn.deallocate(out_s)
+                return out
+            out = ttnn.add(gather(y, self.device, dim=-1), b)
+            return out if resid is None else ttnn.addcmul(resid, gate, out)
         if _precise.ENABLED:
             y = _precise.linear(x, w)
         else:
             y = ttnn.linear(x, w, dtype=ttnn.float32, compute_kernel_config=self.hifi)
         if self.tp > 1:
             y = _ccl.all_reduce(y, self.device)
-        return ttnn.add(y, b)
+        out = ttnn.add(y, b)
+        return out if resid is None else ttnn.addcmul(resid, gate, out)
 
     # ---- forward -------------------------------------------------------------------------------
     def __call__(
@@ -399,8 +420,14 @@ class TtQwenJointAttention:
         encoder_hidden_states_mask=None,
         attention_mask=None,
         image_rotary_emb=None,
+        resid=None,
+        gate=None,
     ):
+        """(img, txt) attention outputs; with resid=(img_res, txt_res), gate=(img_gate, txt_gate): the gated residual
+        updates res + gate * out instead (see _out)."""
         d = self.device
+        r_img, r_txt = (None, None) if resid is None else resid
+        g_img, g_txt = (None, None) if gate is None else gate
         hs = _as_tt(hidden_states, d, ttnn.float32 if _precise.ENABLED else ttnn.bfloat16)
         ehs = _as_tt(encoder_hidden_states, d, ttnn.float32 if _precise.ENABLED else ttnn.bfloat16)
         vdt = ttnn.float32 if _precise.ENABLED else ttnn.bfloat16
@@ -435,10 +462,10 @@ class TtQwenJointAttention:
             m = _as_tt(attention_mask, d)  # 1 = attend, 0 = masked; [B, 1, 1, S_joint]
             mask_add = ttnn.multiply(ttnn.subtract(m, 1.0), 1e30)
 
-        img = self._out(self._attend(qi, kh, kl, v, mask_add), self.img_out)
+        img = self._out(self._attend(qi, kh, kl, v, mask_add), self.img_out, r_img, g_img)
         if SKIP_TXT_OUT:
             return img, None
-        txt = self._out(self._attend(qt, kh, kl, v, mask_add), self.txt_out)
+        txt = self._out(self._attend(qt, kh, kl, v, mask_add), self.txt_out, r_txt, g_txt)
         return img, txt
 
 

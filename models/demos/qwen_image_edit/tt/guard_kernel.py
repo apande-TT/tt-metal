@@ -408,11 +408,70 @@ def sum_parts(g, n):
     y = ttnn.empty(
         s[1:], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=g.device(), memory_config=g.memory_config()
     )
-    ins = [g] * n
-    program = _program(
-        ins, y, pages, compute=_SUM_COMPUTE, offs=[k * pages for k in range(n)] + [0] * (5 - n), compute_args=[n]
+    return ttnn.generic_op([g, y], _sum_blk_program(g, y, n, pages))
+
+
+_SUM_BLK_READER = f"{_DIR}/sum_blk_reader.cpp"
+_SUM_BLK_COMPUTE = f"{_DIR}/sum_blk_compute.cpp"
+_SUM_BLK = 4  # tiles per slab per barrier / per DST acquire (2 x 4 float32 tiles fill the 8-tile DST)
+
+
+def _sum_blk_program(g, y, n, pages):
+    """SUM_PARTS' program, blocked: the reader moves _SUM_BLK tiles of every slab per barrier and the compute sums
+    them under one DST acquire (each init once per block), the same adds in the same order per tile."""
+    grid = y.device().compute_with_storage_grid_size()
+    work = _cores(grid, pages)
+    cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
+
+    def cb_desc(cb):
+        return ttnn.CBDescriptor(
+            total_size=2 * _SUM_BLK * _FP32_TILE_BYTES,
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=cb, data_format=ttnn.float32, page_size=_FP32_TILE_BYTES)
+            ],
+        )
+
+    cbs = [cb_desc(k) for k in range(n)] + [cb_desc(_OUT_CB)]
+    reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+    for c, start, count in work:
+        reader_rt[c.x][c.y] = [g.buffer_address(), count, start, pages]
+        compute_rt[c.x][c.y] = [count]
+        writer_rt[c.x][c.y] = [y.buffer_address(), count, start]
+    compute_cfg = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
     )
-    return ttnn.generic_op([g, y], program)
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    for k in range(n):
+        unpack[k] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute_cfg.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=_SUM_BLK_READER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=ttnn.TensorAccessorArgs(g).get_compile_time_args() + [n, _SUM_BLK],
+            runtime_args=reader_rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_SUM_BLK_COMPUTE,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[n, _SUM_BLK],
+            runtime_args=compute_rt,
+            config=compute_cfg,
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=_WRITER,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores,
+            compile_time_args=[_OUT_CB] + ttnn.TensorAccessorArgs(y).get_compile_time_args(),
+            runtime_args=writer_rt,
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    return ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
 
 
 def sum_list(ts):
@@ -530,7 +589,18 @@ def _col_masks(device, lanes=8):
     return _COL_MASKS[key]
 
 
-def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
+def _col_masks_ones(device, lanes):
+    """_col_masks plus one all-ones tile (index lanes): the lane slot of masked_lane_linear's folded trailing limb."""
+    key = (id(device), lanes, "ones")
+    if key not in _COL_MASKS:
+        vals = [1.0 if j % lanes == r else 0.0 for r in range(lanes) for _ in range(TILE) for j in range(TILE)]
+        vals += [1.0] * (TILE * TILE)
+        m = ttnn.Tensor(vals, [(lanes + 1) * TILE, TILE], ttnn.float32, ttnn.TILE_LAYOUT, device)
+        _COL_MASKS[key] = ttnn.typecast(m, ttnn.bfloat16)
+    return _COL_MASKS[key]
+
+
+def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8, x_lo=None, bias=None):
     """sum_r lane_r(x) @ w in float32 (lane r of x keeping its K columns k % 8 == r: the exact-lane sum of the
     weight-side lanes) for a bf16 interleaved tile input [..., M, K] and bf16 weight [K, N] (M, K, N tile-aligned),
     with no 8x copy of x: each core masks its own x tiles into their lanes in L1 and reads w once. None for a shape
@@ -542,6 +612,14 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
         return None
     if w.layout != ttnn.TILE_LAYOUT or w.is_sharded() or list(x.padded_shape) != s:
         return None
+    if x_lo is not None and (
+        list(x_lo.padded_shape) != s
+        or x_lo.dtype != ttnn.bfloat16
+        or x_lo.layout != ttnn.TILE_LAYOUT
+        or x_lo.is_sharded()
+    ):
+        return None
+    extra = 0 if x_lo is None else 1
     rows = 1
     for d in s[:-1]:
         rows *= d
@@ -550,7 +628,8 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
     work = _cores(dev.compute_with_storage_grid_size(), mt)
     rmax = max(c for _, _, c in work)
     page = _FP32_TILE_BYTES // 2
-    fixed = (2 * rmax + lanes + lanes * rmax) * page  # x (double), masks, lanes
+    ln = lanes + extra
+    fixed = (2 * rmax * (1 + extra) + ln + ln * rmax) * page  # x (+ lo) (double), masks, lanes
     nc = next(
         (
             d
@@ -569,8 +648,14 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
         nc, w_bufs = nc1, 1
     if not nc:
         return None
+    if bias is not None and nc != nt:  # (the bias pre-fill takes one output block per core)
+        return None
     sbw = 2 if nc % 2 == 0 else 1  # (2-row subblocks: 2 x sbw <= the 4 float32 DST tiles)
-    masks = _col_masks(dev, lanes)
+    masks = _col_masks(dev, lanes) if not extra else _col_masks_ones(dev, lanes)
+    b_rows = None
+    if bias is not None:  # [32, N] float32, every row the bias: the output blocks' starting value
+        b32 = bias if bias.dtype == ttnn.float32 else ttnn.typecast(bias, ttnn.float32)
+        b_rows = ttnn.repeat(ttnn.reshape(b32, [1, ws[1]]), (TILE, 1))
     y = ttnn.empty(s[:-1] + [ws[1]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
 
@@ -583,15 +668,19 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
         )
 
     cbs = [
-        cb(0, 2 * rmax, ttnn.bfloat16),
+        cb(0, 2 * rmax * (1 + extra), ttnn.bfloat16),
         cb(1, w_bufs * nc, ttnn.bfloat16),
-        cb(2, lanes, ttnn.bfloat16),
-        cb(3, lanes * rmax, ttnn.bfloat16),
+        cb(2, ln, ttnn.bfloat16),
+        cb(3, ln * rmax, ttnn.bfloat16),
         cb(_OUT_CB, rmax * nc, ttnn.float32),
-    ]
+    ] + ([cb(5, 1, ttnn.bfloat16)] if b_rows is not None else [])
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     for c, start, count in work:
-        reader_rt[c.x][c.y] = [x.buffer_address(), w.buffer_address(), masks.buffer_address(), start, count]
+        reader_rt[c.x][c.y] = [x.buffer_address(), w.buffer_address(), masks.buffer_address(), start, count] + (
+            [(x_lo if extra else x).buffer_address(), b_rows.buffer_address()]
+            if b_rows is not None
+            else ([x_lo.buffer_address()] if extra else [])
+        )
         compute_rt[c.x][c.y] = [count]
         writer_rt[c.x][c.y] = [y.buffer_address(), start, count]
     compute_cfg = ttnn.ComputeConfigDescriptor(math_fidelity=fidelity, fp32_dest_acc_en=True)
@@ -603,7 +692,10 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
             compile_time_args=ttnn.TensorAccessorArgs(x).get_compile_time_args()
             + ttnn.TensorAccessorArgs(w).get_compile_time_args()
             + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
-            + [kt, nt, nc, lanes],
+            + [kt, nt, nc, lanes, extra]
+            + ttnn.TensorAccessorArgs(x_lo if extra else x).get_compile_time_args()
+            + [int(b_rows is not None)]
+            + ttnn.TensorAccessorArgs(b_rows if b_rows is not None else x).get_compile_time_args(),
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -611,7 +703,7 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
             kernel_source=_MM_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, nc, sbw, rmax, lanes],
+            compile_time_args=[kt, nt, nc, sbw, rmax, lanes, extra, int(b_rows is not None)],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
@@ -624,7 +716,12 @@ def masked_lane_linear(x, w, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
             config=ttnn.WriterConfigDescriptor(),
         ),
     ]
-    ttnn.generic_op([x, w, masks, y], ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+    ttnn.generic_op(
+        [x, w, masks, y] + ([x_lo] if extra else []) + ([b_rows] if b_rows is not None else []),
+        ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs),
+    )
+    if b_rows is not None:
+        ttnn.deallocate(b_rows)
     return y
 
 
@@ -724,7 +821,7 @@ def masked_lane_linear2(x, w, w2, fidelity=ttnn.MathFidelity.HiFi3, lanes=8):
             kernel_source=_MM_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, nc, sbw, rmax, lanes],
+            compile_time_args=[kt, nt, nc, sbw, rmax, lanes, 0, 0],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
