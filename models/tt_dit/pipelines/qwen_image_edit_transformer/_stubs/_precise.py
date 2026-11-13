@@ -384,7 +384,12 @@ def _matmul3(a, b):
 
 # Optional fused kernel: EXP_SPLIT(s, m, approx) -> (exp(s - m), bf16 hi, bf16 lo of it) in one pass, or None.
 EXP_SPLIT = None
-_V_SPLIT = [None]  # (b, bh, bl): the last P @ V's value limbs, shared by every query-row chunk of one attention
+_V_SPLIT = [
+    None
+]  # (b, bh, bl, [bh | bl]): the last P @ V's value limbs, shared by every query-row chunk of one attention
+# matmul_presplit: ah's two products (ah @ bh, ah @ bl) as ONE product against [bh | bl] (N doubled): the [.., Sq, Sk]
+# ah is read once, not twice; the halves are sliced back and summed in the same order
+PV_SHARE = False
 
 
 def matmul_presplit(ah, al, b):
@@ -393,16 +398,25 @@ def matmul_presplit(ah, al, b):
     ent = _V_SPLIT[0]
     if ent is None or ent[0] is not b:
         if ent is not None:
-            ttnn.deallocate(ent[1])
-            ttnn.deallocate(ent[2])
+            for t in ent[1:]:
+                if t is not None:
+                    ttnn.deallocate(t)
         bh, bl = split_bf16(b)
-        ent = (b, bh, bl)
+        ent = (b, bh, bl, ttnn.concat([bh, bl], dim=-1) if PV_SHARE else None)
         _V_SPLIT[0] = ent
-    _, bh, bl = ent
+    _, bh, bl, bhl = ent
     cfg = precise_config()
     mm = lambda p, q: ttnn.matmul(  # noqa: E731
         p, q, compute_kernel_config=cfg, dtype=ttnn.float32, program_config=_bmm_config(p, q)
     )
+    if bhl is not None:
+        d = bh.shape[-1]
+        hl = mm(ah, bhl)
+        shape = list(hl.shape)
+        t_h = ttnn.slice(hl, [0] * len(shape), shape[:-1] + [d])
+        t_l = ttnn.slice(hl, [0] * (len(shape) - 1) + [d], shape)
+        ttnn.deallocate(hl)
+        return ttnn.add(ttnn.add(t_h, t_l), mm(al, bh))
     return ttnn.add(ttnn.add(mm(ah, bh), mm(ah, bl)), mm(al, bh))
 
 
