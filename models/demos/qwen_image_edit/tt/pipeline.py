@@ -461,6 +461,8 @@ class TtQwenImageEditPipeline:
             (_dit_precise, "QK_LIMBS", 2),
             # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
             (_te_attention, "LINEAR_NO_GUARD", True),
+            # (and their input-side lanes as 4, the masked-lane kernel's count: half the lane products)
+            (_te_attention, "INPUT_LANES4", True),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
             # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;

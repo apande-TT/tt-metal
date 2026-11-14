@@ -593,6 +593,9 @@ LANE_MASKED_BIAS = False
 # The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
 # no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
 LINEAR_NO_GUARD = False
+# With LINEAR_NO_GUARD: the input-side exact lanes of a linear as 4 (8 nonzero K terms per 32-group, the masked-lane
+# kernel's count) -- the 8 lanes' disjoint pairs summed -- so half the lane products run
+INPUT_LANES4 = False
 # Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
 INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
@@ -747,6 +750,17 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
         if INPUT_LANE_FIDELITY is not None and ws is not None and all(len(w.shape) == 2 for w in ws):
             lane_mms = [_linear_mm(lead, w, INPUT_LANE_FIDELITY) for w in ws]
         lanes, neg_lead = _lead_lanes(lead)
+        if INPUT_LANES4 and LINEAR_NO_GUARD:
+            # 4 lanes (j % 4 == r) as the 8 lanes' disjoint pairs r, r + 4 summed (exact): half the lane products
+            l8 = list(lanes)
+            if len(l8) == 8:
+                lanes = []
+                for r in range(4):
+                    lanes.append(ttnn.add(l8[r], l8[r + 4]))
+                    ttnn.deallocate(l8[r])
+                    ttnn.deallocate(l8[r + 4])
+            else:
+                lanes = l8
         for lane in lanes:
             for i, mm in enumerate(lane_mms):
                 accs[i].push(mm(lane))
