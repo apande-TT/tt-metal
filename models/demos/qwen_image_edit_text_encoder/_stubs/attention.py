@@ -786,7 +786,8 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
                 ttnn.deallocate(t)
             exs = []
             for i, w in enumerate(ws):
-                y = (lane_mms[i] if lane_mms is not mms else _linear_mm(st, w, DN_FIDELITY))(st)
+                # (the product configured for the stacked input's own shape, at the lanes' fidelity)
+                y = _linear_mm(st, w, INPUT_LANE_FIDELITY if INPUT_LANE_FIDELITY is not None else DN_FIDELITY)(st)
                 n = w.shape[-1]
                 tot = INPUT_LANES_MSTACK(ttnn.reshape(y, (n_blk, rows, n)), n_blk)
                 ttnn.deallocate(y)

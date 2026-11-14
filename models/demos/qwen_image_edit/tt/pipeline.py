@@ -368,6 +368,11 @@ class TtQwenImageEditPipeline:
             "LANE_SPLIT",
             lanes_ttl.lanes4 if self.lane_split else None,
         ), self._hook(
+            # (and with the lo limb stacked along M: one product per weight, its row blocks summed in one pass)
+            _te_attention,
+            "INPUT_LANES_MSTACK",
+            sum_parts if self.sum_parts else None,
+        ), self._hook(
             # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
             _te_attention,
             "B_REP_FOLD",
