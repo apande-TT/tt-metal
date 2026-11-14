@@ -599,6 +599,9 @@ INPUT_LANES4 = False
 # Optional slab sum for the input-side lanes stacked along M with the lo limb: INPUT_LANES_MSTACK(y [n, rows, N], n)
 # -> the left-to-right float32 sum of the n row blocks (the C++ sum_parts), or None (the per-lane products)
 INPUT_LANES_MSTACK = None
+# Optional fused input for it: LANES4_MSTACK(lead, lo) -> [lane 0..3; lo] as one [5 x rows, K] bf16 tensor in one pass
+# (no separate lane tensors, no concat), or None
+LANES4_MSTACK = None
 # Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
 INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
@@ -752,7 +755,18 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
         lane_mms = mms
         if INPUT_LANE_FIDELITY is not None and ws is not None and all(len(w.shape) == 2 for w in ws):
             lane_mms = [_linear_mm(lead, w, INPUT_LANE_FIDELITY) for w in ws]
-        lanes, neg_lead = _lead_lanes(lead)
+        st_fused = None
+        if (
+            LANES4_MSTACK is not None
+            and INPUT_LANES_MSTACK is not None
+            and INPUT_LANES4
+            and LINEAR_NO_GUARD
+            and len(parts) == 2
+            and ws is not None
+            and all(len(w.shape) == 2 for w in ws)
+        ):
+            st_fused = LANES4_MSTACK(lead, parts[1])
+        lanes, neg_lead = ([], None) if st_fused is not None else _lead_lanes(lead)
         if INPUT_LANES4 and LINEAR_NO_GUARD:
             # 4 lanes (j % 4 == r) as the 8 lanes' disjoint pairs r, r + 4 summed (exact): half the lane products
             l8 = list(lanes)
@@ -765,7 +779,7 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
             else:
                 lanes = l8
         lanes = list(lanes)
-        if (
+        if st_fused is not None or (
             INPUT_LANES_MSTACK is not None
             and LINEAR_NO_GUARD
             and len(parts) == 2
@@ -780,10 +794,13 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
             rows = 1
             for d in list(lead.shape)[:-1]:
                 rows *= d
-            n_blk = len(lanes) + 1
-            st = ttnn.concat([ttnn.reshape(t, (rows, k)) for t in lanes + [parts[1]]], dim=0)
-            for t in lanes:
-                ttnn.deallocate(t)
+            if st_fused is not None:
+                n_blk, st = 5, st_fused
+            else:
+                n_blk = len(lanes) + 1
+                st = ttnn.concat([ttnn.reshape(t, (rows, k)) for t in lanes + [parts[1]]], dim=0)
+                for t in lanes:
+                    ttnn.deallocate(t)
             exs = []
             for i, w in enumerate(ws):
                 # (the product configured for the stacked input's own shape, at the lanes' fidelity)

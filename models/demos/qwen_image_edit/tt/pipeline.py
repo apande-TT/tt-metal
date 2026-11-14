@@ -246,6 +246,7 @@ class TtQwenImageEditPipeline:
         if precise:
             lanes_ttl.prepare(device)
             lanes_ttl.prepare4(device)
+            lanes_ttl.prepare4m(device)
             # (and the 4-lane QK^T mask tiles of the denoiser (head dim 128) and the vision tower (96, padded from 80),
             # made here so neither stage's first call allocates them in the middle of the run's DRAM layout)
             for k in (128, 96):
@@ -488,6 +489,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "LANE_SPLIT", lanes_ttl.lanes4 if self.lane_split else None),
             # (and the 4 lanes + the lo limb stacked along M: one product per weight, its row blocks summed in one pass)
             (_te_attention, "INPUT_LANES_MSTACK", sum_parts if self.sum_parts else None),
+            # (its stacked input -- the 4 lanes and the lo limb as 5 row blocks -- written by one tt-lang pass)
+            (_te_attention, "LANES4_MSTACK", lanes_ttl.lanes4_mstack if self.lane_split else None),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
             # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;
