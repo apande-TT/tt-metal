@@ -374,6 +374,11 @@ class TtQwenImageEditPipeline:
             "INPUT_LANES_MSTACK",
             sum_parts if self.sum_parts else None,
         ), self._hook(
+            # (its stacked input written by one tt-lang pass, as the denoiser's)
+            _te_attention,
+            "LANES4_MSTACK",
+            lanes_ttl.lanes4_mstack if self.lane_split else None,
+        ), self._hook(
             # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
             _te_attention,
             "B_REP_FOLD",
