@@ -28,6 +28,7 @@ import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
+    _col_masks,
     batched_matmul,
     exp_split,
     guard_tail,
@@ -69,6 +70,8 @@ PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae
 # The denoiser's masked-lane linears' column lanes of x: 4 lanes of 8 K terms per 32-group halve the lane products
 # of the 8-lane form (the encoders keep 8)
 DENOISE_MM_LANES = 4
+# the encoders' C++ masked batched products (the LM's P @ V) at 4 a-side lanes too, the linears' count
+ENCODER_BMM_LANES = 4
 _SCHED_COLS = 32  # schedule table width: col 0 = t / 1000, col 1 = sigma_next - sigma
 
 
@@ -246,6 +249,8 @@ class TtQwenImageEditPipeline:
             # made here so neither stage's first call allocates them in the middle of the run's DRAM layout)
             for k in (128, 96):
                 _te_attention._qk_masks4(device, k, ttnn.bfloat16)
+            # (and the 4-lane column masks of the C++ masked products, made here rather than by a stage's first call)
+            _col_masks(device, 4)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
         self.vote_tail = vote_tail if precise else None
         # and its hi limbs' bf16 rounding, one pass instead of two typecasts
@@ -345,7 +350,7 @@ class TtQwenImageEditPipeline:
             # (and the non-transposed products' 8 a-side lanes + their sum by one C++ masked batched matmul)
             _te_attention,
             "LANE_MASKED_BMM",
-            masked_lane_bmm if self.weight_lane_split else None,
+            functools.partial(masked_lane_bmm, lanes=ENCODER_BMM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             # (and the exact linears unguarded: lane sum + trailing limbs, no dense / negated check products)
             _te_attention,

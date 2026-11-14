@@ -870,7 +870,7 @@ _BMM_M_COMPUTE = f"{_DIR}/masked_bmm_compute.cpp"
 _BMM_M_WRITER = f"{_DIR}/masked_bmm_writer.cpp"
 
 
-def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
+def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4, lanes=8):
     """sum_r lane_r(a) @ b in float32 for a batched bf16 a [E, 1, M, K] and b [E / b_rep, 1, K, N] (entry e of a
     against b's entry e // b_rep; M, K, N tile-aligned): the 8 exact a-side lane products and their sum in ONE pass,
     each core masking its a tiles into their lanes in L1 and reading each b entry once per a row. None for a shape it
@@ -888,7 +888,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
     dev = a.device()
     work = _cores(dev.compute_with_storage_grid_size(), rows)
     sbw = 4 if nt % 4 == 0 else (2 if nt % 2 == 0 else 1)
-    masks = _col_masks(dev)
+    masks = _col_masks(dev, lanes)
     y = ttnn.empty([sa[0], 1, sa[2], sb[3]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
     page = _FP32_TILE_BYTES // 2
@@ -904,8 +904,8 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
     cbs = [
         cb(0, 2, ttnn.bfloat16),
         cb(1, 2 * nt, ttnn.bfloat16),
-        cb(2, 8, ttnn.bfloat16),
-        cb(3, 8, ttnn.bfloat16),
+        cb(2, lanes, ttnn.bfloat16),
+        cb(3, lanes, ttnn.bfloat16),
         cb(_OUT_CB, nt, ttnn.float32),
     ]
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -921,7 +921,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
             compile_time_args=ttnn.TensorAccessorArgs(a).get_compile_time_args()
             + ttnn.TensorAccessorArgs(b).get_compile_time_args()
             + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
-            + [kt, nt, mte, b_rep],
+            + [kt, nt, mte, b_rep, lanes],
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -929,7 +929,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
             kernel_source=_BMM_M_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, sbw],
+            compile_time_args=[kt, nt, sbw, lanes],
             runtime_args=compute_rt,
             config=ttnn.ComputeConfigDescriptor(math_fidelity=fidelity, fp32_dest_acc_en=True),
         ),
