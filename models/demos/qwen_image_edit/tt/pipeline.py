@@ -481,6 +481,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "INPUT_LANES4", True),
             # (formed directly as 4 by one tt-lang pass, not as 8 + their pairwise sums, and without the negation)
             (_te_attention, "LANE_SPLIT", lanes_ttl.lanes4 if self.lane_split else None),
+            # (and the 4 lanes + the lo limb stacked along M: one product per weight, its row blocks summed in one pass)
+            (_te_attention, "INPUT_LANES_MSTACK", sum_parts if self.sum_parts else None),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
             # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;

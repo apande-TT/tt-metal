@@ -596,6 +596,9 @@ LINEAR_NO_GUARD = False
 # With LINEAR_NO_GUARD: the input-side exact lanes of a linear as 4 (8 nonzero K terms per 32-group, the masked-lane
 # kernel's count) -- the 8 lanes' disjoint pairs summed -- so half the lane products run
 INPUT_LANES4 = False
+# Optional slab sum for the input-side lanes stacked along M with the lo limb: INPUT_LANES_MSTACK(y [n, rows, N], n)
+# -> the left-to-right float32 sum of the n row blocks (the C++ sum_parts), or None (the per-lane products)
+INPUT_LANES_MSTACK = None
 # Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
 INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
@@ -761,11 +764,42 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
                     ttnn.deallocate(l8[r + 4])
             else:
                 lanes = l8
+        lanes = list(lanes)
+        if (
+            INPUT_LANES_MSTACK is not None
+            and LINEAR_NO_GUARD
+            and len(parts) == 2
+            and ws is not None
+            and all(len(w.shape) == 2 for w in ws)
+            and 2 <= len(lanes) + 1 <= 6
+        ):
+            # the lanes and the lo limb stacked along M: ONE product per weight (the weight read once, not 5 times),
+            # its row blocks summed left to right in float32 (INPUT_LANES_MSTACK, the C++ slab sum) -- the lo product
+            # then runs at the lanes' fidelity and is not added again below
+            k = lead.shape[-1]
+            rows = 1
+            for d in list(lead.shape)[:-1]:
+                rows *= d
+            n_blk = len(lanes) + 1
+            st = ttnn.concat([ttnn.reshape(t, (rows, k)) for t in lanes + [parts[1]]], dim=0)
+            for t in lanes:
+                ttnn.deallocate(t)
+            exs = []
+            for i, w in enumerate(ws):
+                y = (lane_mms[i] if lane_mms is not mms else _linear_mm(st, w, DN_FIDELITY))(st)
+                n = w.shape[-1]
+                tot = INPUT_LANES_MSTACK(ttnn.reshape(y, (n_blk, rows, n)), n_blk)
+                ttnn.deallocate(y)
+                exs.append(ttnn.reshape(tot, list(lead.shape)[:-1] + [n]))
+            ttnn.deallocate(st)
+            folded[0] = True
+            lanes = []
         for lane in lanes:
             for i, mm in enumerate(lane_mms):
                 accs[i].push(mm(lane))
             ttnn.deallocate(lane)
-        exs = [acc.value() for acc in accs]
+        if not folded[0] or exs is None:
+            exs = [acc.value() for acc in accs]
     if LINEAR_NO_GUARD:
         ys = []
         for i, mm in enumerate(mms):
