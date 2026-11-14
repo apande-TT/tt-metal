@@ -482,6 +482,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "QK_NO_GUARD", True),
             # (with 4 exact lanes, the linears' count: K = 4 x 128 + the rest limbs, not 8 x 128 + them)
             (_te_attention, "QK_LANES4", True),
+            # (and its lead term as one plain product, no exact lanes: K 768 -> 384)
+            (_te_attention, "QK_LANES1", True),
             # (and as a 2-limb split: without its three ~2^-16 order-2 limb terms a1 x b1, a0 x b2, a2 x b0 -- K 1152 ->
             # 768 -- and without forming q's and k's third limbs. a1 x b1 alone was -15 ms/step for 0.0002 PCC; the
             # other two -3 ms/step for 0.0023: restore them (QK_DROP_TERMS ((1, 1),) at 3 limbs) to buy PCC back)

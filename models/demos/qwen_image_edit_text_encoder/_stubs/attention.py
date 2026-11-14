@@ -409,6 +409,8 @@ QK_NO_GUARD_HIFI4 = False
 # QK_NO_GUARD with 4 exact lanes instead of 8 (lane r keeps the K columns j % 4 == r: 8 nonzero terms per 32-group,
 # the linears' DENOISE_MM_LANES count): K = 4 x D + the rest limbs instead of 8 x D + them
 QK_LANES4 = False
+# With it: the lead term as ONE plain product (no exact lanes): [a0 | rest a] @ [b0 | rest b]^T, K = 128 + the rest
+QK_LANES1 = False
 # the 3-limb transposed product's (QK^T's) limb terms (i, j) to leave out, e.g. ((1, 1),): one of the three order-2
 # terms (~2^-16 of the logits each), one 128-wide block less of the K-stacked product's K
 QK_DROP_TERMS = ()
@@ -1316,8 +1318,30 @@ def _unguarded_qk(stacked, pa0, pb0, rest, keep):
     return y
 
 
+def _unguarded_qk1(pa0, pb0, rest, keep):
+    """_unguarded_qk with NO exact lanes: [a's lead | rest a limbs] @ [b's lead | rest b]^T as one product."""
+    rest_b = [pb for _, pb in rest]
+    kr2, kr2_kept = _b_side(keep, "kr_fold1", [pb0] + rest_b, lambda: ttnn.concat([pb0] + rest_b, dim=-1))
+    xs2 = ttnn.concat([pa0] + [pa for pa, _ in rest], dim=-1)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
 def _unguarded_qk4(pa0, pb0, rest, keep):
     """_unguarded_qk with 4 exact lanes: [4 lanes of a's lead | rest a limbs] @ [b's lead x4 along K | rest b]^T."""
+    if QK_LANES1:
+        return _unguarded_qk1(pa0, pb0, rest, keep)
     lanes = [ttnn.multiply(pa0, m) for m in _qk_masks4(pa0.device(), pa0.shape[-1], pa0.dtype)]
     rest_b = [pb for _, pb in rest]
 
