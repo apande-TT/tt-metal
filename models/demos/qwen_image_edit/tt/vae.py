@@ -178,6 +178,8 @@ class TtQwenVAE:
         self.std = _replicated(device, std)
         self.inv_std = _replicated(device, 1.0 / std)
         self.release_after_stage = True  # eager: free the per-shape halo buffers after each VAE stage
+        # and after each decoder up block (one resolution level's buffers held at a time)
+        self.decoder.after_up_block = lambda: self.release_buffers() if self.release_after_stage else None
         if tracker is not None:
             import importlib
 

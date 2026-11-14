@@ -28,13 +28,16 @@ import ttnn
 # the kernels live next to this module; the stock writer is found under TT_METAL_HOME
 _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 _TT_METAL = os.environ.get("TT_METAL_HOME", "")
+# L1 bytes per core the circular buffers may take (each core keeps a whole float32 row, and the mask row, in L1)
+_CB_L1_BYTES = 1280 * 1024
 
 
 def fused_softmax_rows(s, mask_add, mem, split_mem=None):
     """s [N, H, Sq, Sk] float32 TILE (interleaved), mask_add [N or 1, 1, 1, Sk] float32 TILE or None
     -> softmax(s + mask_add, dim=-1) float32 TILE in `mem`, bit-identical to the ttnn op chain (padding too).
     split_mem: -> (p, (hi, lo)) with p's bf16 limbs in split_mem, made as limb_split.fused_split_bf16 makes them,
-    and p itself allocated but NOT written -- for a caller whose only use of p is that split."""
+    and p itself allocated but NOT written -- for a caller whose only use of p is that split. None when a row does
+    not fit one core's L1 (the caller runs the op chain)."""
     N, H, Sq, Sk = (int(d) for d in s.shape)
     assert s.dtype == ttnn.float32 and s.layout == ttnn.TILE_LAYOUT, "float32 TILE logits"
     Wt, Ht = int(s.padded_shape[-1]) // 32, int(s.padded_shape[-2]) // 32
@@ -47,25 +50,29 @@ def fused_softmax_rows(s, mask_add, mem, split_mem=None):
         assert mask_add.dtype == ttnn.float32 and mask_add.layout == ttnn.TILE_LAYOUT
         mask_batches = m[0]
     batch = next(b for b in (4, 2, 1) if Wt % b == 0)  # logit tiles per reader barrier
-    out = ttnn.allocate_tensor_on_device(s.shape, ttnn.float32, ttnn.TILE_LAYOUT, s.device(), mem)
     split = split_mem is not None
-    if split:
-        hi = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
-        lo = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
-
-    device = s.device()
-    grid = device.compute_with_storage_grid_size()
-    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
-    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, N * H * Ht)
     page = 4096  # one float32 tile
     pages = [(0, 2 * batch), (2, Wt), (3, 1), (4, 1)]  # s stream, x / e row, max, sum
-    pages += [(17, 2), (24, 2), (25, 2)] if split else [(16, 4)]  # split: lo, scratch hi, scratch p; else out (two pairs)
+    pages += (
+        [(17, 2), (24, 2), (25, 2)] if split else [(16, 4)]
+    )  # split: lo, scratch hi, scratch p; else out (two pairs)
     if has_mask:
         pages.append((1, Wt))  # the current batch's mask row
     w_mod, h_mod = Sk % 32, Sq % 32
     num_pad = (w_mod != 0) + (h_mod != 0) + (w_mod != 0 and h_mod != 0)
     if num_pad:
         pages.append((5, num_pad))  # padding masks: right, bottom, corner (those present)
+    if sum(n for _, n in pages) * page > _CB_L1_BYTES:
+        return None  # a row (and the mask row) longer than one core's L1 holds
+
+    out = ttnn.allocate_tensor_on_device(s.shape, ttnn.float32, ttnn.TILE_LAYOUT, s.device(), mem)
+    if split:
+        hi = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
+        lo = ttnn.allocate_tensor_on_device(s.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, s.device(), split_mem)
+    device = s.device()
+    grid = device.compute_with_storage_grid_size()
+    all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
+    _, cores, group1, group2, per1, per2 = ttnn.split_work_to_cores(all_cores, N * H * Ht)
     cbs = [
         ttnn.CBDescriptor(
             total_size=n * page,

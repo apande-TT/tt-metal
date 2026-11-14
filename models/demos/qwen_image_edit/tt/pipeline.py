@@ -32,12 +32,14 @@ from __future__ import annotations
 import gc
 import math
 import os
+import sys
 import time
 
 import torch
 
 import ttnn
 from models.demos.qwen_image_edit.mesh import DEVICE_PARAMS, MESH_SHAPE  # noqa: F401 (re-exported)
+from models.demos.qwen_image_edit.tt import rms_rows as _rms_rows
 from models.demos.qwen_image_edit.tt.block_sum import (
     fused_block_sum,
     fused_block_sum_bias,
@@ -45,16 +47,15 @@ from models.demos.qwen_image_edit.tt.block_sum import (
     fused_face_sum_bias,
     fused_sum_bias,
 )
+from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
+from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
+from models.demos.qwen_image_edit.tt.joint_heads import fused_joint_heads
+from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
-from models.demos.qwen_image_edit.tt.exact_qk import fused_exact_qk
-from models.demos.qwen_image_edit.tt.joint_heads import fused_joint_heads
-from models.demos.qwen_image_edit.tt.inputs import EditConfig, EncodedInputs, encode_inputs
-from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm
-from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.limb_split import fused_gelu_split_bf16, fused_split_bf16, fused_split_merge_heads
+from models.demos.qwen_image_edit.tt.ln_rows import fused_ln_modulate
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
-from models.demos.qwen_image_edit.tt import rms_rows as _rms_rows
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_split
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.text_encoder import TtQwenTextEncoder
@@ -126,6 +127,28 @@ STAGE_MAX_BATCH = {}
 # true CFG as ONE transformer pass over [cond; uncond] (the shorter text zero-padded to the longer and masked
 # out) instead of a cond pass and an uncond pass per step: half the per-block programs and TP reduces
 CFG_BATCH = True
+# float32 bytes per device the CFG_BATCH pass's hidden activation [2 B, image rows, dim] may take (past it: two passes)
+CFG_BATCH_ACT_BYTES = 256 * 1024 * 1024
+# float32 bytes per device the denoise blocks' JOINT_HEADS norm tables may take (past it: the streams' own heads / norms)
+JOINT_NORM_TABLE_BYTES = 192 * 1024 * 1024
+# L1 bytes per device the denoise's largest staged activation may take for its on/off L1 placements to stay on
+DENOISE_L1_STAGING_BYTES = 32 * 1024 * 1024
+
+
+def _free(*tensors):
+    """Deallocate the device tensors given (None skipped)."""
+    for t in tensors:
+        if t is not None:
+            ttnn.deallocate(t)
+
+
+def _l1_knobs(package):
+    """(module name, global name) of every module global set to True with "L1" in its name in the imported modules of
+    `package` (the on/off L1 placements; names, not module objects, so walkers of the pipeline's state skip them)."""
+    mods = [(k, m) for k, m in list(sys.modules.items()) if m is not None and k.startswith(package + ".")]
+    return tuple((k, n) for k, m in mods for n, v in list(vars(m).items()) if "L1" in n and v is True)
+
+
 # CFG_BATCH's text zero-padding appended in TILE layout straight into L1 (ttnn.pad), then batched into DRAM (no
 # untilize -> row-major zeros + concat -> tilize round trip)
 CFG_PAD_TILED_L1 = True
@@ -239,6 +262,9 @@ class QwenImageEditTT:
         # q/k/v (and the text stream's add_q/k/v) as one fused column-parallel weight per stream: one limb
         # linear pair reads the activation limbs and the weights once instead of three times
         _tr_attention.FUSED_QKV = True
+        # an attention whose float32 logits pass 128 MB per device (a large image area: 2.2 GB at 1024 x 1024 and
+        # batch 8) attends in query row blocks of at most that; at 256 x 256 and batch 32 they are whole
+        _tr_attention.ATTEND_LOGITS_BYTES = 128 * 1024 * 1024
         # the block stack's sharded weights (modulation) tilized on the host (see tt/upload.py)
         _tr_ccl.FROM_TORCH_FN = host_tiled_from_torch
         with _tr_ccl.tp_axis(TP_AXIS):  # TP=8 over mesh axis 0, replicated over axis 1 (see _ccl)
@@ -324,7 +350,9 @@ class QwenImageEditTT:
         # 41.8 ms)
         _tr_precise.LINEAR_PC_FN = _limb_linear_config
         # and their limb products' sum + float32 bias add as one C++ kernel pass (same adds, same order)
-        _tr_precise.LINEAR_SUM_BIAS_FN = lambda a, b, bias_rows: fused_sum_bias(a, b, bias_rows, ttnn.DRAM_MEMORY_CONFIG)
+        _tr_precise.LINEAR_SUM_BIAS_FN = lambda a, b, bias_rows: fused_sum_bias(
+            a, b, bias_rows, ttnn.DRAM_MEMORY_CONFIG
+        )
         # limb linears as one C++ program: both limbs' products accumulated in the float32 DEST from one multicast
         # stream of the weight (long-K ones, K >= N: whole output rows per core; wide ones, K < N: each grid column
         # its own slice of the output columns)
@@ -371,6 +399,15 @@ class QwenImageEditTT:
         from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import timestep_embedding as _tr_temb
 
         _tr_temb.LIMBS_L1 = True  # the timestep MLP's activation limbs in L1
+        # the denoise's on/off L1 placements as configured above: they are sized for the activations they were
+        # measured on, so prepare() runs them from DRAM for a request whose activations exceed the staging budget
+        self._denoise_l1_knobs = _l1_knobs(_tr_precise.__name__.rpartition(".")[0])
+        tcfg = hf_pipe.transformer.config
+        self._inner_dim = tcfg.num_attention_heads * tcfg.attention_head_dim
+        self._head_dim = tcfg.attention_head_dim
+        self._n_blocks = len(self.transformer.transformer_blocks)
+        self._joint_heads = _tr_attention.JOINT_HEADS  # as configured above (prepare() gates it per request)
+        self._ff_local = 4 * self._inner_dim // self.tp  # FF hidden per device
         self.build_seconds = time.time() - t0
         # repeated stacks (plain lists of same-typed elements), one per stage that owns one
         self.stacks = {
@@ -401,6 +438,12 @@ class QwenImageEditTT:
         p.latents = _replicated(d, enc.latents.to(torch.float32), ttnn.float32)  # (vae_decode trace input)
         p.latents_dp = _dp_sharded(d, enc.latents.to(torch.float32))  # the denoise loop's initial noise
         p.S_lat = enc.latents.shape[1]
+        # the denoise's L1 placements only while its largest staged activation (the image stream's float32 FF hidden
+        # on one device: 25 MB at a 256 x 256 area and batch 32) fits DENOISE_L1_STAGING_BYTES; a larger area runs
+        # them from DRAM (at 1024 x 1024 it is ~100 MB: the placements overflow L1)
+        stage_l1 = p.B_local * 2 * p.S_lat * self._ff_local * 4 <= DENOISE_L1_STAGING_BYTES
+        for mod, name in self._denoise_l1_knobs:
+            setattr(sys.modules[mod], name, stage_l1)
         p.lat_h = 2 * (enc.height // 16)
         p.lat_w = 2 * (enc.width // 16)
         p.img_shapes = list(enc.img_shapes)
@@ -421,7 +464,21 @@ class QwenImageEditTT:
 
         p.joint_mask_cond = joint_mask(p.te.mask_cond)
         p.joint_mask_uncond = joint_mask(p.te.mask_uncond)
-        if CFG_BATCH and p.do_cfg:
+        # CFG_BATCH while the batched pass's float32 hidden activation on one device fits CFG_BATCH_ACT_BYTES (100 MB at
+        # a 256 x 256 area and batch 32; ~400 MB at 1024 x 1024 and batch 8, where cond and uncond then run as two
+        # passes and every denoise activation halves)
+        act = 2 * p.B_local * 2 * p.S_lat * self._inner_dim * 4
+        p.cfg_batch = CFG_BATCH and act <= CFG_BATCH_ACT_BYTES
+        # JOINT_HEADS while the blocks' joint-row (q, k) norm tables [1, 1, L + S, D] float32 (two per block per text
+        # length the passes see) fit JOINT_NORM_TABLE_BYTES per device: ~43 MB at 256 x 256 (one batched length);
+        # ~590 MB at 1024 x 1024, where the streams then take their heads / norms apart
+        from models.tt_dit.pipelines.qwen_image_edit_transformer._stubs import attention as _tr_attention
+
+        lens = {n for n in (p.te.len_cond, p.te.len_uncond if p.do_cfg else None) if n}
+        lens = lens if p.do_cfg and not p.cfg_batch else {max(lens)}
+        tables = self._n_blocks * 2 * sum(-(-n // 32) * 32 + 2 * p.S_lat for n in lens) * self._head_dim * 4
+        _tr_attention.JOINT_HEADS = self._joint_heads and tables <= JOINT_NORM_TABLE_BYTES
+        if p.cfg_batch and p.do_cfg:
             # [cond; uncond] rows of each DP column's samples, every text padded to L = the longer text rounded up to
             # whole tiles (0 = masked): the blocks' [txt, img] concats and splits then fall on tile boundaries
             lc, lu = p.te.len_cond, p.te.len_uncond
@@ -495,10 +552,14 @@ class QwenImageEditTT:
         dt = p.dts[i] if dt is None else dt
         x = ttnn.concat([latents, image_latents], dim=1)
         B, S = latents.shape[0], p.S_lat
-        if p.do_cfg and CFG_BATCH:
+        if p.do_cfg and p.cfg_batch:
             txt2, rope2 = self._cfg_inputs(p, pe, neg_pe)
             both = self.transformer(
-                ttnn.concat([x, x], dim=0), txt2, ttnn.concat([t, t], dim=0), rope2, p.joint_mask_cfg,
+                ttnn.concat([x, x], dim=0),
+                txt2,
+                ttnn.concat([t, t], dim=0),
+                rope2,
+                p.joint_mask_cfg,
                 txt_embedded=self.hoist_txt,
             )
             eps = ttnn.slice(both, [0, 0, 0], [B, S, both.shape[-1]])
@@ -508,7 +569,7 @@ class QwenImageEditTT:
             eps = self.transformer(x, pe, t, rope_c, p.joint_mask_cond, txt_embedded=self.hoist_txt)
             eps = ttnn.slice(eps, [0, 0, 0], [B, S, eps.shape[-1]])
         if p.do_cfg:
-            if not CFG_BATCH:
+            if not p.cfg_batch:
                 neg = self.transformer(x, neg_pe, t, rope_u, p.joint_mask_uncond, txt_embedded=self.hoist_txt)
                 neg = ttnn.slice(neg, [0, 0, 0], [B, S, neg.shape[-1]])
             comb = ttnn.add(neg, ttnn.multiply(ttnn.subtract(eps, neg), p.cfg_scale))
@@ -595,9 +656,15 @@ class QwenImageEditTT:
         rope_u = self.rope(p, neg_pe.shape[1])
         n = p.num_steps if num_steps is None else num_steps
         # denoise: the batch is split over mesh axis 1 (DP), the transformer is TP over axis 0
-        pe_l, neg_l, img_lat_l = self.dp_split(pe), self.dp_split(neg_pe), self.dp_split(image_latents)
-        pe_l, neg_l = self._step_txt_pair(pe_l, neg_l)
-        latents = self._denoise_loop(p, n, p.latents_dp, img_lat_l, pe_l, neg_l, rope_c, rope_u, on_step)
+        split = [self.dp_split(t) if t is not None else None for t in (pe, neg_pe, image_latents)]
+        pe_l, neg_l, img_lat_l = split
+        _free(*(t for t, s in zip((pe, neg_pe, image_latents), split) if s is not t))  # not read again
+        pe_s, neg_s = self._step_txt_pair(pe_l, neg_l)
+        _free(*(t for t, s in ((pe_l, pe_s), (neg_l, neg_s)) if s is not t))
+        latents = self._denoise_loop(p, n, p.latents_dp, img_lat_l, pe_s, neg_s, rope_c, rope_u, on_step)
+        # the chain's text / image-latent inputs are not read past the denoise: freed before the decode (its full-
+        # resolution activation is the widest of the pipeline)
+        _free(pe_s, neg_s, img_lat_l)
         latents = self.dp_gather(latents)  # the whole batch on every chip for the decode
         self.last_latents = latents
         self.steps_run = n

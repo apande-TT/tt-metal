@@ -89,6 +89,18 @@ class TtQwenImageDecoder3d:
         self.up_blocks = ports_of(self.ports, self.decoder.up_blocks)
         # the mid block's residual blocks (a second repeated stack, HF decoder.mid_block.resnets)
         self.mid_block_resnets = ports_of(self.ports, self.decoder.mid_block.resnets)
+        # called after each up block (None: nothing): e.g. free the halo buffers cached for that block's shapes, so a
+        # full-resolution decode holds one level's buffers at a time instead of every level's
+        self.after_up_block = None
+        for port in self.up_blocks:
+
+            def run(*a, _port=port, **k):
+                out = type(_port).forward_sharded(_port, *a, **k)  # late-bound (a class swapped in later is honoured)
+                if self.after_up_block is not None:
+                    self.after_up_block()
+                return out
+
+            port.forward_sharded = run
 
     def __call__(self, x, feat_cache=None, feat_idx=None, **_ignored):
         # x: replicated TILE [B, C=z_dim, T, H, W] (BCTHW, like the torch reference).

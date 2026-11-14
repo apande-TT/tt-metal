@@ -22,19 +22,22 @@ import numpy as np
 import torch
 
 import ttnn
+from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated, mesh_row_block
 from models.demos.qwen_image_edit.tt.inputs import PROMPT_TEMPLATE_DROP
-from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear, fused_lane_linear_patterns
 from models.demos.qwen_image_edit.tt.joint_heads import fused_face_heads, fused_face_merge_heads
+from models.demos.qwen_image_edit.tt.lane_bmm import fused_lane_bmm, fused_lane_linear, fused_lane_linear_patterns
 from models.demos.qwen_image_edit.tt.limb_bmm import fused_limb_bmm
 from models.demos.qwen_image_edit.tt.limb_linear import fused_limb_linear
 from models.demos.qwen_image_edit.tt.limb_split import fused_split_merge_heads
-from models.demos.qwen_image_edit.tt.block_sum import fused_block_sum, fused_block_sum_gated, mesh_row_block
 from models.demos.qwen_image_edit.tt.rms_rows import fused_rms_norm
 from models.demos.qwen_image_edit.tt.rope_rows import fused_rope, fused_rope_heads, fused_rope_rows
 from models.demos.qwen_image_edit.tt.softmax_rows import fused_softmax_rows
 from models.demos.qwen_image_edit.tt.upload import host_tiled_from_torch
+from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
+from models.demos.qwen_image_edit_text_encoder._stubs import language_model_layers_0_mlp
+from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
+from models.demos.qwen_image_edit_text_encoder._stubs import token_embed as _te_embed_mod
 from models.demos.qwen_image_edit_text_encoder._stubs import (
-    language_model_layers_0_mlp,
     v_l_decoder_layer,
     v_l_patch_merger,
     v_l_rotary_embedding,
@@ -43,10 +46,7 @@ from models.demos.qwen_image_edit_text_encoder._stubs import (
     vision_patch_embed,
     vision_transformer_pretrained_model,
 )
-from models.demos.qwen_image_edit_text_encoder._stubs import attention as _te_attention
-from models.demos.qwen_image_edit_text_encoder._stubs import token_embed as _te_embed_mod
 from models.demos.qwen_image_edit_text_encoder._stubs.attention import MASK_NEG, pad_to_tile
-from models.demos.qwen_image_edit_text_encoder._stubs import layer as _te_layer
 from models.demos.qwen_image_edit_text_encoder._stubs.layer import mask_k_tiles, text_attention_mask
 
 # fused_limb_bmm (the LM P @ V) writes its float32 output to L1 when it takes at most this many bytes (0: DRAM)
@@ -198,7 +198,11 @@ class TtQwenTextEncoder:
         # the LM's two-limb linears as one C++ program each (limb_linear.cpp: the weight streamed once for both limbs,
         # the same fp32 products and RNE add)
         _te_attention.LIMB_LINEAR_FN = lambda hi, lo, w, mem=ttnn.DRAM_MEMORY_CONFIG: fused_limb_linear(
-            hi, lo, w, mem, fidelity=ttnn.MathFidelity.HiFi3,  # both limbs' products at HiFi3
+            hi,
+            lo,
+            w,
+            mem,
+            fidelity=ttnn.MathFidelity.HiFi3,  # both limbs' products at HiFi3
             long_groups=True,  # columns split over parallel senders so the rows' cores fill the grid
             chunk_tiles=128,  # in weight chunks of up to 256 KB (fewer sender / receivers handshakes)
             full_dest=True,  # with 8 float32 DEST tiles: 4-column output blocks
@@ -240,7 +244,9 @@ class TtQwenTextEncoder:
         # faces), not slice + reshape [N, S, heads, 80] + permute (the reshape pads the 4 local heads to a tile dim)
         _te_attention.VISION_HEADS_FN = fused_face_heads
         _te_attention.VISION_MERGE_FN = fused_face_merge_heads  # and the P @ V heads merged back by whole-face copies
-        _te_attention.VISION_ROPE_FN = fused_rope_rows  # and the q / k rope as one program (D / 2 = 40: not tile aligned)
+        _te_attention.VISION_ROPE_FN = (
+            fused_rope_rows  # and the q / k rope as one program (D / 2 = 40: not tile aligned)
+        )
         _te_attention.VISION_SOFTMAX_FN = fused_softmax_rows  # and its softmax after the mask add as one kernel
         from models.demos.qwen_image_edit_text_encoder._stubs import encoder_stack as _te_stack
 
@@ -377,7 +383,6 @@ class TtQwenTextEncoder:
         p.ids = _replicated(d, ids.to(torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         # causal + key-padding additive mask (GQA row packing), per sequence
         mask = text_attention_mask(am, 2 * B, s_pad, s_pad, self.group)
-        p.mask = _replicated(d, torch.from_numpy(mask), ttnn.float32)
         # per (sequence, P tile row): the key tiles the LM P @ V accumulates (past them the mask zeroes P)
         p.pv_k_tiles = mask_k_tiles(mask) if PV_K_TILES else None
         # HF passes position_ids=None -> arange on all three mRoPE axes
@@ -411,6 +416,13 @@ class TtQwenTextEncoder:
                 p.prefix = (P, su)
                 p.mask_suffix = _replicated(d, torch.from_numpy(m), ttnn.float32)
                 p.pv_k_tiles_suffix = mask_k_tiles(m) if PV_K_TILES else None
+        # the device masks, one per half (prompts, negatives): each half's program reads its own, with no slice
+        # copy of a [2B, ...] upload; the negatives' half is not uploaded when they run only their suffix (the
+        # mask grows with s_pad^2 x the GQA row packing: at a large image area it is GBs per chip)
+        p.mask_halves = tuple(
+            None if (lo and p.prefix) else _replicated(d, torch.from_numpy(mask[lo : lo + B]), ttnn.float32)
+            for lo in (0, B)
+        )
         # QwenImageEditPipeline.encode_prompt: an all-ones mask is dropped (None)
         p.mask_cond = None if bool(mc.all()) else mc
         p.mask_uncond = None if bool(mu.all()) else mu
@@ -484,12 +496,15 @@ class TtQwenTextEncoder:
                 hs = self.text_model.forward_padded(xs, rows(cos), rows(sin), p.mask_suffix, kv=kv)
                 _te_layer.PV_K_TILES = None
                 h = ttnn.concat(
-                    [ttnn.slice(h_cond, [0, 0, drop, 0], [B, 1, P, C]), ttnn.slice(hs, [0, 0, 0, 0], [B, 1, drop + L - P, C])],
+                    [
+                        ttnn.slice(h_cond, [0, 0, drop, 0], [B, 1, P, C]),
+                        ttnn.slice(hs, [0, 0, 0, 0], [B, 1, drop + L - P, C]),
+                    ],
                     dim=2,
                 )
                 kv["cache"].clear()
             else:
-                mask = ttnn.slice(p.mask, [lo, 0, 0, 0], [lo + B] + list(p.mask.shape)[1:])
+                mask = p.mask_halves[1 if lo else 0]
                 kt = getattr(p, "pv_k_tiles", None)
                 _te_layer.PV_K_TILES = None if kt is None else kt[lo : lo + B]
                 h_full = self.text_model.forward_padded(x, cos, sin, mask, kv=kv)  # [B, 1, s_pad, C] replicated

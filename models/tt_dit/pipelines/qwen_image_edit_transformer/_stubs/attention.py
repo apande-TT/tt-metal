@@ -312,6 +312,8 @@ class TtQwenJointAttention:
         )
         done = []
         for x, wb, parts, row_off in ((ehs, self.txt_qkv, ep, 0), (hs, self.img_qkv, hp, L)):
+            if done and not done[0]:
+                break  # the text stream did not take the heads (e.g. its rows do not tile the grid): both fall back
             _precise.HEADS_OUT = (q, k, v, row_off)
             try:
                 y = self._proj(x, wb, parts=parts)
@@ -330,7 +332,48 @@ class TtQwenJointAttention:
 
     def _attend(self, q, kh, kl, v, mask_add, shared=None, out_mem=None, merge=True):
         """shared (precise + SHARE_SPLIT): (K's folded operand or None, V's (hi, lo)), built once for
-        the image and text queries that attend to the same joint K / V."""
+        the image and text queries that attend to the same joint K / V. Logits over ATTEND_LOGITS_BYTES: the
+        queries' rows attend in row blocks (softmax is per row: the same rows, products and sums)."""
+        B, H, Sq, D = (int(x) for x in q.shape)
+        step = Sq
+        if ATTEND_LOGITS_BYTES:
+            row_bytes = 4 * B * H * int(kh.shape[2])
+            step = max(32, ATTEND_LOGITS_BYTES // row_bytes // 32 * 32)
+        if step >= Sq:
+            o = self._attend_rows(q, kh, kl, v, mask_add, shared)
+        else:
+            # the registered limbs of q / K (ROPE_SPLIT_FN hi limbs) are taken once here: every block's product
+            # reads K's and its own rows' slice of q's, registered again for it
+            qp, kp = (_precise._PRESPLIT.pop(id(t), (None, None)) for t in (q, kh))
+            qp = qp[1] if qp[0] is q else None
+            kp = kp[1] if kp[0] is kh else None
+            handles = {id(t) for t in (q, kh) if id(t) in _LIMB_HANDLES}
+            _LIMB_HANDLES.difference_update(handles)
+            outs = []
+            for r0 in range(0, Sq, step):
+                rows = lambda t: ttnn.slice(t, [0, 0, r0, 0], [B, H, min(Sq, r0 + step), D])  # noqa: E731
+                qc = rows(q)
+                if qp is not None:
+                    qcp = tuple(rows(t) for t in qp)
+                    _precise.register_split(qc, qcp)
+                if kp is not None:
+                    _precise.register_split(kh, kp)
+                outs.append(self._attend_rows(qc, kh, kl, v, mask_add, shared))
+                ttnn.deallocate(qc)
+                if qp is not None:
+                    for t in qcp:
+                        ttnn.deallocate(t)
+            o = ttnn.concat(outs, dim=2)
+            for t in outs:
+                ttnn.deallocate(t)
+            for t in (q, kh):
+                if id(t) in handles:
+                    ttnn.deallocate(t)
+        # merge False: the caller takes the head-major [B, Hl, Sq, D] output (MERGE_SPLIT_FN)
+        return self._merge_heads(o, out_mem) if merge else o
+
+    def _attend_rows(self, q, kh, kl, v, mask_add, shared=None):
+        """QK^T, softmax and P @ V of q's rows -> head-major [B, Hl, Sq, D] (see _attend)."""
         k_rep, v_parts = shared if shared is not None else (None, None)
         if _precise.ENABLED:  # kh = k (float32) in precise mode
             if _precise.EXACT_QK:
@@ -345,15 +388,18 @@ class TtQwenJointAttention:
                 ttnn.deallocate(t)
         # Explicit softmax: the fused ttnn.softmax loses ~0.2 abs on these ~1e4 logits when the key
         # length is not tile-aligned; max/exp/sum/divide on float32 stays within ~2e-3.
+        p = None  # SOFTMAX_FN returns None where the rows do not fit it: the op chain below then runs
         if SOFTMAX_FN is not None and SOFTMAX_SPLIT and _precise.ENABLED:
             # P is only ever split into its bf16 limbs for P @ V: the softmax kernel writes them (L1 like
             # MATMUL_A_L1's split) instead of P, and hands them to _precise.matmul
             mem = ttnn.L1_MEMORY_CONFIG if _precise.MATMUL_A_L1 else ttnn.DRAM_MEMORY_CONFIG
-            p, parts = SOFTMAX_FN(s, mask_add, ttnn.DRAM_MEMORY_CONFIG, split_mem=mem)
-            _precise.register_split(p, parts)
-            ttnn.deallocate(s)
+            res = SOFTMAX_FN(s, mask_add, ttnn.DRAM_MEMORY_CONFIG, split_mem=mem)
+            if res is not None:
+                p, parts = res
+                _precise.register_split(p, parts)
         elif SOFTMAX_FN is not None:  # the same chain as one kernel
             p = SOFTMAX_FN(s, mask_add, ttnn.DRAM_MEMORY_CONFIG)
+        if p is not None:
             ttnn.deallocate(s)
         elif SOFTMAX_L1:  # the same ops, the logits staged in L1 and the subtract / exp done in place there
             l1 = ttnn.L1_MEMORY_CONFIG
@@ -380,8 +426,7 @@ class TtQwenJointAttention:
             o = ttnn.matmul(
                 ttnn.typecast(p, ttnn.bfloat16), v, dtype=ttnn.bfloat16, compute_kernel_config=self.hifi
             )  # [B, Hl, Sq, D]
-        # merge False: the caller takes the head-major [B, Hl, Sq, D] output (MERGE_SPLIT_FN)
-        return self._merge_heads(o, out_mem) if merge else o
+        return o
 
     def _merge_heads(self, o, out_mem=None):  # [B, Hl, Sq, D] -> [B, Sq, Hl * D]
         B, Sq = o.shape[0], o.shape[2]
@@ -642,6 +687,9 @@ def _rope_tables(freqs, half, rot=False):
     return (hit[1], hit[3]) if rot else (hit[1], hit[2])
 
 
+# float32 logits bytes per device one attention may materialise: past it the queries attend in row blocks
+# (None: always whole)
+ATTEND_LOGITS_BYTES = None
 # the attention softmax's float32 logits in L1 (subtract / exp in place), only the probabilities written to DRAM
 SOFTMAX_L1 = False
 # the q / k RMSNorm's x * x and x * r and the RoPE's halves and their swap in L1 (False: DRAM)
