@@ -455,6 +455,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "QK_NO_GUARD", True),
             # (with 4 exact lanes, the linears' count: K = 4 x 128 + the rest limbs, not 8 x 128 + them)
             (_te_attention, "QK_LANES4", True),
+            # (and without the a1 x b1 limb term, one of the three ~2^-16 order-2 terms: K 1152 -> 1024)
+            (_te_attention, "QK_DROP_TERMS", ((1, 1),)),
             # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
             (_te_attention, "LINEAR_NO_GUARD", True),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)

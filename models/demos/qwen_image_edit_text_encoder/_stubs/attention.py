@@ -409,6 +409,9 @@ QK_NO_GUARD_HIFI4 = False
 # QK_NO_GUARD with 4 exact lanes instead of 8 (lane r keeps the K columns j % 4 == r: 8 nonzero terms per 32-group,
 # the linears' DENOISE_MM_LANES count): K = 4 x D + the rest limbs instead of 8 x D + them
 QK_LANES4 = False
+# the 3-limb transposed product's (QK^T's) limb terms (i, j) to leave out, e.g. ((1, 1),): one of the three order-2
+# terms (~2^-16 of the logits each), one 128-wide block less of the K-stacked product's K
+QK_DROP_TERMS = ()
 _QK_MASKS4 = {}
 
 
@@ -1079,7 +1082,12 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
         b_pre, keep_b = (ent[1], ent[2]), True
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
-    terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
+    terms = [
+        (pa_all[i], pb_all[j])
+        for i in range(limbs)
+        for j in range(limbs)
+        if i + j < limbs and not (transpose_b and limbs == 3 and (i, j) in QK_DROP_TERMS)
+    ]
 
     reps = {}  # (each b operand's entries repeated once per call, not once per product: the lanes share one b limb)
 
