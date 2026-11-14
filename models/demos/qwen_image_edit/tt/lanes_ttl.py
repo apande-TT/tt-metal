@@ -334,3 +334,264 @@ def lanes8_stacked(lead):
         ttnn.deallocate(yn)
         y, yn = y2, yn2
     return ttnn.view(y, s[:-1] + [LANES * s[-1]]), ttnn.view(yn, s)
+
+
+# ---- 4 lanes (j % 4 == r: 8 nonzero K terms per 32-group) in one pass, no negation -----------------------------
+_OP4 = []
+_MASKS4 = {}
+
+
+def _make_op4():
+    @ttl.operation(grid="auto", options="--no-ttl-fpu-binary-ops")
+    def _lanes4(x: ttnn.Tensor, masks: ttnn.Tensor, y0: ttnn.Tensor, y1: ttnn.Tensor, y2: ttnn.Tensor, y3: ttnn.Tensor):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        rows = x.shape[0] // TILE
+        cols = x.shape[1] // TILE
+        rows_per_node = -(-rows // grid_rows)
+        cols_per_node = -(-cols // grid_cols)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(masks, shape=(1, 1), block_count=4)
+        o0 = ttl.make_dataflow_buffer_like(y0, shape=(1, 1), block_count=2)
+        o1 = ttl.make_dataflow_buffer_like(y1, shape=(1, 1), block_count=2)
+        o2 = ttl.make_dataflow_buffer_like(y2, shape=(1, 1), block_count=2)
+        o3 = ttl.make_dataflow_buffer_like(y3, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            node_col, node_row = ttl.node(dims=2)
+            with m_dfb.wait() as m0, m_dfb.wait() as m1, m_dfb.wait() as m2, m_dfb.wait() as m3:
+                for local_row in range(rows_per_node):
+                    row = node_row * rows_per_node + local_row
+                    if row < rows:
+                        for local_col in range(cols_per_node):
+                            col = node_col * cols_per_node + local_col
+                            if col < cols:
+                                with x_dfb.wait() as a:
+                                    with o0.reserve() as o:
+                                        o.store(a * m0)
+                                    with o1.reserve() as o:
+                                        o.store(a * m1)
+                                    with o2.reserve() as o:
+                                        o.store(a * m2)
+                                    with o3.reserve() as o:
+                                        o.store(a * m3)
+
+        @ttl.datamovement()
+        def read():
+            node_col, node_row = ttl.node(dims=2)
+            for r in range(4):
+                with m_dfb.reserve() as m:
+                    tx = ttl.copy(masks[r : r + 1, 0:1], m)
+                    tx.wait()
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            with x_dfb.reserve() as a:
+                                tx = ttl.copy(x[row : row + 1, col : col + 1], a)
+                                tx.wait()
+
+        @ttl.datamovement()
+        def write():
+            node_col, node_row = ttl.node(dims=2)
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            with o0.wait() as o:
+                                tx = ttl.copy(o, y0[row : row + 1, col : col + 1])
+                                tx.wait()
+                            with o1.wait() as o:
+                                tx = ttl.copy(o, y1[row : row + 1, col : col + 1])
+                                tx.wait()
+                            with o2.wait() as o:
+                                tx = ttl.copy(o, y2[row : row + 1, col : col + 1])
+                                tx.wait()
+                            with o3.wait() as o:
+                                tx = ttl.copy(o, y3[row : row + 1, col : col + 1])
+                                tx.wait()
+
+    return _lanes4
+
+
+def prepare4(device):
+    """Upload the 4 lane-mask tiles ((4 x 32, 32) bf16; tile r keeps the columns j % 4 == r), once, at build."""
+    if id(device) not in _MASKS4:
+        j = torch.arange(TILE)
+        m = torch.cat([(j % 4 == r).to(torch.float32).expand(TILE, TILE) for r in range(4)], 0)
+        _MASKS4[id(device)] = ttnn.from_torch(
+            m,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device) if hasattr(device, "get_num_devices") else None,
+        )
+
+
+def lanes4(lead):
+    """(the 4 lanes j % 4 == r of a bf16 interleaved tile tensor [..., M, K], None) -- lanes8's interface without the
+    negation -- or None for a shape it does not take."""
+    s = list(lead.shape)
+    if len(s) < 2 or s[-2] % TILE or s[-1] % TILE:
+        return None
+    if lead.dtype != ttnn.bfloat16 or lead.layout != ttnn.TILE_LAYOUT or lead.is_sharded():
+        return None
+    dev = lead.device()
+    if id(dev) not in _MASKS4:
+        return None
+    if not _OP4:
+        _OP4.append(_make_op4())
+    rows = 1
+    for d in s[:-1]:
+        rows *= d
+    x = ttnn.view(lead, (rows, s[-1]))
+    key = ("lanes4",) + tuple(s)
+    first = key not in _COMPILED
+    if first:
+        x = ttnn.clone(x)  # ttl pins the compiling call's arguments: give it a copy to pin and free it
+    ys = [ttnn.empty_like(x) for _ in range(4)]
+    _OP4[0](x, _MASKS4[id(dev)], *ys)
+    if first:
+        _COMPILED.add(key)
+        ttnn.deallocate(x)
+        outs = []
+        for y in ys:
+            outs.append(ttnn.clone(y))
+            ttnn.deallocate(y)
+        ys = outs
+    return [ttnn.view(y, s) for y in ys], None
+
+
+# ---- the 4 lanes AND the lo limb written as the 5 row blocks of ONE [5 x rows, K] tensor (the M-stacked input) --
+_OP4M = []
+_MASKS5 = {}
+
+
+def _make_op4m():
+    @ttl.operation(grid="auto", options="--no-ttl-fpu-binary-ops")
+    def _lanes4m(x: ttnn.Tensor, lo: ttnn.Tensor, masks: ttnn.Tensor, y: ttnn.Tensor):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        rows = x.shape[0] // TILE
+        cols = x.shape[1] // TILE
+        rows_per_node = -(-rows // grid_rows)
+        cols_per_node = -(-cols // grid_cols)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        l_dfb = ttl.make_dataflow_buffer_like(lo, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(masks, shape=(1, 1), block_count=5)
+        o_dfb = ttl.make_dataflow_buffer_like(y, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            node_col, node_row = ttl.node(dims=2)
+            with m_dfb.wait() as m0, m_dfb.wait() as m1, m_dfb.wait() as m2, m_dfb.wait() as m3, m_dfb.wait() as m4:
+                for local_row in range(rows_per_node):
+                    row = node_row * rows_per_node + local_row
+                    if row < rows:
+                        for local_col in range(cols_per_node):
+                            col = node_col * cols_per_node + local_col
+                            if col < cols:
+                                with x_dfb.wait() as a:
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m0)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m1)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m2)
+                                    with o_dfb.reserve() as o:
+                                        o.store(a * m3)
+                                with l_dfb.wait() as b:
+                                    with o_dfb.reserve() as o:
+                                        o.store(b * m4)
+
+        @ttl.datamovement()
+        def read():
+            node_col, node_row = ttl.node(dims=2)
+            for r in range(5):
+                with m_dfb.reserve() as m:
+                    tx = ttl.copy(masks[r : r + 1, 0:1], m)
+                    tx.wait()
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            with x_dfb.reserve() as a:
+                                tx = ttl.copy(x[row : row + 1, col : col + 1], a)
+                                tx.wait()
+                            with l_dfb.reserve() as b:
+                                tx = ttl.copy(lo[row : row + 1, col : col + 1], b)
+                                tx.wait()
+
+        @ttl.datamovement()
+        def write():
+            node_col, node_row = ttl.node(dims=2)
+            for local_row in range(rows_per_node):
+                row = node_row * rows_per_node + local_row
+                if row < rows:
+                    for local_col in range(cols_per_node):
+                        col = node_col * cols_per_node + local_col
+                        if col < cols:
+                            for r in range(5):
+                                yr = r * rows + row
+                                with o_dfb.wait() as o:
+                                    tx = ttl.copy(o, y[yr : yr + 1, col : col + 1])
+                                    tx.wait()
+
+    return _lanes4m
+
+
+def prepare4m(device):
+    """Upload the 4 lane-mask tiles + one all-ones tile ((5 x 32, 32) bf16), once, at build."""
+    if id(device) not in _MASKS5:
+        j = torch.arange(TILE)
+        m = torch.cat(
+            [(j % 4 == r).to(torch.float32).expand(TILE, TILE) for r in range(4)] + [torch.ones(TILE, TILE)], 0
+        )
+        _MASKS5[id(device)] = ttnn.from_torch(
+            m,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(device) if hasattr(device, "get_num_devices") else None,
+        )
+
+
+def lanes4_mstack(lead, lo):
+    """[lane 0; lane 1; lane 2; lane 3; lo] of bf16 interleaved tile tensors lead, lo [..., M, K] as ONE [5 x rows, K]
+    tensor (rows = the leading dims' product), or None for a shape it does not take."""
+    s = list(lead.shape)
+    if len(s) < 2 or s[-2] % TILE or s[-1] % TILE or list(lo.shape) != s:
+        return None
+    for t in (lead, lo):
+        if t.dtype != ttnn.bfloat16 or t.layout != ttnn.TILE_LAYOUT or t.is_sharded():
+            return None
+    dev = lead.device()
+    if id(dev) not in _MASKS5:
+        return None
+    if not _OP4M:
+        _OP4M.append(_make_op4m())
+    rows = 1
+    for d in s[:-1]:
+        rows *= d
+    x, xl = ttnn.view(lead, (rows, s[-1])), ttnn.view(lo, (rows, s[-1]))
+    key = ("lanes4m",) + tuple(s)
+    first = key not in _COMPILED
+    if first:
+        x, xl = ttnn.clone(x), ttnn.clone(xl)  # ttl pins the compiling call's arguments: copies to pin and free
+    y = ttnn.empty((5 * rows, s[-1]), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev)
+    _OP4M[0](x, xl, _MASKS5[id(dev)], y)
+    if first:
+        _COMPILED.add(key)
+        ttnn.deallocate(x)
+        ttnn.deallocate(xl)
+        y2 = ttnn.clone(y)
+        ttnn.deallocate(y)
+        y = y2
+    return y

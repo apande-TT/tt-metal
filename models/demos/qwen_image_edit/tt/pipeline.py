@@ -28,6 +28,7 @@ import ttnn
 from models.demos.qwen_image_edit.tt import inputs as I
 from models.demos.qwen_image_edit.tt import lanes_ttl, round_ttl, square_ttl
 from models.demos.qwen_image_edit.tt.guard_kernel import (
+    _col_masks,
     batched_matmul,
     exp_split,
     guard_tail,
@@ -69,6 +70,8 @@ PIPELINE_STAGES = ["vision_encode", "text_encode", "vae_encode", "denoise", "vae
 # The denoiser's masked-lane linears' column lanes of x: 4 lanes of 8 K terms per 32-group halve the lane products
 # of the 8-lane form (the encoders keep 8)
 DENOISE_MM_LANES = 4
+# the encoders' C++ masked batched products (the LM's P @ V) at 4 a-side lanes too, the linears' count
+ENCODER_BMM_LANES = 4
 _SCHED_COLS = 32  # schedule table width: col 0 = t / 1000, col 1 = sigma_next - sigma
 
 
@@ -242,6 +245,14 @@ class TtQwenImageEditPipeline:
         self.bmm_config = _te_attention.bmm_program_config if precise else None
         if precise:
             lanes_ttl.prepare(device)
+            lanes_ttl.prepare4(device)
+            lanes_ttl.prepare4m(device)
+            # (and the 4-lane QK^T mask tiles of the denoiser (head dim 128) and the vision tower (96, padded from 80),
+            # made here so neither stage's first call allocates them in the middle of the run's DRAM layout)
+            for k in (128, 96):
+                _te_attention._qk_masks4(device, k, ttnn.bfloat16)
+            # (and the 4-lane column masks of the C++ masked products, made here rather than by a stage's first call)
+            _col_masks(device, 4)
         # likewise the VAE encoder's exact-conv vote tail (~8 float32 passes per conv) while it encodes
         self.vote_tail = vote_tail if precise else None
         # and its hi limbs' bf16 rounding, one pass instead of two typecasts
@@ -341,12 +352,32 @@ class TtQwenImageEditPipeline:
             # (and the non-transposed products' 8 a-side lanes + their sum by one C++ masked batched matmul)
             _te_attention,
             "LANE_MASKED_BMM",
-            masked_lane_bmm if self.weight_lane_split else None,
+            functools.partial(masked_lane_bmm, lanes=ENCODER_BMM_LANES) if self.weight_lane_split else None,
         ), self._hook(
             # (and the exact linears unguarded: lane sum + trailing limbs, no dense / negated check products)
             _te_attention,
             "LINEAR_NO_GUARD",
             True,
+        ), self._hook(
+            # (and their input-side lanes as 4, as the denoiser's: half the lane products)
+            _te_attention,
+            "INPUT_LANES4",
+            True,
+        ), self._hook(
+            # (formed directly as 4 by one tt-lang pass, as the denoiser's)
+            _te_attention,
+            "LANE_SPLIT",
+            lanes_ttl.lanes4 if self.lane_split else None,
+        ), self._hook(
+            # (and with the lo limb stacked along M: one product per weight, its row blocks summed in one pass)
+            _te_attention,
+            "INPUT_LANES_MSTACK",
+            sum_parts if self.sum_parts else None,
+        ), self._hook(
+            # (its stacked input written by one tt-lang pass, as the denoiser's)
+            _te_attention,
+            "LANES4_MSTACK",
+            lanes_ttl.lanes4_mstack if self.lane_split else None,
         ), self._hook(
             # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
             _te_attention,
@@ -373,6 +404,11 @@ class TtQwenImageEditPipeline:
             _te_attention, "REST_KCAT", True
         ), self._hook(
             _te_attention, "QK_NO_GUARD_HIFI4", True
+        ), self._hook(
+            # (with 4 exact lanes, as the denoiser's: K = 4 x 96 + the rest limbs, not 8 x 96 + them)
+            _te_attention,
+            "QK_LANES4",
+            True,
         ):
             return self.text_encoder.encode_vision(up.te)
 
@@ -444,8 +480,24 @@ class TtQwenImageEditPipeline:
             (_te_attention, "GUARD_NO_NN", True),
             # (the K-stacked QK^T as one unguarded product: trailing limbs along K, no dense product, no guard tail.)
             (_te_attention, "QK_NO_GUARD", True),
+            # (with 4 exact lanes, the linears' count: K = 4 x 128 + the rest limbs, not 8 x 128 + them)
+            (_te_attention, "QK_LANES4", True),
+            # (and its lead term as one plain product, no exact lanes: K 768 -> 384)
+            (_te_attention, "QK_LANES1", True),
+            # (and as a 2-limb split: without its three ~2^-16 order-2 limb terms a1 x b1, a0 x b2, a2 x b0 -- K 1152 ->
+            # 768 -- and without forming q's and k's third limbs. a1 x b1 alone was -15 ms/step for 0.0002 PCC; the
+            # other two -3 ms/step for 0.0023: restore them (QK_DROP_TERMS ((1, 1),) at 3 limbs) to buy PCC back)
+            (_dit_precise, "QK_LIMBS", 2),
             # (and the exact linears unguarded too: lane sum + trailing limbs, no dense / negated check products)
             (_te_attention, "LINEAR_NO_GUARD", True),
+            # (and their input-side lanes as 4, the masked-lane kernel's count: half the lane products)
+            (_te_attention, "INPUT_LANES4", True),
+            # (formed directly as 4 by one tt-lang pass, not as 8 + their pairwise sums, and without the negation)
+            (_te_attention, "LANE_SPLIT", lanes_ttl.lanes4 if self.lane_split else None),
+            # (and the 4 lanes + the lo limb stacked along M: one product per weight, its row blocks summed in one pass)
+            (_te_attention, "INPUT_LANES_MSTACK", sum_parts if self.sum_parts else None),
+            # (its stacked input -- the 4 lanes and the lo limb as 5 row blocks -- written by one tt-lang pass)
+            (_te_attention, "LANES4_MSTACK", lanes_ttl.lanes4_mstack if self.lane_split else None),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
             # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;
@@ -453,6 +505,10 @@ class TtQwenImageEditPipeline:
             (_te_attention, "LANE_MASKED_BIAS", True),
             # (the softmax's exp(s - max) and the P @ V limb split of it in one C++ pass; v's limbs once per attention)
             (_dit_precise, "EXP_SPLIT", exp_split if self.fused_tail else None),
+            # (and its P @ V's two products of the hi limb as one against [v hi | v lo]: the probabilities read once)
+            (_dit_precise, "PV_SHARE", True),
+            # (and the softmax's row sum formed inside that pass as per-chunk partial sums: e itself never written)
+            (_dit_precise, "EXP_ROWSUM", bool(self.fused_tail)),
             # (the out-projections' gathers run axis 0 first: _stubs/attention.py OUT_GATHER_COL_MAJOR)
             # (the exact all-reduces' 4-device axis as all_to_all + 1/4-sized sum + all_gather: half the link bytes)
             # (and the 2-device axis reduced on that 1/4 slice before the one all_gather back)
@@ -486,10 +542,12 @@ class TtQwenImageEditPipeline:
         # lane_cols_sum in one pass over its column blocks)
         # (and the guard's dense lead-limb product, which only checks the exact-lane sum and breaks a glitch's tie, at
         # HiFi3, the exact lane products' fidelity: HiFi2 trips the guard's 2^-12 slack and takes PCC to 0.898)
+        # (and 128 MB score chunks: 1024-row x 3-head QK^T / softmax / P@V chunks, ~10 per layer instead of 21 at
+        # 96 MB; 192 MB was slower -- its larger float32 transients cost more than the dispatches saved)
         with self._hook(_dit_ccl, "SUM_PARTS", self.sum_parts), self._hook(
             _te_attention, "DN_FIDELITY", ttnn.MathFidelity.HiFi3 if self.weight_lane_split else ttnn.MathFidelity.HiFi4
         ), self._hook(_dit_precise, "LANE_REUSE", bool(self.weight_lane_split)), self._hook(
-            _dit_precise, "CHUNK_ROWS_BYTES", 96 * 1024 * 1024
+            _dit_precise, "CHUNK_ROWS_BYTES", 128 * 1024 * 1024
         ), self._hook(
             _te_attention, "NORM_BF16_SQUARE", True
         ), self._hook(

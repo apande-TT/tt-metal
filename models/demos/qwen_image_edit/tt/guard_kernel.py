@@ -284,9 +284,10 @@ def guard_tail_norms(ex, dn, nn, a_s, b_norm, lo_fn):
 
 _ES_READER = f"{_DIR}/exp_split_reader.cpp"
 _ES_COMPUTE = f"{_DIR}/exp_split_compute.cpp"
+_ES_ROWSUM_WRITER = f"{_DIR}/es_rowsum_writer.cpp"
 
 
-def exp_split(s, m, approx=True):
+def exp_split(s, m, approx=True, rowsum=False):
     """(e, hi, lo) = (exp(s - m), bf16(e), bf16(e - hi)) in one pass for a float32 interleaved tile tensor s [.., M, N]
     and its row maxima m [.., M, 1] (batch-matched): the softmax's fused subtract + EXP post-activation and the P @ V
     limb split, without writing e and reading it back for the split. None for a shape it does not take."""
@@ -302,9 +303,25 @@ def exp_split(s, m, approx=True):
         rows *= d
     n_tiles = (rows // TILE) * nt
     dev = s.device()
-    e = ttnn.empty_like(s)
+    grid = dev.compute_with_storage_grid_size()
     hi, lo = (ttnn.empty(sh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=dev) for _ in range(2))
-    work = _cores(dev.compute_with_storage_grid_size(), n_tiles)
+    cw, n_chunks = 1, 1
+    if rowsum:
+        # (tile row, column chunk) items, enough of them for two per core; each item's tiles are contiguous in the
+        # flat tile order, so a core's run of items is a run of tiles. e = the items' partial row sums [.., M, S*32]
+        mt = rows // TILE
+        want = max(1, min(nt, -(-2 * grid.x * grid.y // mt)))
+        cw = -(-nt // want)
+        n_chunks = -(-nt // cw)
+        e = ttnn.empty(sh[:-1] + [n_chunks * TILE], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
+
+        def item_tile(k):
+            return (k // n_chunks) * nt + min((k % n_chunks) * cw, nt)
+
+        work = [(c, item_tile(st), item_tile(st + cnt) - item_tile(st)) for c, st, cnt in _cores(grid, mt * n_chunks)]
+    else:
+        e = ttnn.empty_like(s)
+        work = _cores(grid, n_tiles)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
 
     def cb_desc(cb, dtype):
@@ -319,9 +336,14 @@ def exp_split(s, m, approx=True):
     cbs += [cb_desc(17, ttnn.bfloat16), cb_desc(18, ttnn.bfloat16)]
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
     for c, start, count in work:
-        reader_rt[c.x][c.y] = [s.buffer_address(), m.buffer_address(), count, start, nt]
+        # (rowsum: the reader sets each row's padded key columns to -1e30, so they add 0 to the partial sums)
+        reader_rt[c.x][c.y] = [s.buffer_address(), m.buffer_address(), count, start, nt, sh[-1] % TILE if rowsum else 0]
         compute_rt[c.x][c.y] = [count, start, nt]
-        writer_rt[c.x][c.y] = [e.buffer_address(), hi.buffer_address(), lo.buffer_address(), count, start]
+        writer_rt[c.x][c.y] = (
+            [hi.buffer_address(), lo.buffer_address(), e.buffer_address(), count, start, nt]
+            if rowsum
+            else [e.buffer_address(), hi.buffer_address(), lo.buffer_address(), count, start]
+        )
     compute_cfg = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, dst_full_sync_en=True
     )
@@ -342,16 +364,19 @@ def exp_split(s, m, approx=True):
             kernel_source=_ES_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[int(bool(approx))],
+            compile_time_args=[int(bool(approx)), int(bool(rowsum)), cw],
             runtime_args=compute_rt,
             config=compute_cfg,
         ),
         ttnn.KernelDescriptor(
-            kernel_source=_TWO_OUT_WRITER,
+            kernel_source=_ES_ROWSUM_WRITER if rowsum else _TWO_OUT_WRITER,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[3]
-            + [a for t in (e, hi, lo) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()],
+            compile_time_args=(
+                [cw, n_chunks] + [a for t in (hi, lo, e) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+                if rowsum
+                else [3] + [a for t in (e, hi, lo) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args()]
+            ),
             runtime_args=writer_rt,
             config=ttnn.WriterConfigDescriptor(),
         ),
@@ -845,7 +870,7 @@ _BMM_M_COMPUTE = f"{_DIR}/masked_bmm_compute.cpp"
 _BMM_M_WRITER = f"{_DIR}/masked_bmm_writer.cpp"
 
 
-def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
+def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4, lanes=8):
     """sum_r lane_r(a) @ b in float32 for a batched bf16 a [E, 1, M, K] and b [E / b_rep, 1, K, N] (entry e of a
     against b's entry e // b_rep; M, K, N tile-aligned): the 8 exact a-side lane products and their sum in ONE pass,
     each core masking its a tiles into their lanes in L1 and reading each b entry once per a row. None for a shape it
@@ -863,7 +888,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
     dev = a.device()
     work = _cores(dev.compute_with_storage_grid_size(), rows)
     sbw = 4 if nt % 4 == 0 else (2 if nt % 2 == 0 else 1)
-    masks = _col_masks(dev)
+    masks = _col_masks(dev, lanes)
     y = ttnn.empty([sa[0], 1, sa[2], sb[3]], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c, _, _ in work])
     page = _FP32_TILE_BYTES // 2
@@ -879,8 +904,8 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
     cbs = [
         cb(0, 2, ttnn.bfloat16),
         cb(1, 2 * nt, ttnn.bfloat16),
-        cb(2, 8, ttnn.bfloat16),
-        cb(3, 8, ttnn.bfloat16),
+        cb(2, lanes, ttnn.bfloat16),
+        cb(3, lanes, ttnn.bfloat16),
         cb(_OUT_CB, nt, ttnn.float32),
     ]
     reader_rt, compute_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -896,7 +921,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
             compile_time_args=ttnn.TensorAccessorArgs(a).get_compile_time_args()
             + ttnn.TensorAccessorArgs(b).get_compile_time_args()
             + ttnn.TensorAccessorArgs(masks).get_compile_time_args()
-            + [kt, nt, mte, b_rep],
+            + [kt, nt, mte, b_rep, lanes],
             runtime_args=reader_rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -904,7 +929,7 @@ def masked_lane_bmm(a, b, b_rep=1, fidelity=ttnn.MathFidelity.HiFi4):
             kernel_source=_BMM_M_COMPUTE,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
             core_ranges=cores,
-            compile_time_args=[kt, nt, sbw],
+            compile_time_args=[kt, nt, sbw, lanes],
             runtime_args=compute_rt,
             config=ttnn.ComputeConfigDescriptor(math_fidelity=fidelity, fp32_dest_acc_en=True),
         ),

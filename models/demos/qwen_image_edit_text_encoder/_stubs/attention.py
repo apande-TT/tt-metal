@@ -406,6 +406,30 @@ GUARD_NO_NN = False
 QK_NO_GUARD = False
 # QK_NO_GUARD at the HiFi4 stack fidelity too (the encoders keep HiFi4; the one product's config is the same either way)
 QK_NO_GUARD_HIFI4 = False
+# QK_NO_GUARD with 4 exact lanes instead of 8 (lane r keeps the K columns j % 4 == r: 8 nonzero terms per 32-group,
+# the linears' DENOISE_MM_LANES count): K = 4 x D + the rest limbs instead of 8 x D + them
+QK_LANES4 = False
+# With it: the lead term as ONE plain product (no exact lanes): [a0 | rest a] @ [b0 | rest b]^T, K = 128 + the rest
+QK_LANES1 = False
+# the 3-limb transposed product's (QK^T's) limb terms (i, j) to leave out, e.g. ((1, 1),): one of the three order-2
+# terms (~2^-16 of the logits each), one 128-wide block less of the K-stacked product's K
+QK_DROP_TERMS = ()
+_QK_MASKS4 = {}
+
+
+def _qk_masks4(device, k, dtype):
+    key = (id(device), k, dtype)
+    if key not in _QK_MASKS4:
+        masks = []
+        for r in range(4):
+            m = ttnn.Tensor(
+                [1.0 if i % 4 == r else 0.0 for i in range(k)], [1, k], ttnn.float32, ttnn.TILE_LAYOUT, device
+            )
+            masks.append(ttnn.typecast(m, dtype))
+        _QK_MASKS4[key] = masks
+    return _QK_MASKS4[key]
+
+
 # The b-side exact lanes (B_LANE_SPLIT: the vision P @ V's lanes on V's rows) as ONE K-stacked product:
 # [a | a | ... | a] @ [lane 0; lane 1; ...; lane 7] (a repeated along K by LANE_STACK, the lanes stacked along K),
 # the same nonzero terms per 32-group as each lane product, instead of 8 products and their sums.
@@ -571,6 +595,15 @@ LANE_MASKED_BIAS = False
 # The exact linears without their guard: the exact-lane sum plus the trailing limbs' products, in the same order, with
 # no dense check product, no negated product and no guard tail (the lanes' rare glitches are not voted out)
 LINEAR_NO_GUARD = False
+# With LINEAR_NO_GUARD: the input-side exact lanes of a linear as 4 (8 nonzero K terms per 32-group, the masked-lane
+# kernel's count) -- the 8 lanes' disjoint pairs summed -- so half the lane products run
+INPUT_LANES4 = False
+# Optional slab sum for the input-side lanes stacked along M with the lo limb: INPUT_LANES_MSTACK(y [n, rows, N], n)
+# -> the left-to-right float32 sum of the n row blocks (the C++ sum_parts), or None (the per-lane products)
+INPUT_LANES_MSTACK = None
+# Optional fused input for it: LANES4_MSTACK(lead, lo) -> [lane 0..3; lo] as one [5 x rows, K] bf16 tensor in one pass
+# (no separate lane tensors, no concat), or None
+LANES4_MSTACK = None
 # Optional math fidelity of the input-side exact-lane products alone (default: the dense product's DN_FIDELITY)
 INPUT_LANE_FIDELITY = None
 _ROW_LANE_MASKS = {}
@@ -724,12 +757,69 @@ def _guarded_sums(mms, parts, b_norms, lo_mms=None, nn_mms=None, ws=None, bias=N
         lane_mms = mms
         if INPUT_LANE_FIDELITY is not None and ws is not None and all(len(w.shape) == 2 for w in ws):
             lane_mms = [_linear_mm(lead, w, INPUT_LANE_FIDELITY) for w in ws]
-        lanes, neg_lead = _lead_lanes(lead)
+        st_fused = None
+        if (
+            LANES4_MSTACK is not None
+            and INPUT_LANES_MSTACK is not None
+            and INPUT_LANES4
+            and LINEAR_NO_GUARD
+            and len(parts) == 2
+            and ws is not None
+            and all(len(w.shape) == 2 for w in ws)
+        ):
+            st_fused = LANES4_MSTACK(lead, parts[1])
+        lanes, neg_lead = ([], None) if st_fused is not None else _lead_lanes(lead)
+        if INPUT_LANES4 and LINEAR_NO_GUARD:
+            # 4 lanes (j % 4 == r) as the 8 lanes' disjoint pairs r, r + 4 summed (exact): half the lane products
+            l8 = list(lanes)
+            if len(l8) == 8:
+                lanes = []
+                for r in range(4):
+                    lanes.append(ttnn.add(l8[r], l8[r + 4]))
+                    ttnn.deallocate(l8[r])
+                    ttnn.deallocate(l8[r + 4])
+            else:
+                lanes = l8
+        lanes = list(lanes)
+        if st_fused is not None or (
+            INPUT_LANES_MSTACK is not None
+            and LINEAR_NO_GUARD
+            and len(parts) == 2
+            and ws is not None
+            and all(len(w.shape) == 2 for w in ws)
+            and 2 <= len(lanes) + 1 <= 6
+        ):
+            # the lanes and the lo limb stacked along M: ONE product per weight (the weight read once, not 5 times),
+            # its row blocks summed left to right in float32 (INPUT_LANES_MSTACK, the C++ slab sum) -- the lo product
+            # then runs at the lanes' fidelity and is not added again below
+            k = lead.shape[-1]
+            rows = 1
+            for d in list(lead.shape)[:-1]:
+                rows *= d
+            if st_fused is not None:
+                n_blk, st = 5, st_fused
+            else:
+                n_blk = len(lanes) + 1
+                st = ttnn.concat([ttnn.reshape(t, (rows, k)) for t in lanes + [parts[1]]], dim=0)
+                for t in lanes:
+                    ttnn.deallocate(t)
+            exs = []
+            for i, w in enumerate(ws):
+                # (the product configured for the stacked input's own shape, at the lanes' fidelity)
+                y = _linear_mm(st, w, INPUT_LANE_FIDELITY if INPUT_LANE_FIDELITY is not None else DN_FIDELITY)(st)
+                n = w.shape[-1]
+                tot = INPUT_LANES_MSTACK(ttnn.reshape(y, (n_blk, rows, n)), n_blk)
+                ttnn.deallocate(y)
+                exs.append(ttnn.reshape(tot, list(lead.shape)[:-1] + [n]))
+            ttnn.deallocate(st)
+            folded[0] = True
+            lanes = []
         for lane in lanes:
             for i, mm in enumerate(lane_mms):
                 accs[i].push(mm(lane))
             ttnn.deallocate(lane)
-        exs = [acc.value() for acc in accs]
+        if not folded[0] or exs is None:
+            exs = [acc.value() for acc in accs]
     if LINEAR_NO_GUARD:
         ys = []
         for i, mm in enumerate(mms):
@@ -1060,7 +1150,12 @@ def split_matmul(a, b, transpose_b=False, compute_kernel_config=None, exact=True
         b_pre, keep_b = (ent[1], ent[2]), True
     pa_all = split_bf16(a, limbs)
     pb_all = split_bf16(b, limbs) if b_pre is None else b_pre[0]
-    terms = [(pa_all[i], pb_all[j]) for i in range(limbs) for j in range(limbs) if i + j < limbs]
+    terms = [
+        (pa_all[i], pb_all[j])
+        for i in range(limbs)
+        for j in range(limbs)
+        if i + j < limbs and not (transpose_b and limbs == 3 and (i, j) in QK_DROP_TERMS)
+    ]
 
     reps = {}  # (each b operand's entries repeated once per call, not once per product: the lanes share one b limb)
 
@@ -1223,6 +1318,58 @@ def _unguarded_qk(stacked, pa0, pb0, rest, keep):
     return y
 
 
+def _unguarded_qk1(pa0, pb0, rest, keep):
+    """_unguarded_qk with NO exact lanes: [a's lead | rest a limbs] @ [b's lead | rest b]^T as one product."""
+    rest_b = [pb for _, pb in rest]
+    kr2, kr2_kept = _b_side(keep, "kr_fold1", [pb0] + rest_b, lambda: ttnn.concat([pb0] + rest_b, dim=-1))
+    xs2 = ttnn.concat([pa0] + [pa for pa, _ in rest], dim=-1)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
+def _unguarded_qk4(pa0, pb0, rest, keep):
+    """_unguarded_qk with 4 exact lanes: [4 lanes of a's lead | rest a limbs] @ [b's lead x4 along K | rest b]^T."""
+    if QK_LANES1:
+        return _unguarded_qk1(pa0, pb0, rest, keep)
+    lanes = [ttnn.multiply(pa0, m) for m in _qk_masks4(pa0.device(), pa0.shape[-1], pa0.dtype)]
+    rest_b = [pb for _, pb in rest]
+
+    def _kr_fold():
+        kr = LANE_STACK(pb0, 4)
+        y = ttnn.concat([kr] + rest_b, dim=-1)
+        ttnn.deallocate(kr)
+        return y
+
+    kr2, kr2_kept = _b_side(keep, "kr_fold4", [pb0] + rest_b, _kr_fold)
+    xs2 = ttnn.concat(lanes + [pa for pa, _ in rest], dim=-1)
+    for t in lanes:
+        ttnn.deallocate(t)
+    pc = None if BMM_CONFIG is None else BMM_CONFIG(xs2, kr2, True)
+    y = ttnn.matmul(
+        xs2,
+        kr2,
+        transpose_b=True,
+        compute_kernel_config=precise_config(QK_STACK_FIDELITY),
+        dtype=ttnn.float32,
+        program_config=pc,
+    )
+    ttnn.deallocate(xs2)
+    if not kr2_kept:
+        ttnn.deallocate(kr2)
+    return y
+
+
 def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=False):
     """EXACT_MODE "guarded" for a @ b over limb terms: the leading term (hi x hi) exact-lane and guarded,
     the rest dense. The bound uses the float32 operands' norms (not cached: b is an activation)."""
@@ -1267,6 +1414,18 @@ def _guarded_terms(mm, terms, a, b, transpose_b, b_rep=1, b_norm=None, keep_b=Fa
         neg0 = None
     else:
         stacked = None
+        if (
+            QK_LANES4
+            and QK_NO_GUARD
+            and REST_KCAT
+            and LANE_STACK is not None
+            and transpose_b
+            and b_rep == 1
+            and len(rest) > 1
+            and pa0.shape[-1] % 32 == 0
+            and (QK_STACK_FIDELITY != ttnn.MathFidelity.HiFi4 or QK_NO_GUARD_HIFI4)
+        ):
+            return _unguarded_qk4(pa0, pb0, rest, keep_b and pb0 is terms[0][1])
         # (a repeated b -- b_rep > 1 -- takes the K-stack too when its product goes through mm, which repeats b once)
         if (
             LANE_KSTACK is not None

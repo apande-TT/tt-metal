@@ -28,6 +28,23 @@ FORCE_INLINE void fill_first_column(uint32_t l1) {
     }
 }
 
+// Columns valid..31 of a float32 tile (faces 1 / 3 hold columns 16..31) set to -1e30: exp of them is 0, so a key
+// row's padded tail adds nothing to the in-kernel row sums (and its limbs are 0).
+FORCE_INLINE void mask_tail_columns(uint32_t l1, uint32_t valid) {
+    auto* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1);
+    constexpr uint32_t neg = 0xF149F2CAu;  // -1e30f
+    for (uint32_t face = 0; face < 4; ++face) {
+        const uint32_t c0 = (face & 1) ? 16 : 0;
+        for (uint32_t row = 0; row < 16; ++row) {
+            for (uint32_t col = 0; col < 16; ++col) {
+                if (c0 + col >= valid) {
+                    p[face * 256 + row * 16 + col] = neg;
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void kernel_main() {
@@ -36,6 +53,7 @@ void kernel_main() {
     const uint32_t count = get_arg_val<uint32_t>(2);
     const uint32_t start = get_arg_val<uint32_t>(3);
     const uint32_t nt = get_arg_val<uint32_t>(4);
+    const uint32_t tail_valid = get_arg_val<uint32_t>(5);  // valid columns of each row's last tile (0: all 32)
 
     constexpr auto args_s = TensorAccessorArgs<0>();
     constexpr auto args_m = TensorAccessorArgs<args_s.next_compile_time_args_offset()>();
@@ -56,8 +74,12 @@ void kernel_main() {
             cb_push_back(cb_m, 1);
         }
         cb_reserve_back(cb_s, 1);
-        noc_async_read(s_s.get_noc_addr(i), get_write_ptr(cb_s), bytes);
+        const uint32_t l1_s = get_write_ptr(cb_s);
+        noc_async_read(s_s.get_noc_addr(i), l1_s, bytes);
         noc_async_read_barrier();
+        if (tail_valid != 0 && i - row * nt == nt - 1) {
+            mask_tail_columns(l1_s, tail_valid);
+        }
         cb_push_back(cb_s, 1);
     }
 }

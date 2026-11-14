@@ -23,7 +23,7 @@ void kernel_main() {
     constexpr uint32_t kt = get_compile_time_arg_val(0);
     constexpr uint32_t nt = get_compile_time_arg_val(1);
     constexpr uint32_t sbw = get_compile_time_arg_val(2);
-    constexpr uint32_t lanes = 8;
+    constexpr uint32_t lanes = get_compile_time_arg_val(3);  // a-side column lanes (8, or 4; a multiple of 4)
     constexpr uint32_t cb_a = 0, cb_b = 1, cb_m = 2, cb_lane = 3, cb_out = 16;
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_lane, cb_b, cb_out);

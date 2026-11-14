@@ -34,6 +34,11 @@ void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(1);
     const uint32_t nt = get_arg_val<uint32_t>(2);
     constexpr uint32_t approx = get_compile_time_arg_val(0);
+    // rowsum (compile-time 1, with the column-chunk width cw): e is not written; each (tile row, cw-column chunk)
+    // item's e tiles are summed elementwise by the packer's float32 L1 accumulation into ONE c_16 tile (the item's
+    // partial row sums, column-spread), pushed when the item ends -- the row sum's input without e's round trip
+    constexpr uint32_t rowsum = get_compile_time_arg_val(1);
+    constexpr uint32_t cw = get_compile_time_arg_val(2);
     constexpr uint32_t cb_s = 0, cb_m = 1, cb_e = 16, cb_hi = 17, cb_lo = 18;
     constexpr uint32_t X = 0, M = 1, HI = 2, LO = 3;
 
@@ -44,7 +49,11 @@ void kernel_main() {
             cb_wait_front(cb_m, 1);
         }
         cb_wait_front(cb_s, 1);
-        cb_reserve_back(cb_e, 1);
+        const bool item_first = rowsum && c % cw == 0;
+        const bool item_last = rowsum && ((c + 1) % cw == 0 || c + 1 == nt);
+        if (!rowsum || item_first) {
+            cb_reserve_back(cb_e, 1);
+        }
         cb_reserve_back(cb_hi, 1);
         cb_reserve_back(cb_lo, 1);
 
@@ -70,13 +79,21 @@ void kernel_main() {
 
         tile_regs_wait();
         pack_reconfig_data_format(cb_e);  // float32 out
-        pack_tile(X, cb_e);
+        if constexpr (rowsum) {
+            pack_reconfig_l1_acc(item_first ? 0 : 1);
+            pack_tile<true>(X, cb_e, 0);
+            pack_reconfig_l1_acc(0);
+        } else {
+            pack_tile(X, cb_e);
+        }
         pack_reconfig_data_format(cb_hi);  // bf16 outs
         pack_tile(HI, cb_hi);
         pack_tile(LO, cb_lo);
         tile_regs_release();
 
-        cb_push_back(cb_e, 1);
+        if (!rowsum || item_last) {
+            cb_push_back(cb_e, 1);
+        }
         cb_push_back(cb_hi, 1);
         cb_push_back(cb_lo, 1);
         cb_pop_front(cb_s, 1);
