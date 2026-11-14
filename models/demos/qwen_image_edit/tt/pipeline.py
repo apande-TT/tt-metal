@@ -363,6 +363,11 @@ class TtQwenImageEditPipeline:
             "INPUT_LANES4",
             True,
         ), self._hook(
+            # (formed directly as 4 by one tt-lang pass, as the denoiser's)
+            _te_attention,
+            "LANE_SPLIT",
+            lanes_ttl.lanes4 if self.lane_split else None,
+        ), self._hook(
             # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
             _te_attention,
             "B_REP_FOLD",
