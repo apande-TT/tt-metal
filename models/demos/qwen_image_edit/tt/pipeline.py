@@ -352,6 +352,11 @@ class TtQwenImageEditPipeline:
             "LINEAR_NO_GUARD",
             True,
         ), self._hook(
+            # (and their input-side lanes as 4, as the denoiser's: half the lane products)
+            _te_attention,
+            "INPUT_LANES4",
+            True,
+        ), self._hook(
             # (and a batched product's shared b entries not repeated: a's entries per b entry as one taller entry)
             _te_attention,
             "B_REP_FOLD",
