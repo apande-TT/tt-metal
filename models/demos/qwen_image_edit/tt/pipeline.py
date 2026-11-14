@@ -245,6 +245,7 @@ class TtQwenImageEditPipeline:
         self.bmm_config = _te_attention.bmm_program_config if precise else None
         if precise:
             lanes_ttl.prepare(device)
+            lanes_ttl.prepare4(device)
             # (and the 4-lane QK^T mask tiles of the denoiser (head dim 128) and the vision tower (96, padded from 80),
             # made here so neither stage's first call allocates them in the middle of the run's DRAM layout)
             for k in (128, 96):
@@ -473,6 +474,8 @@ class TtQwenImageEditPipeline:
             (_te_attention, "LINEAR_NO_GUARD", True),
             # (and their input-side lanes as 4, the masked-lane kernel's count: half the lane products)
             (_te_attention, "INPUT_LANES4", True),
+            # (formed directly as 4 by one tt-lang pass, not as 8 + their pairwise sums, and without the negation)
+            (_te_attention, "LANE_SPLIT", lanes_ttl.lanes4 if self.lane_split else None),
             # (and the hi/lo input's lo product folded into the single-weight masked-lane kernel as one more lane)
             (_te_attention, "LANE_MASKED_LO", True),
             # (and the single-weight linears' bias as the kernel's starting output value: no float32 bias add pass;
